@@ -1,0 +1,8 @@
+services:
+  backend:
+    environment:
+      AUTO_TRANSLATE_WHISPER_DEVICE: cpu
+      AUTO_TRANSLATE_WHISPER_COMPUTE_TYPE: int8
+      AUTO_TRANSLATE_VIDEO_ENCODER: libx264
+      AUTO_TRANSLATE_VIDEO_PRESET: veryfast
+    gpus: []

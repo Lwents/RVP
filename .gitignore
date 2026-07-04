@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.venv/
+__pycache__/
+*.pyc
+.env
+tools/
+backend/storage/*
+!backend/storage/.gitkeep
+/storage/

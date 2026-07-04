@@ -1,0 +1,52 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      AUTO_TRANSLATE_FFMPEG_PATH: /usr/bin/ffmpeg
+      AUTO_TRANSLATE_AI_ENGINE: passthrough
+      AUTO_TRANSLATE_TRANSLATION_ENGINE: google
+      AUTO_TRANSLATE_VOICE_ENGINE: edge
+      AUTO_TRANSLATE_TARGET_LANGUAGE: vi
+      AUTO_TRANSLATE_WHISPER_MODEL: medium
+      AUTO_TRANSLATE_WHISPER_DEVICE: cuda
+      AUTO_TRANSLATE_WHISPER_COMPUTE_TYPE: int8_float16
+      AUTO_TRANSLATE_WHISPER_BEAM_SIZE: "5"
+      AUTO_TRANSLATE_WHISPER_VAD_FILTER: "true"
+      AUTO_TRANSLATE_WHISPER_WORD_TIMESTAMPS: "true"
+      AUTO_TRANSLATE_WHISPER_LOCAL_FILES_ONLY: "false"
+      AUTO_TRANSLATE_PREFER_YOUTUBE_SUBTITLES: "false"
+      AUTO_TRANSLATE_ASR_TIMEOUT_SECONDS: "1800"
+      AUTO_TRANSLATE_YTDLP_JS_RUNTIME: node:/usr/bin/node
+      AUTO_TRANSLATE_VIDEO_ENCODER: h264_nvenc
+      AUTO_TRANSLATE_VIDEO_CRF: "12"
+      AUTO_TRANSLATE_VIDEO_PRESET: p1
+      AUTO_TRANSLATE_TTS_CHUNK_CHARS: "900"
+      AUTO_TRANSLATE_TTS_CHUNK_TIMEOUT_SECONDS: "120"
+      AUTO_TRANSLATE_TTS_CHUNK_RETRIES: "3"
+      AUTO_TRANSLATE_RENDER_WITHOUT_TTS_ON_ERROR: "true"
+      AUTO_TRANSLATE_YTDLP_FORMAT: bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best
+      AUTO_TRANSLATE_YTDLP_DOWNLOAD_TIMEOUT_SECONDS: "1800"
+    volumes:
+      - ./backend/storage:/app/storage
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    gpus: all
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      VITE_API_URL: http://127.0.0.1:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

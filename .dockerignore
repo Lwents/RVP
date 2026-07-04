@@ -1,0 +1,11 @@
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+backend/.venv
+backend/storage
+frontend/node_modules
+frontend/dist
+frontend/tsconfig.tsbuildinfo
+tools/ffmpeg.zip
+tools/ffmpeg-8.1.2-full_build
