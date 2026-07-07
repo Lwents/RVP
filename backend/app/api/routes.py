@@ -3,11 +3,13 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from app.core import settings
 from app.models.job import DubbingRequest, JobCreateResponse, JobProgress, UploadResponse
 from app.services.processor import process_job
 from app.services.store import job_store
+from app.services.media.downloader import download_preview_video
 
 router = APIRouter()
 
@@ -69,10 +71,52 @@ async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
     )
 
 
+class UrlPreviewRequest(BaseModel):
+    url: str
+
+
+@router.post("/uploads/url_preview", response_model=UploadResponse, tags=["uploads"])
+async def upload_url_preview(request: UrlPreviewRequest) -> UploadResponse:
+    storage_dir = Path(settings.storage_dir) / "uploads" / "videos"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    
+    job_id = str(uuid4())
+    work_dir = storage_dir / job_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        downloaded_path = await download_preview_video(request.url, work_dir)
+        safe_name = f"{job_id}{downloaded_path.suffix}"
+        final_destination = storage_dir / safe_name
+        downloaded_path.rename(final_destination)
+        
+        return UploadResponse(
+            file_name=safe_name,
+            content_type="video/mp4",
+            size=final_destination.stat().st_size,
+            url=f"/api/uploads/video/{safe_name}",
+            local_file_path=str(final_destination),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        # Cleanup work dir
+        import shutil
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+from app.services import task_manager
+
 @router.post("/jobs", response_model=JobCreateResponse, tags=["jobs"])
 async def create_job(request: DubbingRequest, background_tasks: BackgroundTasks) -> JobCreateResponse:
     job = job_store.create(request)
-    background_tasks.add_task(process_job, job.job_id)
+    
+    import asyncio
+    task = asyncio.create_task(process_job(job.job_id))
+    task_manager.register_task(job.job_id, task)
+    
+    # We add a background task just to await it so it's not orphaned entirely if we wanted to
+    # but create_task is already enough. We'll just rely on create_task.
     return JobCreateResponse(job_id=job.job_id, status=job.status)
 
 
@@ -106,3 +150,44 @@ async def download_output(job_id: str) -> FileResponse:
     if not output_file.exists():
         raise HTTPException(status_code=404, detail="Output file no longer exists.")
     return FileResponse(output_file, media_type="video/mp4", filename=output_file.name)
+
+@router.post("/jobs/{job_id}/cancel", tags=["jobs"])
+async def cancel_job(job_id: str) -> dict[str, str]:
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if task_manager.cancel_task(job_id):
+        return {"message": "Đã gửi yêu cầu hủy tiến trình."}
+    return {"message": "Không thể hủy (job không chạy hoặc đã kết thúc)."}
+
+
+from app.services.youtube.auth import get_youtube_auth_url, handle_oauth2_callback
+from app.services.youtube.upload import get_channel_videos_stats
+from pydantic import BaseModel
+
+class YoutubeCallbackRequest(BaseModel):
+    code: str
+
+@router.get("/youtube/auth-url", tags=["youtube"])
+async def get_yt_auth_url():
+    try:
+        url = get_youtube_auth_url()
+        return {"url": url}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/youtube/callback", tags=["youtube"])
+async def yt_callback(req: YoutubeCallbackRequest):
+    try:
+        result = handle_oauth2_callback(req.code)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.get("/youtube/stats", tags=["youtube"])
+async def yt_stats():
+    try:
+        stats = get_channel_videos_stats()
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))

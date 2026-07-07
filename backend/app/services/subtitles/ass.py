@@ -69,7 +69,7 @@ def _wrap_subtitle_text(text: str, max_chars: int) -> str:
             current_length += extra
     if current:
         lines.append(" ".join(current))
-    return r"\N".join(lines[:3])
+    return r"\N".join(lines[:2])
 
 
 def _ass_escape(text: str) -> str:

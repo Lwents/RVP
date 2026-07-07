@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Liquid Glass — Trải nghiệm giao diện iOS 26 mượt mà, cao cấp với hiệu ứng kính mờ đỉnh cao." />
+  <title>Liquid Glass — iOS 26 Design</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ============ NAVBAR ============ -->
+  <nav class="ios-navbar" id="navbar">
+    <div class="ios-navbar__inner">
+      <a href="#" class="ios-navbar__brand" id="brand-logo">
+        <!-- Apple-style logo icon -->
+        <svg viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="28" height="28" rx="8" fill="url(#brandGrad)"/>
+          <path d="M9 14.5C9 11.5 11 9 14 9C17 9 19 11.5 19 14.5C19 17.5 17 20 14 20C11 20 9 17.5 9 14.5Z" fill="white" fill-opacity="0.9"/>
+          <circle cx="14" cy="14.5" r="2.5" fill="url(#brandGrad2)"/>
+          <defs>
+            <linearGradient id="brandGrad" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#007AFF"/>
+              <stop offset="1" stop-color="#5856D6"/>
+            </linearGradient>
+            <linearGradient id="brandGrad2" x1="11" y1="12" x2="17" y2="17" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#007AFF"/>
+              <stop offset="1" stop-color="#AF52DE"/>
+            </linearGradient>
+          </defs>
+        </svg>
+        Liquid Glass
+      </a>
+
+      <ul class="ios-navbar__links" id="nav-links">
+        <li><a href="#features" id="nav-features">Tính năng</a></li>
+        <li><a href="#showcase" id="nav-showcase">Giới thiệu</a></li>
+        <li><a href="#cta" id="nav-cta">Liên hệ</a></li>
+        <li>
+          <a href="#cta" class="ios-button ios-button--sm" id="nav-btn-start" style="margin-left: 4px;">
+            Bắt đầu
+          </a>
+        </li>
+      </ul>
+
+      <button class="ios-navbar__toggle" id="nav-toggle" aria-label="Toggle menu">
+        <span></span>
+        <span></span>
+        <span></span>
+      </button>
+    </div>
+  </nav>
+
+  <div class="menu-overlay" id="menu-overlay"></div>
+  <div class="ios-spacer"></div>
+
+  <!-- ============ HERO ============ -->
+  <section class="ios-section hero" id="hero">
+    <div class="ios-container">
+      <div class="hero__badge">
+        <span class="dot"></span>
+        Phong cách iOS 26
+      </div>
+      <h1 class="hero__title">
+        Giao diện <span class="gradient-text">Liquid Glass</span><br />
+        thế hệ mới.
+      </h1>
+      <p class="hero__subtitle">
+        Trải nghiệm thiết kế mượt mà, trong suốt, cao cấp — lấy cảm hứng từ ngôn ngữ thiết kế Apple mới nhất.
+      </p>
+      <div class="hero__actions">
+        <button class="ios-button ios-button--lg" id="hero-btn-explore">
+          Khám phá ngay
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+        </button>
+        <button class="ios-button ios-button--secondary ios-button--lg" id="hero-btn-learn">
+          Tìm hiểu thêm
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ FEATURES ============ -->
+  <section class="ios-section" id="features">
+    <div class="ios-container">
+      <p class="section-label reveal">Tính năng</p>
+      <h2 class="section-heading reveal">Được xây dựng cho tương lai</h2>
+      <p class="section-desc reveal">
+        Mọi thành phần đều được thiết kế tỉ mỉ với hiệu ứng kính mờ, bo góc mềm mại và chuyển động tinh tế.
+      </p>
+
+      <div class="features-grid reveal-stagger">
+        <!-- Card 1 -->
+        <div class="ios-card feature-card reveal" id="feature-glass">
+          <div class="feature-card__icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
+          </div>
+          <h3 class="feature-card__title">Glassmorphism</h3>
+          <p class="feature-card__desc">
+            Hiệu ứng kính mờ tinh tế với backdrop-filter blur, nền trong suốt và viền sáng nhẹ mang lại chiều sâu vượt trội.
+          </p>
+        </div>
+
+        <!-- Card 2 -->
+        <div class="ios-card feature-card reveal" id="feature-responsive">
+          <div class="feature-card__icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="3"/><path d="M12 18h.01"/></svg>
+          </div>
+          <h3 class="feature-card__title">Responsive</h3>
+          <p class="feature-card__desc">
+            Tự động thích ứng hoàn hảo trên mọi thiết bị — từ điện thoại, máy tính bảng đến màn hình lớn.
+          </p>
+        </div>
+
+        <!-- Card 3 -->
+        <div class="ios-card feature-card reveal" id="feature-animation">
+          <div class="feature-card__icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4"/><path d="m16.24 7.76-2.83 2.83"/><path d="M22 12h-4"/><path d="m16.24 16.24-2.83-2.83"/><path d="M12 22v-4"/><path d="m7.76 16.24 2.83-2.83"/><path d="M2 12h4"/><path d="m7.76 7.76 2.83 2.83"/></svg>
+          </div>
+          <h3 class="feature-card__title">Micro-animation</h3>
+          <p class="feature-card__desc">
+            Chuyển động mượt mà trên mỗi tương tác — hover, click, scroll — tạo cảm giác sống động, cao cấp.
+          </p>
+        </div>
+
+        <!-- Card 4 -->
+        <div class="ios-card feature-card reveal" id="feature-reusable">
+          <div class="feature-card__icon" style="background: linear-gradient(135deg, rgba(52, 199, 89, 0.12), rgba(0, 122, 255, 0.08));">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 18h2a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2"/><path d="M8 18H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M8 2v20"/><path d="M16 2v20"/></svg>
+          </div>
+          <h3 class="feature-card__title">Reusable Classes</h3>
+          <p class="feature-card__desc">
+            Hệ thống CSS class rõ ràng, dễ tái sử dụng: .ios-glass, .ios-card, .ios-button, .ios-input và hơn thế.
+          </p>
+        </div>
+
+        <!-- Card 5 -->
+        <div class="ios-card feature-card reveal" id="feature-typography">
+          <div class="feature-card__icon" style="background: linear-gradient(135deg, rgba(175, 82, 222, 0.12), rgba(88, 86, 214, 0.08));">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+          </div>
+          <h3 class="feature-card__title">Typography</h3>
+          <p class="feature-card__desc">
+            Font system theo chuẩn Apple — SF Pro, Inter — với trọng lượng và khoảng cách chữ tối ưu cho đọc.
+          </p>
+        </div>
+
+        <!-- Card 6 -->
+        <div class="ios-card feature-card reveal" id="feature-performance">
+          <div class="feature-card__icon" style="background: linear-gradient(135deg, rgba(255, 159, 10, 0.12), rgba(255, 59, 48, 0.08));">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+          </div>
+          <h3 class="feature-card__title">Hiệu suất cao</h3>
+          <p class="feature-card__desc">
+            Tối ưu GPU acceleration, không framework nặng — chỉ HTML, CSS, JS thuần, nhẹ và nhanh như gió.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SHOWCASE ============ -->
+  <section class="ios-section showcase" id="showcase">
+    <div class="ios-container">
+      <div class="ios-glass showcase__panel reveal">
+        <p class="showcase__label">Giới thiệu</p>
+        <h2 class="showcase__heading">Thiết kế không thỏa hiệp</h2>
+        <p class="showcase__text">
+          Liquid Glass kết hợp sự tối giản của Apple với hiệu ứng kính mờ đột phá — mang đến trải nghiệm hình ảnh sống động mà vẫn giữ sự tinh tế, sang trọng.
+        </p>
+
+        <div class="stats-row">
+          <div class="stat-item">
+            <div class="stat-item__value" data-count="99">0</div>
+            <div class="stat-item__label">Lighthouse Score</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-item__value" data-count="7">0</div>
+            <div class="stat-item__label">CSS Components</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-item__value" data-count="0">0KB</div>
+            <div class="stat-item__label">Dependency</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ CTA ============ -->
+  <section class="ios-section cta" id="cta">
+    <div class="ios-container">
+      <div class="cta__panel reveal">
+        <h2 class="cta__heading">Sẵn sàng trải nghiệm?</h2>
+        <p class="cta__text">
+          Để lại email để nhận bộ UI kit Liquid Glass miễn phí và bắt đầu xây dựng giao diện đẹp ngay hôm nay.
+        </p>
+        <form class="cta__form" id="cta-form" onsubmit="return false;">
+          <input
+            type="email"
+            class="ios-input"
+            id="cta-email"
+            placeholder="email@example.com"
+            autocomplete="email"
+            required
+          />
+          <button type="submit" class="ios-button" id="cta-submit">
+            Đăng ký
+          </button>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ FOOTER ============ -->
+  <footer class="ios-section footer" id="footer">
+    <div class="ios-container">
+      <ul class="footer__links">
+        <li><a href="#features" id="footer-features">Tính năng</a></li>
+        <li><a href="#showcase" id="footer-showcase">Giới thiệu</a></li>
+        <li><a href="#cta" id="footer-contact">Liên hệ</a></li>
+      </ul>
+      <p>&copy; 2026 Liquid Glass. Thiết kế theo phong cách iOS 26.</p>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>

@@ -60,6 +60,12 @@ export async function listJobs(): Promise<JobProgress[]> {
   return request("/api/jobs");
 }
 
+export async function cancelJob(jobId: string): Promise<{ message: string }> {
+  return request(`/api/jobs/${jobId}/cancel`, {
+    method: "POST",
+  });
+}
+
 export async function clearJobs(): Promise<void> {
   const response = await fetch(`${API_URL}/api/jobs`, { method: "DELETE" });
   if (!response.ok) {
@@ -70,4 +76,34 @@ export async function clearJobs(): Promise<void> {
 
 export function toAbsoluteApiUrl(path: string): string {
   return `${API_URL}${path}`;
+}
+
+export async function fetchUrlPreview(url: string): Promise<UploadResponse> {
+  const response = await fetch(`${API_URL}/api/uploads/url_preview`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ url }),
+  });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => null);
+    throw new Error(errorData?.detail || `Lỗi tải preview: ${response.status}`);
+  }
+  return response.json() as Promise<UploadResponse>;
+}
+
+export async function getYoutubeAuthUrl(): Promise<{url: string}> {
+  return request("/api/youtube/auth-url");
+}
+
+export async function sendYoutubeCallbackCode(code: string): Promise<any> {
+  return request("/api/youtube/callback", {
+    method: "POST",
+    body: JSON.stringify({ code })
+  });
+}
+
+export async function getYoutubeStats(): Promise<any[]> {
+  return request("/api/youtube/stats");
 }

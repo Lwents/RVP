@@ -46,19 +46,39 @@ def find_ffprobe(ffmpeg: str) -> str | None:
 
 
 async def run_command(command: list[str], error_message: str) -> None:
-    def run() -> None:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or completed.stdout.strip()
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await process.communicate()
+        if process.returncode != 0:
+            detail = stdout.decode(errors="ignore").strip() if stdout else ""
             raise MediaError(f"{error_message} {detail}")
-
-    await asyncio.to_thread(run)
+    except asyncio.CancelledError:
+        try:
+            process.terminate()
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            try:
+                process.kill()
+            except Exception:
+                pass
+        raise
 
 
 async def extract_audio(ffmpeg: str, source_video: Path, audio_file: Path) -> None:
     await run_command(
         [ffmpeg, "-y", "-i", str(source_video), "-vn", "-ac", "1", "-ar", "16000", str(audio_file)],
         "Không tách được audio từ video.",
+    )
+
+
+async def extract_demucs_audio(ffmpeg: str, source_video: Path, audio_file: Path) -> None:
+    await run_command(
+        [ffmpeg, "-y", "-i", str(source_video), "-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(audio_file)],
+        "Không tách được audio để xử lý Demucs.",
     )
 
 
@@ -143,20 +163,22 @@ async def run_ffmpeg_with_progress(
 ) -> None:
     progress_command = command[:1] + ["-nostats", "-progress", "pipe:1"] + command[1:]
 
-    def run() -> None:
-        process = subprocess.Popen(
-            progress_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        output_lines: list[str] = []
-        last_update = 0.0
+    process = await asyncio.create_subprocess_exec(
+        *progress_command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    
+    output_lines: list[str] = []
+    last_update = 0.0
 
+    try:
         assert process.stdout is not None
-        for line in process.stdout:
-            line = line.strip()
+        while True:
+            line_bytes = await process.stdout.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode(errors="ignore").strip()
             if line:
                 output_lines.append(line)
             if not line.startswith("out_time_") or duration <= 0:
@@ -171,13 +193,21 @@ async def run_ffmpeg_with_progress(
             on_progress(max(progress_start, min(progress_end, percent)))
             last_update = now
 
-        return_code = process.wait()
+        return_code = await process.wait()
         if return_code != 0:
             detail = "\n".join(output_lines[-40:]).strip()
             raise MediaError(f"{error_message} {detail}")
         on_progress(progress_end)
-
-    await asyncio.to_thread(run)
+    except asyncio.CancelledError:
+        try:
+            process.terminate()
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            try:
+                process.kill()
+            except Exception:
+                pass
+        raise
 
 
 def _ffmpeg_progress_seconds(line: str) -> float | None:

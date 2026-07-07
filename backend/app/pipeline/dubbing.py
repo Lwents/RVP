@@ -1,15 +1,17 @@
 from pathlib import Path
+import asyncio
 from typing import Callable
 
 from app.core import settings
-from app.models.job import JobStatus, VoiceGender
+from app.models.job import JobStatus, VoiceGender, BgmMode
 from app.services.ai.voice import VoiceError, get_voice_engine
 from app.services.media.downloader import prepare_source_video
-from app.services.media.ffmpeg import extract_audio, find_ffmpeg, probe_video_duration
+from app.services.media.ffmpeg import extract_audio, extract_demucs_audio, find_ffmpeg, probe_video_duration
 from app.services.media.renderer import render_video
+from app.services.media.separation import separate_background_with_demucs
 from app.services.store import job_store
 from app.services.subtitles.source import get_or_create_subtitles
-
+from app.models.job import PublishTarget
 
 class PipelineError(RuntimeError):
     pass
@@ -58,6 +60,21 @@ async def process_dubbing_job(job_id: str) -> None:
                 "Có thể nâng cấp riêng trong app/services/ai."
             )
 
+        bgm_audio: Path | None = None
+        if job.request.bgm_mode != BgmMode.none:
+            if job.request.use_demucs:
+                progress("Tách nhạc nền và giọng nói gốc bằng Demucs", 45)
+                try:
+                    demucs_audio = work_dir / "demucs_audio.wav"
+                    await extract_demucs_audio(ffmpeg, source_video, demucs_audio)
+                    bgm_audio = await separate_background_with_demucs(demucs_audio, work_dir / "separated" / "htdemucs" / demucs_audio.stem)
+                except Exception as exc:
+                    print(f"Demucs warning/error: {exc}")
+                    bgm_audio = None
+            else:
+                bgm_audio = None # Fallback to ducking or keeping original mix
+
+        subtitle_file: Path | None = None
         if job.request.hard_subtitles and job.request.source_has_hard_subtitles:
             subtitle_file = await get_or_create_subtitles(
                 str(job.request.source_url) if job.request.source_url else None,
@@ -88,6 +105,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=None,
                 narration_audio=narration_audio,
+                bgm_audio=bgm_audio,
                 progress_start=78,
             )
         elif job.request.hard_subtitles:
@@ -120,6 +138,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=subtitle_file,
                 narration_audio=narration_audio,
+                bgm_audio=bgm_audio,
                 progress_start=78,
             )
         else:
@@ -133,7 +152,43 @@ async def process_dubbing_job(job_id: str) -> None:
                 job.request,
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=None,
+                bgm_audio=bgm_audio,
             )
+
+        seo_title = "Video đã được xử lý"
+        seo_description = _completion_description(voice_warning)
+        
+        if job.request.auto_publish and PublishTarget.youtube in job.request.auto_publish:
+            progress("Đang sử dụng AI để tạo chi tiết video...", 85)
+            from app.services.ai.content import generate_video_details
+            
+            transcript_text = ""
+            if subtitle_file and subtitle_file.exists():
+                with open(subtitle_file, 'r', encoding='utf-8') as f:
+                    transcript_text = f.read()
+                    
+            video_details = await generate_video_details(transcript_text)
+            seo_title = video_details.title
+            seo_description = video_details.description
+            
+            progress("Tự động đăng lên YouTube...", 92)
+            from app.services.youtube.upload import upload_video_to_youtube
+            try:
+                # We can run upload in an executor since it's a blocking sync function
+                loop = asyncio.get_running_loop()
+                yt_response = await loop.run_in_executor(
+                    None, 
+                    upload_video_to_youtube,
+                    str(output_file.absolute()),
+                    seo_title,
+                    seo_description,
+                    video_details.tags,
+                    "public" # Hoặc private tuỳ ý
+                )
+                seo_description += f"\n\nĐã đăng lên YouTube thành công! Video ID: {yt_response['id']}"
+            except Exception as e:
+                print(f"Error uploading to YouTube: {e}")
+                seo_description += f"\n\nLỗi đăng YouTube: {e}"
 
         job_store.update(
             job_id,
@@ -142,12 +197,18 @@ async def process_dubbing_job(job_id: str) -> None:
             progress=100,
             output_video_url=f"/api/jobs/{job_id}/download",
             output_file_path=str(output_file),
-            seo_title="Video đã được xử lý",
-            seo_description=_completion_description(voice_warning),
+            seo_title=seo_title,
+            seo_description=seo_description,
             error=voice_warning,
         )
+    except asyncio.CancelledError:
+        job_store.update(job_id, status=JobStatus.failed, stage="Đã huỷ", error="Người dùng huỷ tiến trình.")
+        raise
     except Exception as exc:
         job_store.update(job_id, status=JobStatus.failed, stage="Xử lý thất bại", error=str(exc))
+    finally:
+        from app.services import task_manager
+        task_manager.unregister_task(job_id)
 
 
 async def _try_synthesize_voice(

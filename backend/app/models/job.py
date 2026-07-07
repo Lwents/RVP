@@ -18,16 +18,16 @@ class BgmMode(str, Enum):
     none = "none"
 
 
-class LogoPosition(str, Enum):
-    top_right = "top_right"
-    top_left = "top_left"
-    bottom_right = "bottom_right"
-    bottom_left = "bottom_left"
-
-
 class PublishTarget(str, Enum):
     youtube = "youtube"
     facebook = "facebook"
+
+
+class CustomBlurBox(BaseModel):
+    x_percent: int = Field(ge=0, le=100)
+    y_percent: int = Field(ge=0, le=100)
+    width_percent: int = Field(ge=1, le=100)
+    height_percent: int = Field(ge=1, le=100)
 
 
 class JobStatus(str, Enum):
@@ -42,6 +42,8 @@ class DubbingRequest(BaseModel):
     local_file_path: str | None = Field(default=None, max_length=500)
     voice_gender: VoiceGender = VoiceGender.female
     bgm_mode: BgmMode = BgmMode.demucs
+    use_demucs: bool = True
+    video_speed: float = Field(default=1.0, ge=0.5, le=2.0)
     auto_publish: list[PublishTarget] = Field(default_factory=list)
     clone_voice: bool = False
     hard_subtitles: bool = True
@@ -54,9 +56,18 @@ class DubbingRequest(BaseModel):
     subtitle_box_height_percent: int = Field(default=20, ge=8, le=45)
     source_language: LanguageOption = "auto"
     ducking_volume_db: int = Field(default=-12, ge=-36, le=0)
-    logo_position: LogoPosition = LogoPosition.top_right
     logo_width: int = Field(default=150, ge=32, le=800)
+    logo_x_percent: int = Field(default=90, ge=0, le=100)
+    logo_y_percent: int = Field(default=10, ge=0, le=100)
+    logo_enabled: bool = True
+    cinematic_bars_enabled: bool = False
+    cinematic_bars_height_percent: int = Field(default=10, ge=0, le=40)
+    blur_box_enabled: bool = False
+    blur_box_y_percent: int = Field(default=80, ge=0, le=100)
+    blur_box_height_percent: int = Field(default=15, ge=5, le=100)
+    custom_blur_boxes: list[CustomBlurBox] = Field(default_factory=list)
     watermark_file_name: str | None = None
+    output_resolution: str = "original"
 
     @model_validator(mode="after")
     def validate_input_source(self) -> "DubbingRequest":

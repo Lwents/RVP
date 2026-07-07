@@ -564,3 +564,53 @@ async def download_video(url: str, work_dir: Path, progress: Callable[[str, int]
         return await asyncio.to_thread(download)
     except subprocess.TimeoutExpired as exc:
         raise DownloadError("yt-dlp quá thời gian chờ 180 giây khi tải video.") from exc
+
+
+async def download_preview_video(url: str, work_dir: Path) -> Path:
+    output_template = str(work_dir / "preview.%(ext)s")
+    ffmpeg = find_ffmpeg()
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--force-ipv4",
+        "--socket-timeout",
+        "15",
+        "--retries",
+        "1",
+        "--fragment-retries",
+        "1",
+        "--no-playlist",
+        "--format",
+        "mp4[height<=480]/worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]/worst",
+        "--merge-output-format",
+        "mp4",
+        "--output",
+        output_template,
+    ]
+    if ffmpeg:
+        command.extend(["--ffmpeg-location", str(Path(ffmpeg).parent)])
+    js_runtime = _find_js_runtime()
+    if js_runtime:
+        command.extend(["--js-runtimes", js_runtime])
+    if settings.ytdlp_cookies_file:
+        command.extend(["--cookies", settings.ytdlp_cookies_file])
+    if settings.ytdlp_cookies_from_browser:
+        command.extend(["--cookies-from-browser", settings.ytdlp_cookies_from_browser])
+    command.append(url)
+
+    def download() -> Path:
+        completed = _run_ytdlp_with_cookie_fallback(command, url, timeout=120)
+        if completed.returncode != 0:
+            detail = _detail(completed)
+            raise DownloadError(f"Không thể tải bản xem trước. yt-dlp báo lỗi: {detail}")
+        matches = sorted(work_dir.glob("preview.*"), key=lambda item: item.stat().st_mtime, reverse=True)
+        for match in matches:
+            if match.suffix.lower() in VIDEO_SUFFIXES:
+                return match
+        raise DownloadError("Không tìm thấy file preview sau khi tải.")
+
+    try:
+        return await asyncio.to_thread(download)
+    except subprocess.TimeoutExpired as exc:
+        raise DownloadError("Quá thời gian chờ (120s) khi tải bản xem trước.") from exc

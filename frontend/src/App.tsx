@@ -11,9 +11,11 @@ import {
   Upload,
   Video,
   Wand2,
+  Youtube,
 } from "lucide-react";
-import { clearJobs, createJob, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
-import type { BgmMode, DubbingRequest, JobProgress, LogoPosition, VoiceGender } from "./types/api";
+import { cancelJob, clearJobs, createJob, fetchUrlPreview, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
+import type { BgmMode, DubbingRequest, JobProgress, VoiceGender } from "./types/api";
+import { YoutubeStats } from "./components/YoutubeStats";
 
 const languages = [
   { value: "auto", label: "Tự nhận diện" },
@@ -27,20 +29,31 @@ const defaultForm: DubbingRequest = {
   local_file_path: "",
   voice_gender: "female",
   bgm_mode: "demucs",
+  use_demucs: true,
+  video_speed: 1.0,
   auto_publish: [],
   clone_voice: false,
   hard_subtitles: true,
   source_has_hard_subtitles: false,
   subtitle_x_percent: 50,
   subtitle_y_percent: 78,
-  subtitle_font_size: 32,
+  subtitle_font_size: 48,
   subtitle_box_enabled: true,
   subtitle_box_opacity: 55,
   subtitle_box_height_percent: 20,
   source_language: "auto",
   ducking_volume_db: -12,
-  logo_position: "top_right",
+  output_resolution: "original",
+  logo_enabled: true,
   logo_width: 150,
+  logo_x_percent: 90,
+  logo_y_percent: 10,
+  cinematic_bars_enabled: false,
+  cinematic_bars_height_percent: 10,
+  blur_box_enabled: false,
+  blur_box_y_percent: 80,
+  blur_box_height_percent: 15,
+  custom_blur_boxes: [],
   watermark_file_name: null,
 };
 
@@ -55,8 +68,20 @@ export function App() {
   const [message, setMessage] = useState<string | null>(null);
   const [watermarkName, setWatermarkName] = useState("Chưa có logo được tải lên");
   const [videoName, setVideoName] = useState("Chưa có video được import");
+  const [previewVideoUrl, setPreviewVideoUrl] = useState<string | null>(null);
+  const [isPreviewLoading, setPreviewLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState<"workspace" | "youtube">("workspace");
 
   const videoInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Dọn dẹp object URL để tránh rò rỉ bộ nhớ
+  useEffect(() => {
+    return () => {
+      if (previewVideoUrl && previewVideoUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(previewVideoUrl);
+      }
+    };
+  }, [previewVideoUrl]);
 
   const canSubmit = useMemo(() => {
     return Boolean(form.source_url?.trim() || form.local_file_path?.trim()) && !isSubmitting;
@@ -127,6 +152,7 @@ export function App() {
         local_file_path: uploaded.local_file_path,
       }));
       setVideoName(file.name);
+      setPreviewVideoUrl(URL.createObjectURL(file));
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Import video thất bại.");
     } finally {
@@ -179,52 +205,106 @@ export function App() {
   }
 
   return (
-    <main className="app-shell">
-      <nav className="topbar">
+    <main className="ios-container">
+      <nav className="ios-navbar ios-glass">
         <a className="brand" href="/" aria-label="Auto-Translate AI">
           <span className="brand-mark">
             <Wand2 size={21} />
           </span>
           <span>Auto-Translate AI</span>
         </a>
-        <div className="topbar-actions">
-          <span className="health-pill">
+        <div className="nav-links">
+          <span className="health-pill" style={{ fontSize: '0.85rem', fontWeight: 600, color: '#047857', background: 'rgba(236, 253, 245, 0.7)', padding: '6px 12px', borderRadius: '999px', display: 'flex', alignItems: 'center', gap: '6px' }}>
             <BadgeCheck size={16} />
             Backend đang chạy
           </span>
-          <a className="docs-link" href="http://127.0.0.1:8000/docs" target="_blank" rel="noreferrer">
+          <button 
+            className={`ios-button ios-button-secondary ${activeTab === 'youtube' ? 'active' : ''}`} 
+            onClick={() => setActiveTab('youtube')}
+            style={{ padding: '8px 16px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.9rem' }}
+          >
+            <Youtube size={16} /> YouTube Stats
+          </button>
+          <button 
+            className={`ios-button ios-button-secondary ${activeTab === 'workspace' ? 'active' : ''}`} 
+            onClick={() => setActiveTab('workspace')}
+            style={{ padding: '8px 16px', fontSize: '0.9rem' }}
+          >
+            Workspace
+          </button>
+          <a className="ios-button ios-button-secondary" href="http://127.0.0.1:8000/docs" target="_blank" rel="noreferrer" style={{ textDecoration: 'none', padding: '8px 16px', fontSize: '0.9rem' }}>
             Tài liệu API
             <ChevronRight size={16} />
           </a>
         </div>
       </nav>
 
-      <header className="page-heading">
-        <div>
-          <p>Video dubbing workspace</p>
-          <h1>Cấu hình, kéo vị trí phụ đề và render video trong một màn hình.</h1>
+      {activeTab === 'youtube' ? (
+        <div key="youtube" className="ios-view-transition">
+          <YoutubeStats />
         </div>
-        <button className="primary-action compact" type="submit" form="dubbing-form" disabled={!canSubmit}>
+      ) : (
+        <div key="workspace" className="ios-view-transition">
+          <header className="page-heading">
+        <div>
+          <h1>Video dubbing workspace</h1>
+          <p>Cấu hình, kéo vị trí phụ đề và render video trực quan</p>
+        </div>
+        <button className="ios-button" type="submit" form="dubbing-form" disabled={!canSubmit}>
           {isSubmitting ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
           Render video
         </button>
       </header>
 
       <form id="dubbing-form" className="workspace" onSubmit={handleSubmit}>
-        <section className="panel control-panel">
+        <div className="controls-column">
+          <section className="ios-card">
           <SectionTitle index="01" title="Nguồn video" />
           <label className="field">
             <span>URL video</span>
-            <input
-              value={form.source_url ?? ""}
-              onChange={(event) => setField("source_url", event.target.value)}
-              placeholder="YouTube, TikTok hoặc Douyin"
-            />
+            <div style={{ display: "flex", gap: "10px" }}>
+              <input
+                className="ios-input"
+                value={form.source_url ?? ""}
+                onChange={(event) => {
+                  const val = event.target.value;
+                  setField("source_url", val);
+                  if (val.trim() && val.trim().toLowerCase().endsWith(".mp4")) {
+                    setPreviewVideoUrl(val);
+                  } else if (val.trim() === "") {
+                    setPreviewVideoUrl(null);
+                  }
+                }}
+                placeholder="YouTube, TikTok hoặc Douyin"
+              />
+              {form.source_url && !form.source_url.toLowerCase().endsWith(".mp4") && (
+                <button
+                  type="button"
+                  className="ios-button ios-button-secondary"
+                  style={{ width: "auto", padding: "0 14px", fontWeight: 600, whiteSpace: "nowrap" }}
+                  disabled={isPreviewLoading}
+                  onClick={async () => {
+                    setPreviewLoading(true);
+                    setMessage(null);
+                    try {
+                      const res = await fetchUrlPreview(form.source_url!);
+                      setPreviewVideoUrl(toAbsoluteApiUrl(res.url));
+                    } catch (e: any) {
+                      setMessage(e.message);
+                    } finally {
+                      setPreviewLoading(false);
+                    }
+                  }}
+                >
+                  {isPreviewLoading ? <Loader2 size={18} className="spin" /> : "Tải bản xem trước"}
+                </button>
+              )}
+            </div>
           </label>
           <div className="field">
             <span>File nội bộ</span>
-            <div className="upload-row file-import-row">
-              <button className="upload-button" type="button" onClick={openVideoPicker} disabled={isVideoUploading}>
+            <div className="upload-row">
+              <button className="ios-button" type="button" onClick={openVideoPicker} disabled={isVideoUploading}>
                 {isVideoUploading ? <Loader2 className="spin" size={17} /> : <Upload size={17} />}
                 <span>{isVideoUploading ? "Dang import..." : "Import video"}</span>
               </button>
@@ -245,7 +325,7 @@ export function App() {
           <div className="two-fields">
             <label className="field">
               <span>Ngôn ngữ gốc</span>
-              <select value={form.source_language} onChange={(event) => setField("source_language", event.target.value as DubbingRequest["source_language"])}>
+              <select className="ios-input" value={form.source_language} onChange={(event) => setField("source_language", event.target.value as DubbingRequest["source_language"])}>
                 {languages.map((language) => (
                   <option key={language.value} value={language.value}>
                     {language.label}
@@ -256,6 +336,7 @@ export function App() {
             <label className="field">
               <span>Ducking (dB)</span>
               <input
+                className="ios-input"
                 type="number"
                 min={-36}
                 max={0}
@@ -264,8 +345,10 @@ export function App() {
               />
             </label>
           </div>
+        </section>
 
-          <SectionTitle index="02" title="Tuỳ chọn xử lý" />
+        <section className="ios-card">
+          <SectionTitle index="02" title="Âm thanh & Giọng đọc" />
           <SegmentedControl<VoiceGender>
             label="Giọng đọc"
             value={form.voice_gender}
@@ -285,66 +368,206 @@ export function App() {
             ]}
             onChange={(value) => setField("bgm_mode", value)}
           />
+          {form.bgm_mode !== "none" && (
+            <div style={{ marginTop: 12, marginBottom: 12 }}>
+              <CheckBox 
+                checked={form.use_demucs} 
+                label="Dùng AI Demucs để tách sạch âm thanh (Render chậm hơn)" 
+                onChange={() => setField("use_demucs", !form.use_demucs)} 
+              />
+            </div>
+          )}
+        </section>
 
-          <div className="check-grid">
-            <CheckBox checked={form.hard_subtitles} label="Ghi phụ đề vào video" onChange={() => setField("hard_subtitles", !form.hard_subtitles)} />
-            <CheckBox
-              checked={form.source_has_hard_subtitles}
-              label="Video đã có phụ đề sẵn"
-              onChange={() => setField("source_has_hard_subtitles", !form.source_has_hard_subtitles)}
-            />
-            <CheckBox checked={false} disabled label="Clone giọng thủ công - chờ voice engine" onChange={() => undefined} />
-            <CheckBox checked={false} disabled label="YouTube Channel - chờ token" onChange={() => undefined} />
-            <CheckBox checked={false} disabled label="Facebook Page - chờ token" onChange={() => undefined} />
+        <section className="ios-card">
+          <SectionTitle index="03" title="Tuỳ chọn Video & Hình ảnh" />
+          <div className="two-fields" style={{ marginBottom: 14 }}>
+            <label className="field">
+              <span>Độ phân giải xuất</span>
+              <select className="ios-input" value={form.output_resolution} onChange={(event) => setField("output_resolution", event.target.value)}>
+                <option value="original">Giữ nguyên bản gốc</option>
+                <option value="720p">HD (720p)</option>
+                <option value="1080p">Full HD (1080p)</option>
+                <option value="1440p">2K (1440p)</option>
+                <option value="4k">4K (2160p)</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Tốc độ Video</span>
+              <select className="ios-input" value={form.video_speed} onChange={(event) => setField("video_speed", Number(event.target.value))}>
+                <option value={0.75}>Chậm (0.75x)</option>
+                <option value={1.0}>Bình thường (1x)</option>
+                <option value={1.25}>Nhanh (1.25x)</option>
+                <option value={1.5}>Rất nhanh (1.5x)</option>
+                <option value={2.0}>Siêu nhanh (2x)</option>
+              </select>
+            </label>
           </div>
 
-          <SectionTitle index="03" title="Logo" />
-          <div className="upload-row">
-            <label className="upload-button">
+          <div className="check-grid">
+            <CheckBox checked={form.hard_subtitles} label="Ghi phụ đề cứng vào video" onChange={() => setField("hard_subtitles", !form.hard_subtitles)} />
+            <CheckBox
+              checked={form.source_has_hard_subtitles}
+              label="Video nguồn đã có phụ đề sẵn"
+              onChange={() => setField("source_has_hard_subtitles", !form.source_has_hard_subtitles)}
+            />
+            <CheckBox checked={form.cinematic_bars_enabled} label="Dải đen viền video (Cinematic bars)" onChange={() => setField("cinematic_bars_enabled", !form.cinematic_bars_enabled)} />
+            <CheckBox checked={form.blur_box_enabled} label="Thanh làm mờ chữ gốc" onChange={() => setField("blur_box_enabled", !form.blur_box_enabled)} />
+            <CheckBox 
+              checked={form.logo_enabled} 
+              label="Đóng dấu Logo Watermark" 
+              onChange={() => setField("logo_enabled", !form.logo_enabled)} 
+            />
+            <CheckBox 
+              checked={form.auto_publish?.includes('youtube') ?? false} 
+              label="Tự động đăng YouTube sau khi render" 
+              onChange={() => {
+                const isEnabled = form.auto_publish?.includes('youtube');
+                setField('auto_publish', isEnabled ? (form.auto_publish || []).filter(t => t !== 'youtube') : [...(form.auto_publish || []), 'youtube' as any]);
+              }} 
+            />
+          </div>
+
+          <div style={{ marginTop: 14 }}>
+            <button
+              type="button"
+              className="ios-button ios-button-secondary"
+              onClick={() => {
+                const boxes = [...form.custom_blur_boxes];
+                boxes.push({ x_percent: 40, y_percent: 40, width_percent: 20, height_percent: 20 });
+                setField("custom_blur_boxes", boxes);
+              }}
+            >
+              + Thêm vùng làm mờ tuỳ chỉnh
+            </button>
+            <p className="hint-text" style={{ marginTop: 8 }}>
+              Kéo thả trực tiếp vùng làm mờ trên màn hình Live View bên cạnh. Có thể kéo góc để phóng to/thu nhỏ. Nháy đúp chuột để xoá.
+            </p>
+          </div>
+
+          {form.cinematic_bars_enabled && (
+            <label className="range-field" style={{ marginTop: 14 }}>
+              <span>
+                Độ dày dải đen (trên/dưới)
+                <strong>{form.cinematic_bars_height_percent}%</strong>
+              </span>
+              <input
+                type="range"
+                min={1}
+                max={40}
+                value={form.cinematic_bars_height_percent}
+                onChange={(event) => setField("cinematic_bars_height_percent", Number(event.target.value))}
+              />
+            </label>
+          )}
+
+          {form.blur_box_enabled && (
+            <div className="two-fields">
+              <label className="range-field">
+                <span>
+                  Vị trí dọc thanh mờ
+                  <strong>{form.blur_box_y_percent}%</strong>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={form.blur_box_y_percent}
+                  onChange={(event) => setField("blur_box_y_percent", Number(event.target.value))}
+                />
+              </label>
+              <label className="range-field">
+                <span>
+                  Độ cao thanh mờ
+                  <strong>{form.blur_box_height_percent}%</strong>
+                </span>
+                <input
+                  type="range"
+                  min={5}
+                  max={100}
+                  value={form.blur_box_height_percent}
+                  onChange={(event) => setField("blur_box_height_percent", Number(event.target.value))}
+                />
+              </label>
+            </div>
+          )}
+
+          {form.logo_enabled && (
+            <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid rgba(0,0,0,0.05)" }}>
+              <SectionTitle index="04" title="Cấu hình Logo" />
+              <div className="upload-row">
+                <button type="button" className="ios-button" onClick={() => document.getElementById('watermark-input')?.click()}>
               {isUploading ? <Loader2 className="spin" size={17} /> : <Upload size={17} />}
               <span>Chọn logo</span>
-              <input type="file" accept="image/*" onChange={handleWatermark} />
-            </label>
+            </button>
+            <input id="watermark-input" type="file" accept="image/*" onChange={handleWatermark} style={{ display: 'none' }} />
             <span className="upload-name">
               <FileImage size={17} />
               {watermarkName}
             </span>
           </div>
           <div className="two-fields">
-            <label className="field">
-              <span>Vị trí logo</span>
-              <select value={form.logo_position} onChange={(event) => setField("logo_position", event.target.value as LogoPosition)}>
-                <option value="top_right">Trên phải</option>
-                <option value="top_left">Trên trái</option>
-                <option value="bottom_right">Dưới phải</option>
-                <option value="bottom_left">Dưới trái</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Rộng logo</span>
+            <label className="range-field">
+              <span>
+                Vị trí ngang (X)
+                <strong>{form.logo_x_percent}%</strong>
+              </span>
               <input
-                type="number"
-                min={32}
-                max={800}
-                value={form.logo_width}
-                onChange={(event) => setField("logo_width", Number(event.target.value))}
+                type="range"
+                min={0}
+                max={100}
+                value={form.logo_x_percent}
+                onChange={(event) => setField("logo_x_percent", Number(event.target.value))}
+              />
+            </label>
+            <label className="range-field">
+              <span>
+                Vị trí dọc (Y)
+                <strong>{form.logo_y_percent}%</strong>
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={form.logo_y_percent}
+                onChange={(event) => setField("logo_y_percent", Number(event.target.value))}
               />
             </label>
           </div>
+              <label className="range-field" style={{ marginTop: 14 }}>
+                <span>
+                  Kích thước rộng logo
+                  <strong>{form.logo_width}px</strong>
+                </span>
+                <input
+                  type="range"
+                  min={32}
+                  max={800}
+                  value={form.logo_width}
+                  onChange={(event) => setField("logo_width", Number(event.target.value))}
+                />
+              </label>
+            </div>
+          )}
 
-          {message && <div className="message">{message}</div>}
+          {message && <div style={{ color: "#d32f2f", background: "#fdecec", padding: "12px", borderRadius: "12px", marginTop: "16px", fontWeight: 600 }}>{message}</div>}
         </section>
+        </div>
 
-        <section className="panel preview-panel">
-          <SectionTitle index="04" title="Live view phụ đề" />
-          <LivePreview form={form} setField={setField} />
-        </section>
+        <div className="preview-column" style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+          <section className="ios-card">
+            <SectionTitle index="05" title="Live view phụ đề" />
+            <LivePreview form={form} setField={setField} previewVideoUrl={previewVideoUrl} />
+          </section>
 
-        <aside className="side-stack">
-          <StatusPanel job={activeJob} />
-          <HistoryPanel jobs={jobs} onSelect={setActiveJobId} onClear={handleClearJobs} />
-        </aside>
+          <aside className="side-stack">
+            <StatusPanel job={activeJob} />
+            <HistoryPanel jobs={jobs} onSelect={setActiveJobId} onClear={handleClearJobs} />
+          </aside>
+        </div>
       </form>
+      </div>
+      )}
     </main>
   );
 }
@@ -361,12 +584,13 @@ function SectionTitle({ index, title }: { index: string; title: string }) {
 interface LivePreviewProps {
   form: DubbingRequest;
   setField: <K extends keyof DubbingRequest>(key: K, value: DubbingRequest[K]) => void;
+  previewVideoUrl: string | null;
 }
 
-function LivePreview({ form, setField }: LivePreviewProps) {
+function LivePreview({ form, setField, previewVideoUrl }: LivePreviewProps) {
   const frameRef = useRef<HTMLDivElement | null>(null);
 
-  function updatePosition(event: PointerEvent<HTMLDivElement>) {
+  function updateSubtitlePosition(event: PointerEvent<HTMLDivElement>) {
     const frame = frameRef.current;
     if (!frame) return;
     const rect = frame.getBoundingClientRect();
@@ -376,22 +600,193 @@ function LivePreview({ form, setField }: LivePreviewProps) {
     setField("subtitle_y_percent", clamp(y, 8, 94));
   }
 
-  function beginDrag(event: PointerEvent<HTMLDivElement>) {
+  function beginSubtitleDrag(event: PointerEvent<HTMLDivElement>) {
     event.currentTarget.setPointerCapture(event.pointerId);
-    updatePosition(event);
+    updateSubtitlePosition(event);
+  }
+
+  function updateLogoPosition(event: PointerEvent<HTMLImageElement>) {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const rect = frame.getBoundingClientRect();
+    const x = Math.round(((event.clientX - rect.left) / rect.width) * 100);
+    const y = Math.round(((event.clientY - rect.top) / rect.height) * 100);
+    setField("logo_x_percent", clamp(x, 0, 100));
+    setField("logo_y_percent", clamp(y, 0, 100));
+  }
+
+  function beginLogoDrag(event: PointerEvent<HTMLImageElement>) {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    updateLogoPosition(event);
+  }
+
+  function updateBlurBoxPosition(event: PointerEvent<HTMLDivElement>) {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const rect = frame.getBoundingClientRect();
+    const y = Math.round(((event.clientY - rect.top) / rect.height) * 100);
+    setField("blur_box_y_percent", clamp(y, 0, 100));
+  }
+
+  function beginBlurBoxDrag(event: PointerEvent<HTMLDivElement>) {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    updateBlurBoxPosition(event);
+  }
+
+  function updateCustomBlurBoxPosition(event: PointerEvent<HTMLDivElement>, index: number) {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const rect = frame.getBoundingClientRect();
+    const x = Math.round(((event.clientX - rect.left) / rect.width) * 100);
+    const y = Math.round(((event.clientY - rect.top) / rect.height) * 100);
+    
+    const boxes = [...form.custom_blur_boxes];
+    boxes[index] = { ...boxes[index], x_percent: clamp(x, 0, 100 - boxes[index].width_percent), y_percent: clamp(y, 0, 100 - boxes[index].height_percent) };
+    setField("custom_blur_boxes", boxes);
+  }
+
+  function beginCustomBlurBoxDrag(event: PointerEvent<HTMLDivElement>, index: number) {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+    updateCustomBlurBoxPosition(event, index);
+  }
+
+  function updateCustomBlurBoxSize(event: PointerEvent<HTMLDivElement>, index: number) {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const rect = frame.getBoundingClientRect();
+    const box = form.custom_blur_boxes[index];
+    const newWidth = Math.round(((event.clientX - rect.left) / rect.width) * 100) - box.x_percent;
+    const newHeight = Math.round(((event.clientY - rect.top) / rect.height) * 100) - box.y_percent;
+    
+    const boxes = [...form.custom_blur_boxes];
+    boxes[index] = { 
+      ...box, 
+      width_percent: clamp(newWidth, 2, 100 - box.x_percent), 
+      height_percent: clamp(newHeight, 2, 100 - box.y_percent) 
+    };
+    setField("custom_blur_boxes", boxes);
+  }
+
+  function beginCustomBlurBoxResize(event: PointerEvent<HTMLDivElement>, index: number) {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+    updateCustomBlurBoxSize(event, index);
   }
 
   const boxTop = clamp(form.subtitle_y_percent - form.subtitle_box_height_percent / 2, 0, 100 - form.subtitle_box_height_percent);
 
+
   return (
     <div className="live-editor">
       <div className="video-frame" ref={frameRef}>
-        <div className="sample-scene">
-          <div className="scene-grid" />
-          <div className="scene-person" />
-          <div className="scene-caption">Preview frame</div>
-        </div>
-        {form.subtitle_box_enabled && (
+        {previewVideoUrl ? (
+          <video
+            className="preview-video-element"
+            src={previewVideoUrl}
+            controls
+            autoPlay
+            loop
+            muted
+            playsInline
+            onError={(e) => {
+              (e.target as HTMLVideoElement).style.display = "none";
+            }}
+            onLoadStart={(e) => {
+              (e.target as HTMLVideoElement).style.display = "block";
+            }}
+          />
+        ) : (
+          <div className="sample-scene">
+            <div className="scene-grid" />
+            <div className="scene-person" />
+            <div className="scene-caption">Preview frame</div>
+          </div>
+        )}
+        
+        {form.cinematic_bars_enabled && form.cinematic_bars_height_percent > 0 && (
+          <>
+            <div className="cinematic-bar top" style={{ height: `${form.cinematic_bars_height_percent}%` }} />
+            <div className="cinematic-bar bottom" style={{ height: `${form.cinematic_bars_height_percent}%` }} />
+          </>
+        )}
+
+        {form.blur_box_enabled && (
+          <div
+            className="blur-box-layer"
+            style={{
+              top: `${clamp(form.blur_box_y_percent, 0, 100 - form.blur_box_height_percent)}%`,
+              height: `${form.blur_box_height_percent}%`,
+            }}
+            onPointerDown={beginBlurBoxDrag}
+            onPointerMove={(event) => {
+              if (event.buttons === 1) updateBlurBoxPosition(event);
+            }}
+          />
+        )}
+        
+        {form.custom_blur_boxes?.map((box, index) => (
+          <div
+            key={index}
+            className="custom-blur-box-layer"
+            style={{
+              left: `${box.x_percent}%`,
+              top: `${box.y_percent}%`,
+              width: `${box.width_percent}%`,
+              height: `${box.height_percent}%`,
+            }}
+            onPointerDown={(e) => beginCustomBlurBoxDrag(e, index)}
+            onPointerMove={(e) => {
+              if (e.buttons === 1) updateCustomBlurBoxPosition(e, index);
+            }}
+            onDoubleClick={() => {
+              const boxes = [...form.custom_blur_boxes];
+              boxes.splice(index, 1);
+              setField("custom_blur_boxes", boxes);
+            }}
+          >
+            <button
+              className="custom-blur-delete-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                const boxes = [...form.custom_blur_boxes];
+                boxes.splice(index, 1);
+                setField("custom_blur_boxes", boxes);
+              }}
+              title="Xoá vùng làm mờ"
+            >
+              ×
+            </button>
+            <div 
+              className="resize-handle"
+              onPointerDown={(e) => beginCustomBlurBoxResize(e, index)}
+              onPointerMove={(e) => {
+                if (e.buttons === 1) updateCustomBlurBoxSize(e, index);
+              }}
+            />
+          </div>
+        ))}
+
+        {form.logo_enabled && form.watermark_file_name && (
+          <img
+            src={toAbsoluteApiUrl(`/api/uploads/watermark/${form.watermark_file_name}`)}
+            className="watermark-logo-layer"
+            style={{
+              left: `${form.logo_x_percent}%`,
+              top: `${form.logo_y_percent}%`,
+              width: `${Math.max(32, form.logo_width * 0.6)}px`, // scale a bit for visual matching with FFmpeg
+              transform: `translate(-${form.logo_x_percent}%, -${form.logo_y_percent}%)`,
+            }}
+            alt="Logo"
+            draggable={false}
+            onPointerDown={beginLogoDrag}
+            onPointerMove={(event) => {
+              if (event.buttons === 1) updateLogoPosition(event);
+            }}
+          />
+        )}
+
+        {form.hard_subtitles && form.subtitle_box_enabled && (
           <div
             className="blur-band"
             style={{
@@ -401,26 +796,28 @@ function LivePreview({ form, setField }: LivePreviewProps) {
             }}
           />
         )}
-        <div
-          className="subtitle-layer"
-          style={{
-            left: `${form.subtitle_x_percent}%`,
-            top: `${form.subtitle_y_percent}%`,
-            fontSize: `${Math.max(16, form.subtitle_font_size * 0.72)}px`,
-          }}
-          onPointerDown={beginDrag}
-          onPointerMove={(event) => {
-            if (event.buttons === 1) updatePosition(event);
-          }}
-        >
-          <span>Phụ đề sẽ nằm ở đây sau khi render</span>
-        </div>
+        {form.hard_subtitles && (
+          <div
+            className="subtitle-layer"
+            style={{
+              left: `${form.subtitle_x_percent}%`,
+              top: `${form.subtitle_y_percent}%`,
+              fontSize: `${Math.max(16, form.subtitle_font_size * 0.72)}px`,
+            }}
+            onPointerDown={beginSubtitleDrag}
+            onPointerMove={(event) => {
+              if (event.buttons === 1) updateSubtitlePosition(event);
+            }}
+          >
+            <span>Phụ đề sẽ nằm ở đây sau khi render</span>
+          </div>
+        )}
       </div>
 
-      <div className="editor-grid">
+      <div className="editor-grid" style={{ opacity: form.hard_subtitles ? 1 : 0.4, pointerEvents: form.hard_subtitles ? "auto" : "none" }}>
         <RangeField label="Vị trí ngang" value={form.subtitle_x_percent} min={0} max={100} onChange={(value) => setField("subtitle_x_percent", value)} suffix="%" />
         <RangeField label="Vị trí dọc" value={form.subtitle_y_percent} min={8} max={94} onChange={(value) => setField("subtitle_y_percent", value)} suffix="%" />
-        <RangeField label="Cỡ chữ" value={form.subtitle_font_size} min={16} max={72} onChange={(value) => setField("subtitle_font_size", value)} suffix="px" />
+        <RangeField label="Cỡ chữ" value={form.subtitle_font_size} min={16} max={120} onChange={(value) => setField("subtitle_font_size", value)} suffix="px" />
         <RangeField
           label="Cao thanh mờ"
           value={form.subtitle_box_height_percent}
@@ -509,31 +906,98 @@ function CheckBox({ checked, label, onChange, disabled = false }: { checked: boo
 }
 
 function StatusPanel({ job }: { job: JobProgress | null }) {
+  const [etaText, setEtaText] = useState<string | null>(null);
+  const lastProgressRef = useRef<{ progress: number; time: number; stage: string } | null>(null);
+
+  useEffect(() => {
+    if (!job || job.status !== "processing" || job.progress >= 100) {
+      setEtaText(null);
+      lastProgressRef.current = null;
+      return;
+    }
+
+    const now = Date.now();
+    const current = lastProgressRef.current;
+
+    if (!current || job.stage !== current.stage) {
+      lastProgressRef.current = { progress: job.progress, time: now, stage: job.stage };
+      setEtaText(null);
+    } else {
+      const progressDelta = job.progress - current.progress;
+      const timeDelta = now - current.time;
+      
+      // Calculate ETA only if progress advances slightly to get a better estimate
+      if (progressDelta > 0) {
+        const remainingProgress = 100 - job.progress;
+        const timePerPercent = timeDelta / progressDelta;
+        const msRemaining = timePerPercent * remainingProgress;
+        
+        const secs = Math.ceil(msRemaining / 1000);
+        if (secs > 60) {
+          setEtaText(`~ ${Math.floor(secs / 60)} phút ${secs % 60} giây`);
+        } else {
+          setEtaText(`~ ${secs} giây`);
+        }
+      }
+    }
+  }, [job]);
+
   if (!job) {
     return (
-      <section className="panel status-panel">
+      <section className="ios-card">
         <h2>Trạng thái</h2>
-        <p className="muted">Chưa có job đang chọn.</p>
+        <p style={{ color: "#86868b", marginTop: "8px" }}>Chưa có job đang chọn.</p>
       </section>
     );
   }
 
   return (
-    <section className="panel status-panel">
-      <div className="status-heading">
-        <span className={`status-pill ${job.status}`}>{statusLabel(job.status)}</span>
+    <section className="ios-card">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <span style={{ fontSize: "0.85rem", fontWeight: 700, textTransform: "uppercase", padding: "4px 10px", borderRadius: "999px", background: "rgba(0,0,0,0.05)" }}>
+            {statusLabel(job.status)}
+          </span>
+          {(job.status === "processing" || job.status === "queued") && (
+            <button 
+              type="button"
+              className="ios-button ios-button-secondary"
+              style={{ padding: "4px 12px", fontSize: "0.8rem" }}
+              onClick={async () => {
+                if (window.confirm("Bạn có chắc chắn muốn hủy tiến trình này?")) {
+                  try {
+                    await cancelJob(job.job_id);
+                  } catch (e) {
+                    alert("Không thể hủy: " + (e as Error).message);
+                  }
+                }
+              }}
+            >
+              Hủy xử lý
+            </button>
+          )}
+        </div>
         <span>{job.progress}%</span>
       </div>
-      <h2>{job.stage}</h2>
-      <div className="progress-bar">
-        <span style={{ width: `${job.progress}%` }} />
+      <h2 style={{ fontSize: "1.1rem", marginBottom: "8px" }}>{job.stage}</h2>
+      {etaText && <p style={{ color: "#86868b", fontSize: '0.9rem', marginBottom: '16px' }}>Dự kiến còn: <strong>{etaText}</strong></p>}
+      <div style={{ height: "12px", background: "rgba(0,0,0,0.05)", borderRadius: "999px", overflow: "hidden", marginBottom: "16px" }}>
+        <div style={{ width: `${job.progress}%`, height: "100%", background: "#0071e3", borderRadius: "999px", transition: "width 0.3s" }} />
       </div>
       {job.error && <ErrorMessage error={job.error} />}
       {job.output_video_url && (
-        <a className="download-link" href={toAbsoluteApiUrl(job.output_video_url)} target="_blank" rel="noreferrer">
+        <a className="ios-button" href={toAbsoluteApiUrl(job.output_video_url)} target="_blank" rel="noreferrer" style={{ textDecoration: "none", width: "100%" }}>
           <Download size={17} />
           Tải video đầu ra
         </a>
+      )}
+      {job.status === "completed" && job.created_at && job.updated_at && (
+        <p className="muted" style={{ marginTop: 12, fontSize: '0.85rem' }}>
+          Tổng thời gian xử lý: <strong>{(() => {
+            const diffSecs = Math.floor((new Date(job.updated_at).getTime() - new Date(job.created_at).getTime()) / 1000);
+            return diffSecs > 60 ? `${Math.floor(diffSecs / 60)} phút ${diffSecs % 60} giây` : `${diffSecs} giây`;
+          })()}</strong>
+        </p>
       )}
     </section>
   );
@@ -541,32 +1005,46 @@ function StatusPanel({ job }: { job: JobProgress | null }) {
 
 function HistoryPanel({ jobs, onSelect, onClear }: { jobs: JobProgress[]; onSelect: (id: string) => void; onClear: () => void }) {
   return (
-    <section className="panel history-panel">
-      <div className="history-heading">
-      <h2>
-        <Video size={20} />
+    <section className="ios-card">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
+      <h2 style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "1.2rem" }}>
+        <Video size={20} color="#0071e3" />
         Job gần đây
       </h2>
       {jobs.length > 0 && (
-        <button className="trash-action" type="button" onClick={onClear} title="Đưa file job và video đã render vào Thùng rác">
+        <button className="ios-button ios-button-secondary" type="button" onClick={onClear} title="Đưa file job và video đã render vào Thùng rác" style={{ padding: "6px 12px", fontSize: "0.85rem", color: "#d32f2f" }}>
           <Trash2 size={17} />
           <span>Xoá tất cả</span>
         </button>
       )}
       </div>
       {jobs.length === 0 ? (
-        <p className="muted">Chưa có job nào.</p>
+        <p style={{ color: "#86868b" }}>Chưa có job nào.</p>
       ) : (
-        <div className="job-list">
+        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
           {jobs.map((job) => (
-            <button key={job.job_id} type="button" onClick={() => onSelect(job.job_id)}>
-              <span className={`dot ${job.status}`} />
-              <span>
-                <strong>{job.stage}</strong>
-                <small>
+            <button 
+              key={job.job_id} 
+              type="button" 
+              onClick={() => onSelect(job.job_id)}
+              style={{ display: "flex", alignItems: "flex-start", gap: "12px", padding: "12px", background: "rgba(255,255,255,0.5)", border: "1px solid rgba(255,255,255,0.8)", borderRadius: "16px", textAlign: "left", width: "100%", transition: "all 0.2s" }}
+            >
+              <span style={{ width: "10px", height: "10px", borderRadius: "50%", background: job.status === "completed" ? "#34c759" : job.status === "failed" ? "#ff3b30" : "#007aff", marginTop: "6px", flexShrink: 0 }} />
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <strong style={{ fontSize: "0.95rem" }}>{job.stage}</strong>
+                <span style={{ fontSize: "0.85rem", color: "#86868b" }}>
                   {job.progress}% - {languageLabel(job.request.source_language)}
-                </small>
-              </span>
+                  {job.status === "completed" && job.created_at && job.updated_at && (
+                    <>
+                      {" • "}
+                      {(() => {
+                        const diffSecs = Math.floor((new Date(job.updated_at).getTime() - new Date(job.created_at).getTime()) / 1000);
+                        return diffSecs > 60 ? `${Math.floor(diffSecs / 60)} phút ${diffSecs % 60} giây` : `${diffSecs} giây`;
+                      })()}
+                    </>
+                  )}
+                </span>
+              </div>
             </button>
           ))}
         </div>
@@ -577,11 +1055,11 @@ function HistoryPanel({ jobs, onSelect, onClear }: { jobs: JobProgress[]; onSele
 
 function ErrorMessage({ error }: { error: string }) {
   return (
-    <div className="message error">
-      <strong>{friendlyError(error)}</strong>
+    <div style={{ background: "#fdecec", border: "1px solid #f8bbd0", padding: "16px", borderRadius: "16px", marginBottom: "16px", color: "#d32f2f" }}>
+      <strong style={{ display: "block", marginBottom: "8px" }}>{friendlyError(error)}</strong>
       <details>
-        <summary>Chi tiết kỹ thuật</summary>
-        <pre>{error}</pre>
+        <summary style={{ cursor: "pointer", fontWeight: 600, fontSize: "0.9rem" }}>Chi tiết kỹ thuật</summary>
+        <pre style={{ marginTop: "8px", fontSize: "0.8rem", whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{error}</pre>
       </details>
     </div>
   );
@@ -604,10 +1082,13 @@ function languageLabel(value: string) {
 function friendlyError(error: string) {
   const value = error.toLowerCase();
   const platform = value.includes("douyin") ? "Douyin" : value.includes("tiktok") ? "TikTok" : value.includes("youtube") ? "YouTube" : "nền tảng này";
+  if (value.includes("edge tts") || value.includes("voice") || value.includes("tts") || value.includes("no audio was received")) {
+    return "Không tạo được giọng đọc tiếng Việt. Backend sẽ tự chia nhỏ và thử lại, nếu vẫn lỗi hãy kiểm tra mạng/Edge TTS.";
+  }
   if (value.includes("video unavailable") || value.includes("restricted")) {
     return "Video này đang bị nền tảng hoặc mạng/tài khoản hạn chế, backend không tải được. Hãy thử link công khai khác, dùng file nội bộ, hoặc cấu hình cookie hợp lệ.";
   }
-  if (value.includes("fresh cookies") || value.includes("login") || value.includes("captcha") || value.includes("verify")) {
+  if (value.includes("fresh cookies") || value.includes("login") || value.includes("captcha") || value.includes("verify your identity") || value.includes("verification")) {
     return `${platform} yêu cầu cookie đăng nhập mới hoặc đang chặn xác minh. Hãy dùng link công khai khác, tải video về máy rồi chọn File nội bộ, hoặc xuất cookie Netscape và cấu hình AUTO_TRANSLATE_YTDLP_COOKIES_FILE.`;
   }
   if (value.includes("could not copy") || value.includes("cookie database") || value.includes("could not read")) {
@@ -615,9 +1096,6 @@ function friendlyError(error: string) {
   }
   if (value.includes("cookie")) {
     return `${platform} cần cookie hợp lệ. Hãy dùng link công khai khác, tải video về máy rồi chọn File nội bộ, hoặc cấu hình AUTO_TRANSLATE_YTDLP_COOKIES_FILE.`;
-  }
-  if (value.includes("voice") || value.includes("tts")) {
-    return "Không tạo được giọng đọc. Kiểm tra mạng và voice engine Edge TTS.";
   }
   if (value.includes("ffmpeg")) {
     return "FFmpeg xử lý video thất bại. Kiểm tra file nguồn hoặc định dạng video.";

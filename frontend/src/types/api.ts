@@ -1,15 +1,23 @@
 export type VoiceGender = "female" | "male";
 export type BgmMode = "demucs" | "ducking" | "none";
-export type LogoPosition = "top_right" | "top_left" | "bottom_right" | "bottom_left";
 export type PublishTarget = "youtube" | "facebook";
 export type JobStatus = "queued" | "processing" | "completed" | "failed";
 export type SourceLanguage = "auto" | "en" | "zh" | "vi";
+
+export interface CustomBlurBox {
+  x_percent: number;
+  y_percent: number;
+  width_percent: number;
+  height_percent: number;
+}
 
 export interface DubbingRequest {
   source_url?: string | null;
   local_file_path?: string | null;
   voice_gender: VoiceGender;
   bgm_mode: BgmMode;
+  use_demucs: boolean;
+  video_speed: number;
   auto_publish: PublishTarget[];
   clone_voice: boolean;
   hard_subtitles: boolean;
@@ -22,8 +30,17 @@ export interface DubbingRequest {
   subtitle_box_height_percent: number;
   source_language: SourceLanguage;
   ducking_volume_db: number;
-  logo_position: LogoPosition;
+  output_resolution: string;
+  logo_enabled: boolean;
   logo_width: number;
+  logo_x_percent: number;
+  logo_y_percent: number;
+  cinematic_bars_enabled: boolean;
+  cinematic_bars_height_percent: number;
+  blur_box_enabled: boolean;
+  blur_box_y_percent: number;
+  blur_box_height_percent: number;
+  custom_blur_boxes: CustomBlurBox[];
   watermark_file_name?: string | null;
 }
 

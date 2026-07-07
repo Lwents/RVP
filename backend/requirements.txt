@@ -17,3 +17,9 @@ aiosqlite>=0.19.0
 gmssl>=3.2.2
 imageio-ffmpeg==0.6.0
 python-dateutil>=2.8.2
+demucs>=4.0.1
+numpy
+openai
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2

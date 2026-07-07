@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     target_language: str = "vi"
     ffmpeg_path: str | None = None
     video_encoder: str = "h264_nvenc"
-    video_crf: int = 12
+    video_crf: int = 23
     video_preset: str = "slow"
     ytdlp_format: str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best"
     ytdlp_download_timeout_seconds: int = 1800
@@ -40,10 +40,15 @@ class Settings(BaseSettings):
     tts_chunk_chars: int = 900
     tts_chunk_timeout_seconds: int = 120
     tts_chunk_retries: int = 3
-    render_without_tts_on_error: bool = True
-    subtitle_group_max_chars: int = 140
-    subtitle_group_max_duration: float = 7.5
+    render_without_tts_on_error: bool = False
+    subtitle_group_max_chars: int = 70
+    subtitle_group_max_duration: float = 4.5
     subtitle_group_max_gap: float = 0.75
+    
+    ninerouter_api_url: str = "http://localhost:20128/v1"
+    ninerouter_api_key: str = "sk-placeholder"
+    youtube_client_secrets_file: str = "client_secret.json"
+    youtube_credentials_file: str = "storage/youtube_credentials.json"
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="AUTO_TRANSLATE_", extra="ignore")
 

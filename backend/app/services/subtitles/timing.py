@@ -1,3 +1,10 @@
+"""
+Subtitle timing utilities: parse SRT, normalize, group events.
+
+Cải tiến:
+- group_subtitle_events: không cắt giữa câu chưa hoàn chỉnh (kết thúc bằng từ nối / dấu phẩy)
+- Heuristic: nếu câu hiện tại chưa xong ý (cuối là và/nhưng/that/which...) → nối tiếp
+"""
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +51,26 @@ def normalize_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
     return normalized
 
 
+# Các từ nối — nếu câu kết thúc bằng những từ này, chưa nên cắt
+_INCOMPLETE_SENTENCE_RE = re.compile(
+    r"\b(?:and|but|or|so|because|that|which|who|when|where|if|as|"
+    r"và|nhưng|hoặc|vì|mà|thì|hay|khi|nếu|để|rằng|với|còn|dù|tuy|"
+    r"because|although|though|unless|until|while|since|after|before|"
+    r"however|therefore|moreover|furthermore|meanwhile|nevertheless)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _sentence_incomplete(text: str) -> bool:
+    """Trả về True nếu câu chưa hoàn chỉnh (kết thúc bằng dấu phẩy hoặc từ nối)."""
+    stripped = text.strip()
+    if stripped.endswith(","):
+        return True
+    if _INCOMPLETE_SENTENCE_RE.search(stripped):
+        return True
+    return False
+
+
 def group_subtitle_events(
     events: list[SubtitleEvent],
     max_chars: int = 90,
@@ -70,19 +97,33 @@ def group_subtitle_events(
             continue
         if not current:
             current.append(event)
-            if _ends_sentence(event.text):
+            # Chỉ flush ngay nếu câu đã hoàn chỉnh VÀ đủ dài
+            if _ends_sentence(event.text) and not _sentence_incomplete(event.text):
                 flush()
             continue
 
         gap = event.start - current[-1].end
         duration = event.end - current[0].start
         merged_text = current_text(event)
-        if gap > max_gap or duration > max_duration or len(merged_text) > max_chars:
+
+        # Điều kiện cắt: vượt quá giới hạn
+        hard_limit = len(merged_text) > max_chars or duration > max_duration
+        # Khoảng cách lớn VÀ câu trước đã hoàn chỉnh → cắt
+        gap_cut = gap > max_gap and _ends_sentence(current_text()) and not _sentence_incomplete(current_text())
+
+        should_flush = hard_limit or gap_cut
+
+        if should_flush:
             flush()
 
         current.append(event)
-        if _ends_sentence(event.text) or len(current_text()) >= max_chars:
-            flush()
+
+        # Flush nếu câu hoàn chỉnh (kết thúc bằng dấu câu, không phải từ nối)
+        if _ends_sentence(event.text) and not _sentence_incomplete(event.text):
+            if len(current_text()) >= max_chars * 0.5:  # ít nhất 50% capacity
+                flush()
+            elif gap > max_gap:
+                flush()
 
     flush()
     return grouped
@@ -121,4 +162,4 @@ def _timestamp_seconds(value: str) -> float:
 
 
 def _ends_sentence(text: str) -> bool:
-    return text.rstrip().endswith((".", "?", "!", "。", "？", "！"))
+    return text.rstrip().endswith((".", "?", "!", "…", "。", "？", "！"))
