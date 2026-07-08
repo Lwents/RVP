@@ -38,19 +38,28 @@ def upload_video_to_youtube(video_path: str, title: str, description: str, tags:
     return response
 
 def get_channel_videos_stats():
-    """Lấy số liệu thống kê (views, likes) của các video đã upload trên kênh."""
+    """Lấy số liệu thống kê chi tiết của kênh và danh sách video."""
     youtube = get_youtube_client()
     
-    # 1. Lấy Uploads playlist ID của channel
+    # 1. Lấy thông tin chi tiết của Channel (avatar, subs, views, uploads playlist)
     channel_response = youtube.channels().list(
-        part="contentDetails",
+        part="snippet,contentDetails,statistics",
         mine=True
     ).execute()
     
     if not channel_response.get("items"):
-        return []
+        return {"channel": None, "videos": []}
         
-    uploads_playlist_id = channel_response["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    channel_item = channel_response["items"][0]
+    channel_info = {
+        "title": channel_item["snippet"]["title"],
+        "avatar": channel_item["snippet"]["thumbnails"].get("medium", channel_item["snippet"]["thumbnails"]["default"])["url"],
+        "subscribers": channel_item["statistics"].get("subscriberCount", "0"),
+        "views": channel_item["statistics"].get("viewCount", "0"),
+        "videos_count": channel_item["statistics"].get("videoCount", "0")
+    }
+    
+    uploads_playlist_id = channel_item["contentDetails"]["relatedPlaylists"]["uploads"]
     
     # 2. Lấy danh sách video ID trong playlist uploads
     playlist_response = youtube.playlistItems().list(
@@ -61,24 +70,26 @@ def get_channel_videos_stats():
     
     video_ids = [item["contentDetails"]["videoId"] for item in playlist_response.get("items", [])]
     if not video_ids:
-        return []
+        return {"channel": channel_info, "videos": []}
         
-    # 3. Lấy stats cho các video ID này
+    # 3. Lấy stats, status, và contentDetails (duration) cho các video ID này
     videos_response = youtube.videos().list(
-        part="snippet,statistics",
+        part="snippet,statistics,status,contentDetails",
         id=",".join(video_ids)
     ).execute()
     
-    stats = []
+    videos = []
     for video in videos_response.get("items", []):
-        stats.append({
+        videos.append({
             "id": video["id"],
             "title": video["snippet"]["title"],
-            "thumbnail": video["snippet"]["thumbnails"].get("medium", {}).get("url", ""),
+            "thumbnail": video["snippet"]["thumbnails"].get("medium", video["snippet"]["thumbnails"]["default"])["url"],
             "published_at": video["snippet"]["publishedAt"],
             "views": video["statistics"].get("viewCount", "0"),
             "likes": video["statistics"].get("likeCount", "0"),
             "comments": video["statistics"].get("commentCount", "0"),
+            "privacy": video["status"].get("privacyStatus", "public"),
+            "duration": video["contentDetails"].get("duration", "")
         })
         
-    return stats
+    return {"channel": channel_info, "videos": videos}

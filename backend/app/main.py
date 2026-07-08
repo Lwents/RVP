@@ -1,3 +1,20 @@
+import socket
+# Force IPv4 to bypass broken local IPv6 network configurations on Windows
+orig_getaddrinfo = socket.getaddrinfo
+def patched_getaddrinfo(*args, **kwargs):
+    responses = orig_getaddrinfo(*args, **kwargs)
+    return [r for r in responses if r[0] == socket.AF_INET]
+socket.getaddrinfo = patched_getaddrinfo
+
+import sys
+if sys.platform.startswith("win"):
+    import io
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from pathlib import Path
 
 from fastapi import FastAPI

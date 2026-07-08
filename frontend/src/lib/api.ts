@@ -93,17 +93,70 @@ export async function fetchUrlPreview(url: string): Promise<UploadResponse> {
   return response.json() as Promise<UploadResponse>;
 }
 
-export async function getYoutubeAuthUrl(): Promise<{url: string}> {
-  return request("/api/youtube/auth-url");
+export async function getYoutubeAuthUrl(redirectUri: string): Promise<{url: string}> {
+  return request(`/api/youtube/auth-url?redirect_uri=${encodeURIComponent(redirectUri)}`);
 }
 
-export async function sendYoutubeCallbackCode(code: string): Promise<any> {
+export async function sendYoutubeCallbackCode(code: string, redirectUri: string): Promise<any> {
   return request("/api/youtube/callback", {
     method: "POST",
-    body: JSON.stringify({ code })
+    body: JSON.stringify({ code, redirect_uri: redirectUri })
   });
 }
 
-export async function getYoutubeStats(): Promise<any[]> {
+export async function getYoutubeStats(): Promise<any> {
   return request("/api/youtube/stats");
+}
+
+export async function uploadYoutubeClientSecret(file: File): Promise<{ status: string; message: string }> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(`${API_URL}/api/youtube/client-secret`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    try {
+      const parsed = JSON.parse(detail);
+      throw new Error(parsed.detail || "Upload client_secret failed");
+    } catch {
+      throw new Error(detail || "Upload client_secret failed");
+    }
+  }
+  return response.json() as Promise<{ status: string; message: string }>;
+}
+
+export interface DetectedBlurRegion {
+  x_percent: number;
+  y_percent: number;
+  width_percent: number;
+  height_percent: number;
+  label?: string;
+}
+
+export async function detectBlurRegions(
+  videoPath: string,
+  detectSub: boolean = true,
+  detectLogo: boolean = true,
+  engine: string = "local",
+): Promise<{ 
+  regions: DetectedBlurRegion[]; 
+  count: number; 
+  auto_logo?: { 
+    watermark_file_name: string; 
+    logo_x_percent: number; 
+    logo_y_percent: number; 
+    logo_enabled: boolean 
+  } 
+}> {
+  return request("/api/analyze/detect-regions", {
+    method: "POST",
+    body: JSON.stringify({
+      video_path: videoPath,
+      detect_sub: detectSub,
+      detect_logo: detectLogo,
+      engine,
+    }),
+  });
 }

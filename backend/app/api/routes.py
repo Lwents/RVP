@@ -167,11 +167,30 @@ from pydantic import BaseModel
 
 class YoutubeCallbackRequest(BaseModel):
     code: str
+    redirect_uri: str = "http://localhost:5173/youtube/callback"
+
+@router.post("/youtube/client-secret", tags=["youtube"])
+async def upload_client_secret(file: UploadFile = File(...)):
+    try:
+        data = await file.read()
+        import json
+        secret_data = json.loads(data)
+        if "web" not in secret_data and "installed" not in secret_data:
+            raise HTTPException(status_code=400, detail="Định dạng file client_secret.json không hợp lệ. Phải chứa khoá 'web' hoặc 'installed'.")
+        
+        dest = Path(settings.youtube_client_secrets_file)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        return {"status": "success", "message": "Đã lưu tệp client_secret.json thành công."}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Tệp tải lên không phải là định dạng JSON hợp lệ.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/youtube/auth-url", tags=["youtube"])
-async def get_yt_auth_url():
+async def get_yt_auth_url(redirect_uri: str = "http://localhost:5173/youtube/callback"):
     try:
-        url = get_youtube_auth_url()
+        url = get_youtube_auth_url(redirect_uri=redirect_uri)
         return {"url": url}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -179,7 +198,7 @@ async def get_yt_auth_url():
 @router.post("/youtube/callback", tags=["youtube"])
 async def yt_callback(req: YoutubeCallbackRequest):
     try:
-        result = handle_oauth2_callback(req.code)
+        result = handle_oauth2_callback(req.code, redirect_uri=req.redirect_uri)
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -191,3 +210,92 @@ async def yt_stats():
         return stats
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ─── Auto-detect blur regions ─────────────────────────────────────────────────
+
+class DetectRegionsRequest(BaseModel):
+    video_path: str
+    detect_sub: bool = True
+    detect_logo: bool = True
+    engine: str = "local"
+
+
+@router.post("/analyze/detect-regions", tags=["analyze"])
+async def detect_blur_regions(req: DetectRegionsRequest):
+    """
+    Phân tích video gốc để tự động nhận diện:
+    - Vùng chứa sub chữ Trung/Hán
+    - Vùng logo/watermark cố định của kênh gốc
+    Hỗ trợ công nghệ Cục bộ (local) hoặc Trí tuệ nhân tạo (ai via 9router).
+    """
+    from app.services.ai.detect_regions import auto_detect_blur_regions_local, auto_detect_blur_regions_ai
+    import asyncio
+
+    video_path = req.video_path
+    path_obj = Path(video_path)
+    
+    # Try resolving relative to storage_dir if direct file doesn't exist
+    if not path_obj.exists():
+        path_obj = Path(settings.storage_dir) / video_path
+        
+    # Handle case where path already starts with storage folder name
+    if not path_obj.exists() and video_path.startswith("storage/"):
+        path_obj = Path(settings.storage_dir) / video_path[len("storage/"):]
+        
+    if not path_obj.exists():
+        raise HTTPException(status_code=404, detail=f"Không tìm thấy video: {video_path} (đã thử phân giải thành {path_obj})")
+
+    video_path = str(path_obj.resolve())
+
+    try:
+        # Tự động chèn logo kênh sang bên trái từ thư mục người dùng
+        logo_dir = Path(r"C:\Users\kirit\Pictures\logo")
+        auto_logo_data = None
+        if logo_dir.exists() and logo_dir.is_dir():
+            # Quét tìm ảnh đầu tiên
+            logo_src = None
+            for ext in ["*.png", "*.jpg", "*.jpeg", "*.webp"]:
+                found = list(logo_dir.glob(ext))
+                if found:
+                    logo_src = found[0]
+                    break
+            
+            if logo_src:
+                try:
+                    dest_dir = Path(settings.storage_dir)
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    safe_name = f"logo_kenh{logo_src.suffix}"
+                    import shutil
+                    shutil.copy(logo_src, dest_dir / safe_name)
+                    auto_logo_data = {
+                        "watermark_file_name": safe_name,
+                        "logo_x_percent": 2,
+                        "logo_y_percent": 3,
+                        "logo_enabled": True,
+                        "display_name": logo_src.name
+                    }
+                except Exception as e:
+                    print(f"Lỗi sao chép logo từ {logo_src}: {e}")
+
+        if req.engine == "ai":
+            # Gọi trực tiếp vì hàm async
+            regions = await auto_detect_blur_regions_ai(
+                video_path,
+                detect_sub=req.detect_sub,
+                detect_logo=req.detect_logo,
+            )
+        else:
+            # Chạy local (đồng bộ) trong thread pool
+            loop = asyncio.get_event_loop()
+            regions = await loop.run_in_executor(
+                None,
+                lambda: auto_detect_blur_regions_local(
+                    video_path,
+                    detect_sub=req.detect_sub,
+                    detect_logo=req.detect_logo,
+                )
+            )
+        return {"regions": regions, "count": len(regions), "auto_logo": auto_logo_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi phân tích video: {str(e)}")

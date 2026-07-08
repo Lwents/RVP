@@ -68,6 +68,8 @@ class DubbingRequest(BaseModel):
     custom_blur_boxes: list[CustomBlurBox] = Field(default_factory=list)
     watermark_file_name: str | None = None
     output_resolution: str = "original"
+    auto_detect_sub: bool = False
+    auto_detect_logo: bool = False
 
     @model_validator(mode="after")
     def validate_input_source(self) -> "DubbingRequest":

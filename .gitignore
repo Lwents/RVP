@@ -5,6 +5,9 @@ dist/
 __pycache__/
 *.pyc
 .env
+client_secret.json
+**/client_secret.json
+**/*credentials*.json
 tools/
 backend/storage/*
 !backend/storage/.gitkeep

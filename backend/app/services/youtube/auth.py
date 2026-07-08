@@ -23,6 +23,12 @@ def get_youtube_auth_url(redirect_uri: str = "http://localhost:5173/youtube/call
         redirect_uri=redirect_uri
     )
     auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+    
+    # Save PKCE code_verifier for stateless callback verification
+    verifier_path = Path(settings.storage_dir) / "oauth_code_verifier.txt"
+    verifier_path.parent.mkdir(parents=True, exist_ok=True)
+    verifier_path.write_text(flow.code_verifier)
+    
     return auth_url
 
 def handle_oauth2_callback(code: str, redirect_uri: str = "http://localhost:5173/youtube/callback") -> dict:
@@ -38,6 +44,12 @@ def handle_oauth2_callback(code: str, redirect_uri: str = "http://localhost:5173
         scopes=SCOPES,
         redirect_uri=redirect_uri
     )
+    
+    # Retrieve PKCE code_verifier
+    verifier_path = Path(settings.storage_dir) / "oauth_code_verifier.txt"
+    if verifier_path.exists():
+        flow.code_verifier = verifier_path.read_text().strip()
+        
     flow.fetch_token(code=code)
     credentials = flow.credentials
 

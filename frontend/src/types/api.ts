@@ -42,6 +42,8 @@ export interface DubbingRequest {
   blur_box_height_percent: number;
   custom_blur_boxes: CustomBlurBox[];
   watermark_file_name?: string | null;
+  auto_detect_sub?: boolean;
+  auto_detect_logo?: boolean;
 }
 
 export interface JobProgress {
