@@ -3,6 +3,7 @@ import {
   BadgeCheck,
   Check,
   ChevronRight,
+  Copy,
   Download,
   FileImage,
   Loader2,
@@ -13,7 +14,7 @@ import {
   Wand2,
   Youtube,
 } from "lucide-react";
-import { cancelJob, clearJobs, createJob, detectBlurRegions, fetchUrlPreview, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
+import { cancelJob, clearJobs, createJob, detectBlurRegions, fetchUrlPreview, generateJobMetadata, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
 import type { BgmMode, DubbingRequest, JobProgress, VoiceGender } from "./types/api";
 import { YoutubeStats } from "./components/YoutubeStats";
 import { LivePreview } from "./components/LivePreview";
@@ -57,6 +58,13 @@ const defaultForm: DubbingRequest = {
   custom_blur_boxes: [],
   watermark_file_name: null,
 };
+
+function needsYoutubeMetadata(job: JobProgress): boolean {
+  if (job.status !== "completed") return false;
+  const title = job.seo_title?.trim();
+  const tags = job.seo_tags ?? [];
+  return !title || title === "Video đã được xử lý" || tags.length === 0;
+}
 
 interface DebouncedInputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, "onChange"> {
   value: string;
@@ -123,7 +131,10 @@ export function App() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const job = await getJob(activeJobId);
+        let job = await getJob(activeJobId);
+        if (needsYoutubeMetadata(job)) {
+          job = await generateJobMetadata(job.job_id);
+        }
         if (cancelled) return;
         setActiveJob(job);
         setJobs((previous) => [job, ...previous.filter((item) => item.job_id !== job.job_id)].slice(0, 8));
@@ -202,6 +213,10 @@ export function App() {
       source_url: form.source_url?.trim() || null,
       local_file_path: form.local_file_path?.trim() || null,
     };
+    if (payload.blur_box_enabled && payload.blur_box_y_percent >= 65) {
+      payload.blur_box_y_percent = Math.min(payload.blur_box_y_percent, 76);
+      payload.blur_box_height_percent = Math.max(payload.blur_box_height_percent, 100 - payload.blur_box_y_percent);
+    }
 
     try {
       const response = await createJob(payload);
@@ -249,26 +264,61 @@ export function App() {
       return;
     }
     setIsDetectingAI(true);
-    setMessage(null);
+    setMessage("AI đang phân tích khung hình và kiểm tra lại cấu hình...");
     try {
       const result = await detectBlurRegions(videoPath, true, true, "ai");
-      if (result.count === 0 && !result.auto_logo) {
+      if (result.count === 0 && !result.auto_logo && !result.review?.ok) {
         setMessage("AI không phát hiện ra vùng cần làm mờ nào.");
       } else {
+        // Preset AI tong the: render ra phai dung nhu preview, che sach chu goc va giu phu de moi ro.
+        setField("hard_subtitles", true);
+        setField("source_has_hard_subtitles", false);
+        setField("source_language", "auto");
+        setField("voice_gender", "female");
+        setField("bgm_mode", "demucs");
+        setField("use_demucs", true);
+        setField("video_speed", 1);
+        setField("output_resolution", "original");
+        setField("cinematic_bars_enabled", false);
+        setField("subtitle_x_percent", 50);
+        setField("subtitle_font_size", 48);
+        setField("subtitle_box_enabled", false);
+        setField("subtitle_box_opacity", 0);
+        setField("subtitle_box_height_percent", 22);
+        setField("auto_publish", []);
+
         // 1. Cập nhật các vùng làm mờ mới
-        const newBoxes = [...form.custom_blur_boxes, ...result.regions.map(r => ({
-          x_percent: r.x_percent,
-          y_percent: r.y_percent,
-          width_percent: r.width_percent,
-          height_percent: r.height_percent,
-        }))];
-        setField("custom_blur_boxes", newBoxes);
+        if (result.config) {
+          const blurY = Math.min(result.config.blur_box_y_percent, 76);
+          const blurHeight = Math.max(result.config.blur_box_height_percent, 100 - blurY);
+          setField("blur_box_enabled", true);
+          setField("blur_box_y_percent", blurY);
+          setField("blur_box_height_percent", Math.min(35, blurHeight));
+          setField("custom_blur_boxes", result.config.custom_blur_boxes);
+
+          if (typeof result.config.subtitle_y_percent === "number") {
+            setField("subtitle_y_percent", Math.max(86, Math.min(92, result.config.subtitle_y_percent)));
+          } else {
+            setField("subtitle_y_percent", 90);
+          }
+        } else {
+          setField("blur_box_enabled", true);
+          setField("blur_box_y_percent", 76);
+          setField("blur_box_height_percent", 24);
+          setField("subtitle_y_percent", 90);
+          setField("custom_blur_boxes", result.regions.map(r => ({
+            x_percent: r.x_percent,
+            y_percent: r.y_percent,
+            width_percent: r.width_percent,
+            height_percent: r.height_percent,
+          })));
+        }
 
         // 2. Tự động dịch chuyển phụ đề mới đè lên vùng mờ chữ Trung dưới đáy
-        const subRegion = result.regions.find(r => r.label?.toLowerCase().includes("sub"));
+        const subRegion = result.config ? undefined : result.regions.find(r => r.label?.toLowerCase().includes("sub"));
         if (subRegion) {
           // Tính tâm dọc của vùng mờ để đặt chữ phụ đề đè lên
-          const targetY = Math.max(8, Math.min(94, Math.round(subRegion.y_percent + subRegion.height_percent / 2)));
+          const targetY = Math.max(86, Math.min(92, Math.round(subRegion.y_percent + subRegion.height_percent / 2)));
           setField("subtitle_y_percent", targetY);
         }
 
@@ -281,14 +331,15 @@ export function App() {
           setWatermarkName("logo kenh.png");
         }
 
-        setMessage(`AI đã tự động phân tích: Thêm ${result.count} vùng mờ và tự động chèn logo kênh sang bên trái!`);
+        const notes = result.review?.notes?.length ? ` ${result.review.notes.join(" ")}` : "";
+        setMessage(`AI đã tự cấu hình đầy đủ: phụ đề, giọng đọc, Demucs, thanh mờ chữ gốc, logo và metadata YouTube. ${result.count} vùng hợp lý.${notes}`);
       }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "AI phân tích thất bại.");
     } finally {
       setIsDetectingAI(false);
     }
-  }, [form.local_file_path, form.custom_blur_boxes, setField, setWatermarkName]);
+  }, [form.local_file_path, setField, setWatermarkName]);
 
   return (
     <main className="ios-container">
@@ -836,6 +887,26 @@ const StatusPanel = React.memo(function StatusPanel({ job }: { job: JobProgress 
     }
   }, [job]);
 
+  const seoTags = useMemo(() => {
+    return (job?.seo_tags ?? [])
+      .map((tag) => tag.trim())
+      .filter(Boolean)
+      .map((tag) => (tag.startsWith("#") ? tag : `#${tag.replace(/^#+/, "").replace(/\s+/g, "")}`))
+      .join(" ");
+  }, [job?.seo_tags]);
+
+  const youtubeUploadText = useMemo(() => {
+    if (!job) return "";
+    const description = job.seo_description ?? "";
+    const shouldAppendTags = seoTags && !description.includes("#");
+    return [job.seo_title, description, shouldAppendTags ? seoTags : ""].filter(Boolean).join("\n\n");
+  }, [job, seoTags]);
+
+  const copyToClipboard = useCallback(async (value: string) => {
+    if (!value) return;
+    await navigator.clipboard.writeText(value);
+  }, []);
+
   if (!job) {
     return (
       <section className="ios-card">
@@ -889,6 +960,20 @@ const StatusPanel = React.memo(function StatusPanel({ job }: { job: JobProgress 
           Tải video đầu ra
         </a>
       )}
+      {job.status === "completed" && youtubeUploadText && (
+        <div style={{ marginTop: 16, display: "grid", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+            <h3 style={{ fontSize: "1rem", margin: 0 }}>Nội dung up YouTube</h3>
+            <button type="button" className="ios-button ios-button-secondary" style={{ padding: "6px 10px", fontSize: "0.82rem" }} onClick={() => copyToClipboard(youtubeUploadText)}>
+              <Copy size={15} />
+              Copy tất cả
+            </button>
+          </div>
+          {job.seo_title && <SeoCopyBlock label="Tiêu đề" value={job.seo_title} onCopy={copyToClipboard} />}
+          {job.seo_description && <SeoCopyBlock label="Mô tả" value={job.seo_description} onCopy={copyToClipboard} multiline />}
+          {seoTags && <SeoCopyBlock label="Hashtag" value={seoTags} onCopy={copyToClipboard} />}
+        </div>
+      )}
       {job.status === "completed" && job.created_at && job.updated_at && (
         <p className="muted" style={{ marginTop: 12, fontSize: "0.85rem" }}>
           Tổng thời gian xử lý:{" "}
@@ -901,6 +986,31 @@ const StatusPanel = React.memo(function StatusPanel({ job }: { job: JobProgress 
         </p>
       )}
     </section>
+  );
+});
+
+const SeoCopyBlock = React.memo(function SeoCopyBlock({
+  label,
+  value,
+  onCopy,
+  multiline = false,
+}: {
+  label: string;
+  value: string;
+  onCopy: (value: string) => void;
+  multiline?: boolean;
+}) {
+  return (
+    <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: 12, padding: 12, background: "#f7f8fa" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 8 }}>
+        <strong style={{ fontSize: "0.88rem" }}>{label}</strong>
+        <button type="button" className="ios-button ios-button-secondary" style={{ padding: "4px 8px", fontSize: "0.78rem" }} onClick={() => onCopy(value)}>
+          <Copy size={14} />
+          Copy
+        </button>
+      </div>
+      <p style={{ whiteSpace: "pre-wrap", margin: 0, color: "#1d1d1f", fontSize: multiline ? "0.88rem" : "0.95rem", lineHeight: 1.45 }}>{value}</p>
+    </div>
   );
 });
 

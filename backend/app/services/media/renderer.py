@@ -30,11 +30,25 @@ async def render_video(
     filter_parts: list[str] = []
 
     if request.blur_box_enabled:
-        blur_h = max(2, round(height * request.blur_box_height_percent / 100))
-        blur_y = round(height * request.blur_box_y_percent / 100)
+        blur_y_percent, blur_height_percent = _render_blur_band(
+            request.blur_box_y_percent,
+            request.blur_box_height_percent,
+        )
+        blur_h = max(2, round(height * blur_height_percent / 100))
+        blur_y = round(height * blur_y_percent / 100)
         blur_y = max(0, min(height - blur_h, blur_y))
-        filter_parts.append(f"{video_label}crop=iw:{blur_h}:0:{blur_y},boxblur=20:5[blurred]")
-        filter_parts.append(f"{video_label}[blurred]overlay=0:{blur_y}[vblur]")
+        blur_radius = _boxblur_radius(width, blur_h)
+        small_w, small_h = _mosaic_size(width, blur_h)
+        filter_parts.append(
+            f"{video_label}split=2[vblur_base][vblur_crop]"
+        )
+        filter_parts.append(
+            f"[vblur_crop]crop=iw:{blur_h}:0:{blur_y},"
+            f"scale={small_w}:{small_h}:flags=bilinear,"
+            f"scale={width}:{blur_h}:flags=neighbor,"
+            f"boxblur={blur_radius}:10[blurred]"
+        )
+        filter_parts.append(f"[vblur_base][blurred]overlay=0:{blur_y}[vblur]")
         video_label = "[vblur]"
 
     for i, custom_blur in enumerate(request.custom_blur_boxes):
@@ -44,11 +58,23 @@ async def render_video(
         cb_y = round(height * custom_blur.y_percent / 100)
         
         # Ensure dimensions and coordinates don't exceed video boundaries
+        cb_x = max(0, min(width - 2, cb_x))
+        cb_y = max(0, min(height - 2, cb_y))
         cb_w = min(cb_w, width - cb_x)
         cb_h = min(cb_h, height - cb_y)
+        if cb_w < 2 or cb_h < 2:
+            continue
         
-        filter_parts.append(f"{video_label}crop={cb_w}:{cb_h}:{cb_x}:{cb_y},boxblur=20:5[cblur_{i}]")
-        filter_parts.append(f"{video_label}[cblur_{i}]overlay={cb_x}:{cb_y}[vcb_{i}]")
+        blur_radius = _boxblur_radius(cb_w, cb_h)
+        small_w, small_h = _mosaic_size(cb_w, cb_h)
+        filter_parts.append(f"{video_label}split=2[vcb_base_{i}][vcb_crop_{i}]")
+        filter_parts.append(
+            f"[vcb_crop_{i}]crop={cb_w}:{cb_h}:{cb_x}:{cb_y},"
+            f"scale={small_w}:{small_h}:flags=bilinear,"
+            f"scale={cb_w}:{cb_h}:flags=neighbor,"
+            f"boxblur={blur_radius}:10[cblur_{i}]"
+        )
+        filter_parts.append(f"[vcb_base_{i}][cblur_{i}]overlay={cb_x}:{cb_y}[vcb_{i}]")
         video_label = f"[vcb_{i}]"
 
 
@@ -183,6 +209,23 @@ async def burn_subtitles(
 
 def _can_stream_copy(request: DubbingRequest, subtitle_file: Path | None, narration_audio: Path | None, bgm_audio: Path | None) -> bool:
     return subtitle_file is None and narration_audio is None and bgm_audio is None and not (request.watermark_file_name and request.logo_enabled) and not request.blur_box_enabled and not request.cinematic_bars_enabled and request.output_resolution == "original" and request.bgm_mode == BgmMode.demucs and request.video_speed == 1.0
+
+
+def _boxblur_radius(width: int, height: int) -> int:
+    # FFmpeg also applies the radius to chroma planes; for yuv420p those planes
+    # are about half-size, so small logo boxes need a smaller blur radius.
+    return max(1, min(20, min(width, height) // 4 - 1))
+
+
+def _mosaic_size(width: int, height: int) -> tuple[int, int]:
+    return max(8, width // 80), max(4, height // 80)
+
+
+def _render_blur_band(y_percent: int, height_percent: int) -> tuple[int, int]:
+    if y_percent >= 65:
+        y_percent = min(y_percent, 76)
+        height_percent = max(height_percent, 100 - y_percent)
+    return y_percent, min(40, max(2, height_percent))
 
 
 def _audio_output_args(request: DubbingRequest, has_narration: bool) -> list[str]:

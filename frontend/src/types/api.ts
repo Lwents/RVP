@@ -57,6 +57,7 @@ export interface JobProgress {
   output_video_url?: string | null;
   seo_title?: string | null;
   seo_description?: string | null;
+  seo_tags?: string[] | null;
   error?: string | null;
 }
 

@@ -57,7 +57,7 @@ class GoogleTranslation(TranslationEngine):
             return events
 
         def translate() -> list[SubtitleEvent]:
-            all_texts = [e.text.strip() for e in events]
+            all_texts = [_normalize_source_text(e.text.strip()) for e in events]
 
             # Xây dựng bản đồ proper nouns từ toàn bộ phụ đề
             proper_noun_map = _build_proper_noun_map(all_texts, source_language)
@@ -92,6 +92,7 @@ class GoogleTranslation(TranslationEngine):
             # Post-processing sửa lỗi dịch Google sang tiếng Việt
             if target_language.lower() == "vi":
                 translated_texts = [_fix_vietnamese_output(t, all_texts[i]) for i, t in enumerate(translated_texts)]
+                translated_texts = [_fix_character_names(t) for t in translated_texts]
 
             return [
                 SubtitleEvent(event.start, event.end, translated_texts[i] or event.text)
@@ -213,6 +214,36 @@ def _restore_glossary(text: str) -> str:
         restored = restored.replace(placeholder.lower(), term)
         restored = restored.replace(placeholder.title(), term)
     return restored
+
+
+# Các lỗi ASR/OCR tiếng Trung hay làm sai nghĩa hoặc biến cụm từ thành tên riêng.
+_SOURCE_TEXT_FIXES: list[tuple[re.Pattern, str]] = [
+    (re.compile("臣定当赵半"), "臣定当照办"),
+    (re.compile("定当赵半"), "定当照办"),
+    (re.compile("赵半"), "照办"),
+    (re.compile("战相"), "照常"),
+    (re.compile("太阳照常"), "太阳照常"),
+    (re.compile("不清"), "父亲"),
+    (re.compile("初期"), "朱祁钰"),
+    (re.compile("朱言"), "朱元璋"),
+    (re.compile("红武朝"), "洪武朝"),
+    (re.compile("从西朝"), "正统朝"),
+    (re.compile("有垃圾的"), "永乐朝的"),
+    (re.compile("墨月"), "墨月"),
+    (re.compile("七夏山"), "栖霞山"),
+    (re.compile("秦哥"), "秦哥"),
+    (re.compile("龙姐"), "龙姐"),
+]
+
+
+def _normalize_source_text(text: str) -> str:
+    if not text:
+        return text
+    normalized = text
+    if _looks_chinese(normalized):
+        for pattern, replacement in _SOURCE_TEXT_FIXES:
+            normalized = pattern.sub(replacement, normalized)
+    return normalized
 
 
 # ─── Interjections: giữ nguyên không dịch ────────────────────────────────────
@@ -438,6 +469,46 @@ _VI_FIXES: list[tuple[re.Pattern, str]] = [
     (re.compile(r",([^\s])"), r", \1"),
 ]
 
+_VI_NAME_FIXES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bZhaoban\b", re.IGNORECASE), "làm theo"),
+    (re.compile(r"\bZhan\s*Xiang\b", re.IGNORECASE), "như thường"),
+    (re.compile(r"Giai đoạn Chiến tranh Mặt trời", re.IGNORECASE), "mặt trời vẫn chiếu như thường"),
+    (re.compile(r"\bMo\s*Yue\b", re.IGNORECASE), "Mặc Nguyệt"),
+    (re.compile(r"\bQixia\b", re.IGNORECASE), "Tê Hà"),
+    (re.compile(r"núi Tê Hà", re.IGNORECASE), "núi Tê Hà"),
+    (re.compile(r"\bZhu\s*Yan\b", re.IGNORECASE), "Chu Nguyên Chương"),
+    (re.compile(r"\bZhu\s*Qiyu\b", re.IGNORECASE), "Chu Kỳ Ngọc"),
+    (re.compile(r"\bZhu\s*Qi\s*Yu(?:zheng)?\b", re.IGNORECASE), "Chu Kỳ Ngọc"),
+    (re.compile(r"\bChu\s+Qiyu\b", re.IGNORECASE), "Chu Kỳ Ngọc"),
+    (re.compile(r"\bChu\s+Kiyu\b", re.IGNORECASE), "Chu Kỳ Ngọc"),
+    (re.compile(r"\bChu\s+Ngọc\b", re.IGNORECASE), "Chu Kỳ Ngọc"),
+    (re.compile(r"\bTần ca\b", re.IGNORECASE), "Tần ca"),
+    (re.compile(r"\bAnh Tần\b", re.IGNORECASE), "Tần ca"),
+    (re.compile(r"\bLong Jie\b", re.IGNORECASE), "Long tỷ"),
+    (re.compile(r"\bLong\s+tỷ\b", re.IGNORECASE), "Long tỷ"),
+    (re.compile(r"\bBộ trưởng của hoàng đế đã đến\b", re.IGNORECASE), "Bệ hạ, thần đến rồi"),
+    (re.compile(r"\bBộ trưởng của hoàng đế\b", re.IGNORECASE), "thần"),
+    (re.compile(r"\bHoàng đế\b"), "Bệ hạ"),
+    (re.compile(r"\bHongwu\b", re.IGNORECASE), "Hồng Vũ"),
+    (re.compile(r"\bYongle\b", re.IGNORECASE), "Vĩnh Lạc"),
+    (re.compile(r"\bHaifan\b", re.IGNORECASE), "Hải Phàm"),
+    (re.compile(r"triều đại Hồng Vũ", re.IGNORECASE), "triều Hồng Vũ"),
+    (re.compile(r"triều đại Vĩnh Lạc", re.IGNORECASE), "triều Vĩnh Lạc"),
+    (re.compile(r"triều đại Chính Thống", re.IGNORECASE), "triều Chính Thống"),
+    (re.compile(r"thái tử và đại sư", re.IGNORECASE), "Thái tử thái sư"),
+    (re.compile(r"Thái tử và đại sư", re.IGNORECASE), "Thái tử thái sư"),
+    (re.compile(r"Hãy hứa với chúng tôi một điều", re.IGNORECASE), "Xin hãy hứa với thần một điều"),
+    (re.compile(r"Thưa bệ hạ, tôi sẽ làm theo lời ngài", re.IGNORECASE), "Bệ hạ nói gì, thần nhất định sẽ làm theo"),
+    (re.compile(r"Hãy bảo vệ anh ấy bằng gần như toàn bộ sức lực của bạn", re.IGNORECASE), "Thần sẽ dốc gần như toàn lực để bảo vệ người ấy"),
+    (re.compile(r"Hãy bảo anh ấy làm như bình thường\.?\s*Gọi mặt trời như thường lệ\.?\s*Gọi mặt trời như thường lệ\.?", re.IGNORECASE), "Hãy để mặt trời vẫn chiếu như thường."),
+    (re.compile(r"Xin đừng giữ Mặc Nguyệt lên núi Tê Hà", re.IGNORECASE), "Xin hãy ôm Mặc Nguyệt lên núi Tê Hà"),
+    (re.compile(r"Đừng để mọi người tan vỡ", re.IGNORECASE), "Sinh ly tử biệt khiến người ta rơi lệ"),
+    (re.compile(r"Đếm xem Tần ca có thể nhân lên bao nhiêu lần", re.IGNORECASE), "Đếm xem Tần ca làm được bao nhiêu lần"),
+    (re.compile(r"Cha ơi con ở đây", re.IGNORECASE), "Phụ thân, con ở đây"),
+    (re.compile(r"Cha ơi, sao trời tối thế", re.IGNORECASE), "Phụ thân, sao trời tối thế"),
+    (re.compile(r"ngay cả cha tôi cũng là học trò của ông", re.IGNORECASE), "ngay cả phụ hoàng của ta cũng là học trò của ông"),
+]
+
 
 def _fix_vietnamese_output(translated: str, original: str) -> str:
     """Sửa các lỗi Google Translate thường gặp khi dịch sang tiếng Việt."""
@@ -448,6 +519,16 @@ def _fix_vietnamese_output(translated: str, original: str) -> str:
     # (trường hợp placeholder không được restore đúng)
     result = result.strip()
     return result or translated
+
+
+def _fix_character_names(text: str) -> str:
+    result = text
+    for pattern, replacement in _VI_NAME_FIXES:
+        result = pattern.sub(replacement, result)
+    result = re.sub(r"\b(làm theo)\s+\1\b", r"\1", result, flags=re.IGNORECASE)
+    result = re.sub(r"\s+([.,!?:;])", r"\1", result)
+    result = re.sub(r",([^\s])", r", \1", result)
+    return result.strip()
 
 
 # ─── Batch translation ────────────────────────────────────────────────────────

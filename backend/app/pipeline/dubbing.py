@@ -157,20 +157,21 @@ async def process_dubbing_job(job_id: str) -> None:
 
         seo_title = "Video đã được xử lý"
         seo_description = _completion_description(voice_warning)
+        seo_tags: list[str] = []
+
+        if subtitle_file and subtitle_file.exists():
+            progress("AI đang viết tiêu đề, mô tả và hashtag YouTube", 98)
+            from app.services.ai.content import generate_video_details
+
+            try:
+                video_details = await generate_video_details(subtitle_file.read_text(encoding="utf-8"))
+                seo_title = video_details.title
+                seo_description = video_details.description
+                seo_tags = video_details.tags
+            except Exception as exc:
+                print(f"Error generating YouTube metadata: {exc}")
         
         if job.request.auto_publish and PublishTarget.youtube in job.request.auto_publish:
-            progress("Đang sử dụng AI để tạo chi tiết video...", 85)
-            from app.services.ai.content import generate_video_details
-            
-            transcript_text = ""
-            if subtitle_file and subtitle_file.exists():
-                with open(subtitle_file, 'r', encoding='utf-8') as f:
-                    transcript_text = f.read()
-                    
-            video_details = await generate_video_details(transcript_text)
-            seo_title = video_details.title
-            seo_description = video_details.description
-            
             progress("Tự động đăng lên YouTube...", 92)
             from app.services.youtube.upload import upload_video_to_youtube
             try:
@@ -182,7 +183,7 @@ async def process_dubbing_job(job_id: str) -> None:
                     str(output_file.absolute()),
                     seo_title,
                     seo_description,
-                    video_details.tags,
+                    seo_tags,
                     "public" # Hoặc private tuỳ ý
                 )
                 seo_description += f"\n\nĐã đăng lên YouTube thành công! Video ID: {yt_response['id']}"
@@ -199,6 +200,7 @@ async def process_dubbing_job(job_id: str) -> None:
             output_file_path=str(output_file),
             seo_title=seo_title,
             seo_description=seo_description,
+            seo_tags=seo_tags,
             error=voice_warning,
         )
     except asyncio.CancelledError:

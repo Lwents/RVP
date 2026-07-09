@@ -56,6 +56,12 @@ export async function getJob(jobId: string): Promise<JobProgress> {
   return request(`/api/jobs/${jobId}`);
 }
 
+export async function generateJobMetadata(jobId: string): Promise<JobProgress> {
+  return request(`/api/jobs/${jobId}/metadata`, {
+    method: "POST",
+  });
+}
+
 export async function listJobs(): Promise<JobProgress[]> {
   return request("/api/jobs");
 }
@@ -133,6 +139,20 @@ export interface DetectedBlurRegion {
   width_percent: number;
   height_percent: number;
   label?: string;
+  kind?: "subtitle" | "logo";
+}
+
+export interface CheckedBlurConfig {
+  blur_box_enabled: boolean;
+  blur_box_y_percent: number;
+  blur_box_height_percent: number;
+  custom_blur_boxes: Array<{
+    x_percent: number;
+    y_percent: number;
+    width_percent: number;
+    height_percent: number;
+  }>;
+  subtitle_y_percent?: number | null;
 }
 
 export async function detectBlurRegions(
@@ -143,6 +163,11 @@ export async function detectBlurRegions(
 ): Promise<{ 
   regions: DetectedBlurRegion[]; 
   count: number; 
+  config?: CheckedBlurConfig;
+  review?: {
+    ok: boolean;
+    notes: string[];
+  };
   auto_logo?: { 
     watermark_file_name: string; 
     logo_x_percent: number; 

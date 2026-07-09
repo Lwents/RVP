@@ -19,6 +19,7 @@ imageio-ffmpeg==0.6.0
 python-dateutil>=2.8.2
 demucs>=4.0.1
 numpy
+opencv-python
 openai
 google-api-python-client
 google-auth-oauthlib

@@ -95,6 +95,7 @@ class JobProgress(BaseModel):
     output_file_path: str | None = None
     seo_title: str | None = None
     seo_description: str | None = None
+    seo_tags: list[str] | None = None
     error: str | None = None
 
 

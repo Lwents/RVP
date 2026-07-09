@@ -3,9 +3,6 @@ import wave
 from pathlib import Path
 
 import numpy as np
-import torch
-from demucs.apply import apply_model
-from demucs.pretrained import get_model
 
 
 class SeparationError(RuntimeError):
@@ -22,6 +19,13 @@ def _separate_background_sync(audio_file: Path, output_dir: Path) -> Path:
     vocals_file = output_dir / "vocals.wav"
 
     sample_rate, audio = _read_pcm16_wav(audio_file)
+    try:
+        import torch
+        from demucs.apply import apply_model
+        from demucs.pretrained import get_model
+    except ImportError as exc:
+        raise SeparationError("Thiếu torch/demucs. Chạy pip install -r requirements.txt trong backend.") from exc
+
     model = get_model(name="htdemucs")
     model.eval()
     device = "cuda" if torch.cuda.is_available() else "cpu"

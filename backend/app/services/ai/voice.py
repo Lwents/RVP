@@ -55,6 +55,11 @@ class EdgeTtsVoiceEngine(VoiceEngine):
         else:
             return "vi-VN-HoaiMyNeural" if gender == VoiceGender.female else "vi-VN-NamMinhNeural"
 
+    def get_voice_for_text(self, text: str, gender: VoiceGender) -> str:
+        if _cjk_ratio(text) > 0.2:
+            return "zh-CN-XiaoxiaoNeural" if gender == VoiceGender.female else "zh-CN-YunxiNeural"
+        return self.get_voice(gender)
+
     async def synthesize(
         self,
         text: str,
@@ -76,7 +81,6 @@ class EdgeTtsVoiceEngine(VoiceEngine):
             output_file.unlink()
 
         chunks = _split_tts_chunks(normalized, settings.tts_chunk_chars)
-        voice = self.get_voice(voice_gender)
         part_dir = output_file.parent / "tts_parts"
         part_dir.mkdir(parents=True, exist_ok=True)
         part_files: list[Path] = []
@@ -88,7 +92,7 @@ class EdgeTtsVoiceEngine(VoiceEngine):
             part_file = part_dir / f"part_{index:04d}.mp3"
             if part_file.exists():
                 part_file.unlink()
-            await self._save_chunk(edge_tts, chunk, part_file, voice)
+            await self._save_chunk(edge_tts, chunk, part_file, self.get_voice_for_text(chunk, voice_gender))
             part_files.append(part_file)
 
         if progress:
@@ -150,7 +154,7 @@ class EdgeTtsVoiceEngine(VoiceEngine):
 
             raw_file = aligned_dir / f"{index:04d}_raw.mp3"
             speech_file = aligned_dir / f"{index:04d}_speech.wav"
-            await self._save_chunk(edge_tts, event.text, raw_file, voice)
+            await self._save_chunk(edge_tts, event.text, raw_file, self.get_voice_for_text(event.text, voice_gender))
 
             raw_duration = await _probe_audio_duration(raw_file)
             next_start = events[index].start if index < total else duration
@@ -198,7 +202,8 @@ class EdgeTtsVoiceEngine(VoiceEngine):
                 "Hãy thử chạy lại khi mạng ổn định."
             ) from last_error
         if last_error:
-            raise VoiceError(f"Edge TTS lỗi sau {settings.tts_chunk_retries} lần thử: {last_error}") from last_error
+            preview = _tts_error_preview(text)
+            raise VoiceError(f"Edge TTS lỗi sau {settings.tts_chunk_retries} lần thử ở đoạn '{preview}': {last_error}") from last_error
         if not output_file.exists() or output_file.stat().st_size == 0:
             raise VoiceError("TTS không tạo được audio cho một đoạn phụ đề.")
 
@@ -217,6 +222,21 @@ def get_voice_engine() -> VoiceEngine:
 def _normalize_tts_text(text: str) -> str:
     lines = [line.strip() for line in text.replace("\\N", "\n").splitlines()]
     return "\n".join(line for line in lines if line)
+
+
+def _cjk_ratio(text: str) -> float:
+    chars = [char for char in text if not char.isspace()]
+    if not chars:
+        return 0.0
+    cjk_count = sum(1 for char in chars if "\u4e00" <= char <= "\u9fff")
+    return cjk_count / len(chars)
+
+
+def _tts_error_preview(text: str) -> str:
+    preview = " ".join(text.split())
+    if len(preview) > 80:
+        preview = f"{preview[:77]}..."
+    return preview
 
 
 def _split_tts_chunks(text: str, max_chars: int) -> list[str]:

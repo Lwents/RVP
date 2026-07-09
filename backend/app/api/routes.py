@@ -139,6 +139,35 @@ async def get_job(job_id: str) -> JobProgress:
     return job
 
 
+@router.post("/jobs/{job_id}/metadata", response_model=JobProgress, tags=["jobs"])
+async def generate_job_metadata(job_id: str) -> JobProgress:
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    work_dir = Path(settings.storage_dir) / "jobs" / job_id
+    subtitle_file = next(
+        (path for path in [
+            work_dir / "subtitles.vi.srt",
+            work_dir / "subtitles.grouped.srt",
+            work_dir / "subtitles.whisper.srt",
+        ] if path.exists()),
+        None,
+    )
+    if not subtitle_file:
+        raise HTTPException(status_code=404, detail="Job này chưa có phụ đề để AI viết nội dung YouTube.")
+
+    from app.services.ai.content import generate_video_details
+
+    details = await generate_video_details(subtitle_file.read_text(encoding="utf-8"))
+    return job_store.update(
+        job_id,
+        seo_title=details.title,
+        seo_description=details.description,
+        seo_tags=details.tags,
+    )
+
+
 @router.get("/jobs/{job_id}/download", tags=["jobs"])
 async def download_output(job_id: str) -> FileResponse:
     job = job_store.get(job_id)
@@ -229,7 +258,7 @@ async def detect_blur_regions(req: DetectRegionsRequest):
     - Vùng logo/watermark cố định của kênh gốc
     Hỗ trợ công nghệ Cục bộ (local) hoặc Trí tuệ nhân tạo (ai via 9router).
     """
-    from app.services.ai.detect_regions import auto_detect_blur_regions_local, auto_detect_blur_regions_ai
+    from app.services.ai.detect_regions import auto_detect_blur_regions_local, auto_detect_blur_regions_ai, review_and_build_blur_config
     import asyncio
 
     video_path = req.video_path
@@ -280,11 +309,25 @@ async def detect_blur_regions(req: DetectRegionsRequest):
 
         if req.engine == "ai":
             # Gọi trực tiếp vì hàm async
-            regions = await auto_detect_blur_regions_ai(
-                video_path,
-                detect_sub=req.detect_sub,
-                detect_logo=req.detect_logo,
-            )
+            try:
+                regions = await auto_detect_blur_regions_ai(
+                    video_path,
+                    detect_sub=req.detect_sub,
+                    detect_logo=req.detect_logo,
+                )
+            except Exception as e:
+                print(f"AI detect failed, falling back to local detection: {e}")
+                regions = []
+            if not regions:
+                loop = asyncio.get_event_loop()
+                regions = await loop.run_in_executor(
+                    None,
+                    lambda: auto_detect_blur_regions_local(
+                        video_path,
+                        detect_sub=req.detect_sub,
+                        detect_logo=req.detect_logo,
+                    )
+                )
         else:
             # Chạy local (đồng bộ) trong thread pool
             loop = asyncio.get_event_loop()
@@ -296,6 +339,13 @@ async def detect_blur_regions(req: DetectRegionsRequest):
                     detect_logo=req.detect_logo,
                 )
             )
-        return {"regions": regions, "count": len(regions), "auto_logo": auto_logo_data}
+        checked = review_and_build_blur_config(regions)
+        return {
+            "regions": checked["regions"],
+            "count": len(checked["regions"]),
+            "auto_logo": auto_logo_data,
+            "config": checked["config"],
+            "review": checked["review"],
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi phân tích video: {str(e)}")

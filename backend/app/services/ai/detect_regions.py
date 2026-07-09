@@ -34,6 +34,228 @@ SUBTITLE_SCAN_X_END_RATIO   = 0.85   # bỏ qua 15% bên phải (tránh logo gó
 LOGO_CORNER_SIZE_RATIO      = 0.25   # quét vùng 25% ở các góc để tìm logo rộng
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _to_float(value: object, default: float = 0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _region_kind(region: dict) -> str:
+    label = str(region.get("label", "")).lower()
+    if "sub" in label or "subtitle" in label or "caption" in label:
+        return "subtitle"
+    if "logo" in label or "watermark" in label:
+        return "logo"
+    y = _to_float(region.get("y_percent"))
+    width = _to_float(region.get("width_percent"))
+    if y >= 65 and width >= 45:
+        return "subtitle"
+    return "logo"
+
+
+def _normalize_region(region: dict, kind: str) -> dict | None:
+    x = _to_float(region.get("x_percent"))
+    y = _to_float(region.get("y_percent"))
+    width = _to_float(region.get("width_percent"))
+    height = _to_float(region.get("height_percent"))
+
+    if width <= 0 or height <= 0:
+        return None
+
+    # Add bleed around detections so blur covers text/logo edges cleanly.
+    if kind == "subtitle":
+        pad_y = max(1.5, height * 0.25)
+        y -= pad_y
+        height += pad_y * 2
+        x = 0
+        width = 100
+    else:
+        pad_x = max(1.0, width * 0.2)
+        pad_y = max(1.0, height * 0.2)
+        x -= pad_x
+        y -= pad_y
+        width += pad_x * 2
+        height += pad_y * 2
+
+    x = _clamp(x, 0, 99)
+    y = _clamp(y, 0, 99)
+    width = _clamp(width, 1, 100 - x)
+    height = _clamp(height, 1, 100 - y)
+
+    if kind == "subtitle":
+        y = _clamp(y, 62, 94)
+        height = _clamp(height, 7, 28)
+        if y + height > 98:
+            y = 98 - height
+        label = "Subtitle blur (AI checked)"
+    else:
+        center_x = x + width / 2
+        center_y = y + height / 2
+        near_corner = (
+            (center_x <= 35 or center_x >= 65)
+            and (center_y <= 35 or center_y >= 65)
+        )
+        top_watermark = center_y <= 35 and 15 <= center_x <= 85
+        side_watermark = center_y <= 75 and (center_x <= 20 or center_x >= 80)
+        if not (near_corner or top_watermark or side_watermark):
+            return None
+        width = _clamp(width, 4, 45)
+        height = _clamp(height, 4, 25)
+        label = "Logo/Watermark blur (AI checked)"
+
+    return {
+        "x_percent": round(x),
+        "y_percent": round(y),
+        "width_percent": round(width),
+        "height_percent": round(height),
+        "label": label,
+        "kind": kind,
+    }
+
+
+def _overlap_ratio(a: dict, b: dict) -> float:
+    ax1, ay1 = a["x_percent"], a["y_percent"]
+    ax2 = ax1 + a["width_percent"]
+    ay2 = ay1 + a["height_percent"]
+    bx1, by1 = b["x_percent"], b["y_percent"]
+    bx2 = bx1 + b["width_percent"]
+    by2 = by1 + b["height_percent"]
+    overlap_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+    overlap_h = max(0, min(ay2, by2) - max(ay1, by1))
+    overlap_area = overlap_w * overlap_h
+    smaller_area = max(1, min(a["width_percent"] * a["height_percent"], b["width_percent"] * b["height_percent"]))
+    return overlap_area / smaller_area
+
+
+def review_and_build_blur_config(regions: list[dict]) -> dict:
+    """
+    Sanity-check detections and convert them into render-ready settings.
+    Subtitle detections become the main blur band; logo detections stay custom boxes.
+    """
+    normalized: list[dict] = []
+    notes: list[str] = []
+
+    for region in regions:
+        kind = _region_kind(region)
+        clean = _normalize_region(region, kind)
+        if clean is None:
+            notes.append("Bo qua mot vung AI vi toa do khong hop ly hoac logo khong nam o goc.")
+            continue
+        normalized.append(clean)
+
+    subtitle_regions = [r for r in normalized if r["kind"] == "subtitle"]
+    logo_regions = [r for r in normalized if r["kind"] == "logo"]
+
+    subtitle_region = None
+    if subtitle_regions:
+        subtitle_region = max(subtitle_regions, key=lambda r: r["width_percent"] * r["height_percent"])
+        notes.append("Da can subtitle thanh mot dai mo ngang de che sach chu goc.")
+    else:
+        subtitle_region = {
+            "x_percent": 0,
+            "y_percent": 76,
+            "width_percent": 100,
+            "height_percent": 24,
+            "label": "Subtitle blur safety band",
+            "kind": "subtitle",
+        }
+        normalized.append(subtitle_region)
+        notes.append("AI khong chac vung subtitle, dung dai mo an toan 76-100% de che chu goc.")
+
+    subtitle_region["x_percent"] = 0
+    subtitle_region["width_percent"] = 100
+    if subtitle_region["y_percent"] >= 70:
+        subtitle_region["y_percent"] = min(subtitle_region["y_percent"], 76)
+        subtitle_region["height_percent"] = max(subtitle_region["height_percent"], 100 - subtitle_region["y_percent"])
+    subtitle_region["height_percent"] = min(35, max(18, subtitle_region["height_percent"]))
+
+    custom_boxes: list[dict] = []
+    for logo in logo_regions:
+        if subtitle_region and _overlap_ratio(logo, subtitle_region) > 0.25:
+            notes.append("Bo qua mot logo box vi trung voi dai subtitle.")
+            continue
+        if any(_overlap_ratio(logo, existing) > 0.6 for existing in custom_boxes):
+            notes.append("Gop/bo bot logo box bi trung lap.")
+            continue
+        custom_boxes.append({
+            "x_percent": logo["x_percent"],
+            "y_percent": logo["y_percent"],
+            "width_percent": logo["width_percent"],
+            "height_percent": logo["height_percent"],
+        })
+
+    has_top_left_watermark = any(
+        box["x_percent"] <= 35 and box["y_percent"] <= 18
+        for box in custom_boxes
+    )
+    if not has_top_left_watermark:
+        top_left_box = {
+            "x_percent": 0,
+            "y_percent": 0,
+            "width_percent": 45,
+            "height_percent": 13,
+        }
+        if not any(_overlap_ratio(top_left_box, existing) > 0.35 for existing in custom_boxes):
+            custom_boxes.append(top_left_box)
+            notes.append("Them vung mo chu/logo phia tren trai neu AI bo sot.")
+
+    has_top_middle_watermark = any(
+        35 <= box["x_percent"] + box["width_percent"] / 2 <= 75
+        and box["y_percent"] <= 28
+        for box in custom_boxes
+    )
+    has_top_watermark = any(box["y_percent"] <= 15 for box in custom_boxes)
+    if not has_top_middle_watermark:
+        top_middle_box = {
+            "x_percent": 44,
+            "y_percent": 7,
+            "width_percent": 32,
+            "height_percent": 16,
+        }
+        if not any(_overlap_ratio(top_middle_box, existing) > 0.35 for existing in custom_boxes):
+            custom_boxes.append(top_middle_box)
+            notes.append("Them vung mo watermark chu o phia tren giua neu AI bo sot.")
+
+    has_top_right_watermark = any(
+        box["x_percent"] >= 70 and box["y_percent"] <= 18
+        for box in custom_boxes
+    )
+    if (has_top_watermark or custom_boxes) and not has_top_right_watermark:
+        top_right_box = {
+            "x_percent": 76,
+            "y_percent": 0,
+            "width_percent": 24,
+            "height_percent": 13,
+        }
+        if not any(_overlap_ratio(top_right_box, existing) > 0.35 for existing in custom_boxes):
+            custom_boxes.append(top_right_box)
+            notes.append("Them vung mo watermark goc phai tren neu AI bo sot.")
+
+    config = {
+        "blur_box_enabled": bool(subtitle_region),
+        "blur_box_y_percent": subtitle_region["y_percent"] if subtitle_region else 80,
+        "blur_box_height_percent": subtitle_region["height_percent"] if subtitle_region else 15,
+        "custom_blur_boxes": custom_boxes,
+        "subtitle_y_percent": (
+            round(_clamp(subtitle_region["y_percent"] + subtitle_region["height_percent"] / 2, 8, 94))
+            if subtitle_region else None
+        ),
+    }
+
+    return {
+        "regions": normalized,
+        "config": config,
+        "review": {
+            "ok": bool(subtitle_region or custom_boxes),
+            "notes": notes,
+        },
+    }
+
 
 def _has_chinese(text: str) -> bool:
     for ch in text:
@@ -257,8 +479,10 @@ async def auto_detect_blur_regions_ai(
         )
     if detect_logo:
         prompt += (
-            "- The bounding box of channel watermark logo (located strictly in one of the four extreme corners, "
-            "very close to the edges. Do not blur normal text, characters, or credits).\n"
+            "- The bounding boxes of persistent source watermarks/logos. Include corner logos, platform marks, "
+            "and creator watermark text near the top center/top third of the frame (for example Chinese text "
+            "like 原创@...). Do not blur characters, credits, or normal scene text unless it is a persistent "
+            "watermark repeated across frames.\n"
         )
         
     prompt += (

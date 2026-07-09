@@ -1,27 +1,43 @@
 import json
+import re
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from app.core import settings
 
 class VideoDetails(BaseModel):
-    title: str = Field(description="Tiêu đề video giật tít, thu hút người xem (tối đa 100 ký tự).")
-    description: str = Field(description="Mô tả video chi tiết, hấp dẫn, bao gồm tóm tắt nội dung.")
-    tags: list[str] = Field(description="Danh sách các tags liên quan đến video, ví dụ: ['hoathinh', 'review'].")
+    title: str = Field(description="Tiêu đề YouTube tiếng Việt, hấp dẫn nhưng không sai sự thật.")
+    description: str = Field(description="Mô tả YouTube chuyên nghiệp, có hook, tóm tắt, CTA và hashtag.")
+    tags: list[str] = Field(description="Danh sách tag SEO không có dấu #, ví dụ: ['reviewphim', 'tomtatphim'].")
 
 async def generate_video_details(transcript: str, custom_prompt: str | None = None) -> VideoDetails:
     """
     Sử dụng AI qua 9router để tạo chi tiết video (tiêu đề, mô tả, tags).
     """
+    clean_transcript = _plain_transcript(transcript)
+
     client = AsyncOpenAI(
         api_key=settings.ninerouter_api_key,
         base_url=settings.ninerouter_api_url,
     )
 
     system_prompt = (
-        "Bạn là một chuyên gia SEO YouTube chuyên tạo content thu hút người xem. "
-        "Dựa vào nội dung phụ đề (transcript) sau đây, hãy tạo ra 1 Tiêu đề (dưới 100 ký tự), "
-        "1 Mô tả tóm tắt nội dung hấp dẫn, và 1 danh sách các Tags phù hợp. "
-        "Trả về ĐỊNH DẠNG JSON với các key: 'title', 'description', 'tags'."
+        "Bạn là một YouTuber chuyên nghiệp kiêm chuyên gia SEO cho kênh review phim/hoạt hình tiếng Việt. "
+        "Hãy viết metadata như người làm YouTube lâu năm: tự nhiên, cuốn, có cảm xúc, không giật tít sai sự thật.\n\n"
+        "Yêu cầu title:\n"
+        "- Tiếng Việt, 55-85 ký tự, không hashtag.\n"
+        "- Có hook mạnh ở đầu, nêu đúng cảm xúc/xung đột chính của video.\n"
+        "- Không dùng chữ in hoa toàn bộ, không spam dấu chấm than.\n\n"
+        "Yêu cầu description:\n"
+        "- Viết theo format chuyên nghiệp, dễ copy lên YouTube.\n"
+        "- Dòng 1 là hook ngắn khiến người xem muốn xem hết.\n"
+        "- Đoạn 2 tóm tắt nội dung chính trong 2-3 câu, không spoil quá đà nếu không cần.\n"
+        "- Có 1 câu hỏi kéo bình luận.\n"
+        "- Có CTA nhẹ: đăng ký/kênh/bình luận/chia sẻ.\n"
+        "- Cuối mô tả có một dòng hashtag 5-8 hashtag liên quan.\n\n"
+        "Yêu cầu tags:\n"
+        "- 15-20 tag SEO không có dấu #, không có khoảng trắng.\n"
+        "- Ưu tiên: reviewphim, tomtatphim, hoathinh, donghua, phimcotrang, phimnguoctam, tên nhân vật/sự kiện nếu nhận ra.\n\n"
+        "Trả về đúng JSON với key: title, description, tags."
     )
     
     if custom_prompt:
@@ -32,7 +48,7 @@ async def generate_video_details(transcript: str, custom_prompt: str | None = No
             model="ag/gemini-3.5-flash-low",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Transcript của video:\n{transcript[:8000]}"}
+                {"role": "user", "content": f"Transcript của video:\n{clean_transcript[:8000]}"}
             ],
             response_format={"type": "json_object"},
             temperature=0.7,
@@ -42,18 +58,130 @@ async def generate_video_details(transcript: str, custom_prompt: str | None = No
         if not content:
             raise ValueError("Empty response from AI")
             
-        data = json.loads(content)
+        data = _loads_json_object(content)
         
+        tags = data.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+        cleaned_tags = _clean_tags(tags) or _default_tags()
+
         return VideoDetails(
-            title=data.get("title", "Video Mới"),
-            description=data.get("description", "Mô tả đang cập nhật..."),
-            tags=data.get("tags", [])
+            title=_polish_title(str(data.get("title") or "Review phim hoạt hình cảm động")),
+            description=_polish_description(str(data.get("description") or ""), cleaned_tags),
+            tags=cleaned_tags
         )
     except Exception as e:
         print(f"Error generating video details with AI: {e}")
         # Fallback values
         return VideoDetails(
-            title="Tập 1 - Review Phim Mới",
-            description="Tóm tắt: " + transcript[:200] + "...",
-            tags=["review", "phim"]
+            title=_fallback_title(clean_transcript),
+            description=_fallback_description(clean_transcript),
+            tags=_default_tags()
         )
+
+
+def _loads_json_object(content: str) -> dict:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", content, flags=re.S)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def _plain_transcript(transcript: str) -> str:
+    lines: list[str] = []
+    for raw in transcript.splitlines():
+        line = raw.strip()
+        if not line or line.isdigit() or "-->" in line:
+            continue
+        lines.append(line)
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def _fallback_title(transcript: str) -> str:
+    if not transcript:
+        return "Câu chuyện cảm động khiến người xem nghẹn lòng"
+    first_sentence = re.split(r"(?<=[.!?。！？])\s+", transcript)[0]
+    first_sentence = first_sentence[:58].strip(" ,.;:-")
+    return _polish_title(f"Cảnh phim khiến ai xem cũng nghẹn lòng: {first_sentence}")
+
+
+def _fallback_description(transcript: str) -> str:
+    summary = transcript[:260].strip()
+    if not summary:
+        summary = "Một câu chuyện nhiều cảm xúc được tóm tắt và lồng tiếng lại bằng tiếng Việt."
+    return _polish_description(
+        (
+            "Một phân cảnh nhiều cảm xúc, càng xem càng thấy nghẹn.\n\n"
+            f"Trong video này, mình tóm tắt lại nội dung chính: {summary}...\n\n"
+            "Bạn thấy đoạn nào lấy cảm xúc nhất? Bình luận cảm nhận của bạn bên dưới nhé.\n"
+            "Nếu thích kiểu review này, hãy đăng ký kênh để xem thêm những câu chuyện hay hơn."
+        ),
+        _default_tags(),
+    )
+
+
+def _clean_tags(tags: list[object]) -> list[str]:
+    cleaned: list[str] = []
+    for tag in tags:
+        value = str(tag).strip().lower().lstrip("#")
+        value = "".join(ch for ch in value if ch.isalnum() or ch in {"_", "-"})
+        if not value or value in cleaned:
+            continue
+        cleaned.append(value)
+        if len(cleaned) >= 18:
+            break
+    return cleaned
+
+
+def _polish_title(title: str) -> str:
+    cleaned = re.sub(r"\s+", " ", title).strip(" \n\t\"'")
+    cleaned = cleaned.replace("!!!", "!").replace("!!", "!")
+    if not cleaned:
+        cleaned = "Câu chuyện cảm động khiến người xem nghẹn lòng"
+    if len(cleaned) > 85:
+        cleaned = cleaned[:82].rstrip(" ,.;:-") + "..."
+    return cleaned
+
+
+def _polish_description(description: str, tags: list[str]) -> str:
+    text = re.sub(r"\n{3,}", "\n\n", description.strip())
+    if not text:
+        text = (
+            "Một phân cảnh nhiều cảm xúc, càng xem càng thấy nghẹn.\n\n"
+            "Trong video này, mình tóm tắt lại câu chuyện theo cách dễ hiểu, cuốn và giữ đúng tinh thần nội dung gốc.\n\n"
+            "Bạn thấy đoạn nào đáng nhớ nhất? Bình luận cảm nhận của bạn bên dưới nhé.\n"
+            "Nếu thích kiểu review này, hãy đăng ký kênh để xem thêm những câu chuyện hay hơn."
+        )
+
+    hashtag_line = _hashtag_line(tags)
+    if hashtag_line and "#" not in text.splitlines()[-1]:
+        text = f"{text.rstrip()}\n\n{hashtag_line}"
+    return text
+
+
+def _hashtag_line(tags: list[str]) -> str:
+    selected = tags[:8] if tags else _default_tags()[:8]
+    return " ".join(f"#{tag}" for tag in selected)
+
+
+def _default_tags() -> list[str]:
+    return [
+        "reviewphim",
+        "tomtatphim",
+        "hoathinh",
+        "donghua",
+        "phimcotrang",
+        "phimnguoctam",
+        "longtiengviet",
+        "phimhay",
+        "reviewhoathinh",
+        "phimcamdong",
+        "cotrangtrungquoc",
+        "xuhuong",
+        "viralvideo",
+        "storytelling",
+        "reviewyoutube",
+    ]
