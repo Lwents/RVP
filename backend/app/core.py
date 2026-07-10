@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     subtitle_group_max_gap: float = 0.75
     
     ninerouter_api_url: str = "http://localhost:20128/v1"
-    ninerouter_api_key: str = "sk-1f1cc1b2edd32ceb-x5e9ov-38804b30"
+    ninerouter_api_key: str | None = None
     youtube_client_secrets_file: str = "client_secret.json"
     youtube_credentials_file: str = "storage/youtube_credentials.json"
 
