@@ -51,25 +51,7 @@ def write_srt(events: list[SubtitleEvent], output_file: Path) -> Path:
 
 def _wrap_subtitle_text(text: str, max_chars: int) -> str:
     normalized = text.replace(r"\N", " ")
-    words = normalized.split()
-    if not words:
-        return ""
-
-    lines: list[str] = []
-    current: list[str] = []
-    current_length = 0
-    for word in words:
-        extra = len(word) + (1 if current else 0)
-        if current and current_length + extra > max_chars:
-            lines.append(" ".join(current))
-            current = [word]
-            current_length = len(word)
-        else:
-            current.append(word)
-            current_length += extra
-    if current:
-        lines.append(" ".join(current))
-    return r"\N".join(lines[:2])
+    return " ".join(normalized.split())
 
 
 def _ass_escape(text: str) -> str:

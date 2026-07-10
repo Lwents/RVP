@@ -119,7 +119,8 @@ class EdgeTtsVoiceEngine(VoiceEngine):
         except ImportError as exc:
             raise VoiceError("Thiếu edge-tts. Chạy pip install -r requirements.txt trong backend.") from exc
 
-        events = _group_events(normalize_events(parse_srt(subtitle_file)))
+        # Keep voice generation aligned with the exact subtitle events burned into the output.
+        events = normalize_events(parse_srt(subtitle_file))
         if not events:
             raise VoiceError("Không có phụ đề hợp lệ để tạo giọng đọc theo thời gian.")
 
@@ -152,13 +153,18 @@ class EdgeTtsVoiceEngine(VoiceEngine):
                 timeline_files.append(silence_file)
                 cursor = event.start
 
-            raw_file = aligned_dir / f"{index:04d}_raw.mp3"
             speech_file = aligned_dir / f"{index:04d}_speech.wav"
-            await self._save_chunk(edge_tts, event.text, raw_file, self.get_voice_for_text(event.text, voice_gender))
-
-            raw_duration = await _probe_audio_duration(raw_file)
             next_start = events[index].start if index < total else duration
             available = max(0.4, min(event.end, next_start - 0.05, duration) - event.start)
+            if not _has_speakable_content(event.text):
+                await _create_silence(ffmpeg, available, speech_file)
+                timeline_files.append(speech_file)
+                cursor = event.start + available
+                continue
+
+            raw_file = aligned_dir / f"{index:04d}_raw.mp3"
+            await self._save_chunk(edge_tts, event.text, raw_file, self.get_voice_for_text(event.text, voice_gender))
+            raw_duration = await _probe_audio_duration(raw_file)
             speed = max(1.0, raw_duration / available) if raw_duration > 0 else 1.0
             await _convert_speech(ffmpeg, raw_file, speech_file, speed=speed, max_duration=available)
             timeline_files.append(speech_file)
@@ -222,6 +228,13 @@ def get_voice_engine() -> VoiceEngine:
 def _normalize_tts_text(text: str) -> str:
     lines = [line.strip() for line in text.replace("\\N", "\n").splitlines()]
     return "\n".join(line for line in lines if line)
+
+
+def _has_speakable_content(text: str) -> bool:
+    normalized = _normalize_tts_text(text)
+    if not normalized:
+        return False
+    return any(char.isalnum() or ("\u4e00" <= char <= "\u9fff") for char in normalized)
 
 
 def _cjk_ratio(text: str) -> float:

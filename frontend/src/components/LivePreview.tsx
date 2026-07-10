@@ -80,7 +80,7 @@ export const LivePreview = React.memo(function LivePreview({
 
   // References to draggable elements to apply high performance direct style mutations
   const subtitleNodeRef = useRef<HTMLDivElement | null>(null);
-  const logoNodeRef = useRef<HTMLImageElement | null>(null);
+  const logoNodeRef = useRef<HTMLDivElement | null>(null);
   const blurBoxNodeRef = useRef<HTMLDivElement | null>(null);
   const customBoxNodeRefs = useRef<{ [key: number]: HTMLDivElement | null }>({});
 
@@ -164,7 +164,7 @@ export const LivePreview = React.memo(function LivePreview({
   };
 
   // Pointer Handlers: Logo Watermark
-  const beginLogoDrag = (e: PointerEvent<HTMLImageElement>) => {
+  const beginLogoDrag = (e: PointerEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
     el.setPointerCapture(e.pointerId);
     const frame = frameRef.current;
@@ -179,7 +179,7 @@ export const LivePreview = React.memo(function LivePreview({
     };
   };
 
-  const handleLogoMove = (e: PointerEvent<HTMLImageElement>) => {
+  const handleLogoMove = (e: PointerEvent<HTMLDivElement>) => {
     const drag = dragStartRef.current;
     if (!drag || drag.type !== "logo") return;
     const deltaX = e.clientX - drag.startX;
@@ -192,7 +192,7 @@ export const LivePreview = React.memo(function LivePreview({
     e.currentTarget.style.transform = `translate(-${newX}%, -${newY}%)`;
   };
 
-  const handleLogoUp = (e: PointerEvent<HTMLImageElement>) => {
+  const handleLogoUp = (e: PointerEvent<HTMLDivElement>) => {
     const drag = dragStartRef.current;
     if (!drag || drag.type !== "logo") return;
     const deltaX = e.clientX - drag.startX;
@@ -204,6 +204,12 @@ export const LivePreview = React.memo(function LivePreview({
     dragStartRef.current = null;
     setField("logo_x_percent", newX);
     setField("logo_y_percent", newY);
+  };
+
+  const removeLogo = () => {
+    dragStartRef.current = null;
+    setField("watermark_file_name", null);
+    setField("logo_enabled", false);
   };
 
   // Pointer Handlers: original Subtitle Blur Box
@@ -445,23 +451,40 @@ export const LivePreview = React.memo(function LivePreview({
         ))}
 
         {logo_enabled && watermark_file_name && (
-          <img
+          <div
             ref={logoNodeRef}
-            src={toAbsoluteApiUrl(`/api/uploads/watermark/${watermark_file_name}`)}
-            className="watermark-logo-layer"
+            className="watermark-logo-wrapper"
             style={{
               left: `${logo_x_percent}%`,
               top: `${logo_y_percent}%`,
-              width: `${Math.max(32, logo_width * 0.6)}px`,
               transform: `translate(-${logo_x_percent}%, -${logo_y_percent}%)`,
             }}
-            alt="Logo"
-            draggable={false}
             onPointerDown={beginLogoDrag}
             onPointerMove={handleLogoMove}
             onPointerUp={handleLogoUp}
             onPointerCancel={handleLogoUp}
-          />
+          >
+            <button
+              type="button"
+              className="custom-blur-delete-btn watermark-delete-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                removeLogo();
+              }}
+              title="Xoa logo"
+            >
+              ×
+            </button>
+            <img
+              src={toAbsoluteApiUrl(`/api/uploads/watermark/${watermark_file_name}`)}
+              className="watermark-logo-layer"
+              style={{
+                width: `${Math.max(32, logo_width * 0.6)}px`,
+              }}
+              alt="Logo"
+              draggable={false}
+            />
+          </div>
         )}
 
         {hard_subtitles && subtitle_box_enabled && (

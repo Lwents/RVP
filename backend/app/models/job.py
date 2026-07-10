@@ -56,9 +56,9 @@ class DubbingRequest(BaseModel):
     subtitle_box_height_percent: int = Field(default=20, ge=8, le=45)
     source_language: LanguageOption = "auto"
     ducking_volume_db: int = Field(default=-12, ge=-36, le=0)
-    logo_width: int = Field(default=150, ge=32, le=800)
-    logo_x_percent: int = Field(default=90, ge=0, le=100)
-    logo_y_percent: int = Field(default=10, ge=0, le=100)
+    logo_width: int = Field(default=96, ge=32, le=800)
+    logo_x_percent: int = Field(default=94, ge=0, le=100)
+    logo_y_percent: int = Field(default=6, ge=0, le=100)
     logo_enabled: bool = True
     cinematic_bars_enabled: bool = False
     cinematic_bars_height_percent: int = Field(default=10, ge=0, le=40)

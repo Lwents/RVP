@@ -82,6 +82,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 work_dir,
                 job.request.source_language,
                 progress,
+                source_video,
             )
             progress("Tạo giọng đọc khớp phụ đề", 70)
             narration_audio, voice_warning = await _try_synthesize_voice(
@@ -115,6 +116,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 work_dir,
                 job.request.source_language,
                 progress,
+                source_video,
             )
             progress("Tạo giọng đọc khớp phụ đề", 70)
             narration_audio, voice_warning = await _try_synthesize_voice(

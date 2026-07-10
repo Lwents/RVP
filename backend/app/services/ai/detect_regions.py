@@ -45,6 +45,36 @@ def _to_float(value: object, default: float = 0) -> float:
         return default
 
 
+def _target_subtitle_height(height: float) -> int:
+    return round(_clamp(height, 8, 18))
+
+
+def _merge_logo_regions(regions: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    for region in sorted(regions, key=lambda item: item["width_percent"] * item["height_percent"], reverse=True):
+        duplicate_index = next(
+            (index for index, existing in enumerate(merged) if _overlap_ratio(region, existing) > 0.45),
+            None,
+        )
+        if duplicate_index is None:
+            merged.append(region)
+            continue
+
+        existing = merged[duplicate_index]
+        x1 = min(existing["x_percent"], region["x_percent"])
+        y1 = min(existing["y_percent"], region["y_percent"])
+        x2 = max(existing["x_percent"] + existing["width_percent"], region["x_percent"] + region["width_percent"])
+        y2 = max(existing["y_percent"] + existing["height_percent"], region["y_percent"] + region["height_percent"])
+        merged[duplicate_index] = {
+            **existing,
+            "x_percent": round(x1),
+            "y_percent": round(y1),
+            "width_percent": round(x2 - x1),
+            "height_percent": round(y2 - y1),
+        }
+    return merged
+
+
 def _region_kind(region: dict) -> str:
     label = str(region.get("label", "")).lower()
     if "sub" in label or "subtitle" in label or "caption" in label:
@@ -158,24 +188,24 @@ def review_and_build_blur_config(regions: list[dict]) -> dict:
     else:
         subtitle_region = {
             "x_percent": 0,
-            "y_percent": 76,
+            "y_percent": 82,
             "width_percent": 100,
-            "height_percent": 24,
+            "height_percent": 12,
             "label": "Subtitle blur safety band",
             "kind": "subtitle",
         }
         normalized.append(subtitle_region)
-        notes.append("AI khong chac vung subtitle, dung dai mo an toan 76-100% de che chu goc.")
+        notes.append("AI khong chac vung subtitle, dung dai mo an toan gon o day khung hinh.")
 
     subtitle_region["x_percent"] = 0
     subtitle_region["width_percent"] = 100
-    if subtitle_region["y_percent"] >= 70:
-        subtitle_region["y_percent"] = min(subtitle_region["y_percent"], 76)
-        subtitle_region["height_percent"] = max(subtitle_region["height_percent"], 100 - subtitle_region["y_percent"])
-    subtitle_region["height_percent"] = min(35, max(18, subtitle_region["height_percent"]))
+    subtitle_region["y_percent"] = round(_clamp(subtitle_region["y_percent"], 74, 90))
+    subtitle_region["height_percent"] = _target_subtitle_height(subtitle_region["height_percent"])
+    if subtitle_region["y_percent"] + subtitle_region["height_percent"] > 97:
+        subtitle_region["y_percent"] = 97 - subtitle_region["height_percent"]
 
     custom_boxes: list[dict] = []
-    for logo in logo_regions:
+    for logo in _merge_logo_regions(logo_regions):
         if subtitle_region and _overlap_ratio(logo, subtitle_region) > 0.25:
             notes.append("Bo qua mot logo box vi trung voi dai subtitle.")
             continue
@@ -188,53 +218,8 @@ def review_and_build_blur_config(regions: list[dict]) -> dict:
             "width_percent": logo["width_percent"],
             "height_percent": logo["height_percent"],
         })
-
-    has_top_left_watermark = any(
-        box["x_percent"] <= 35 and box["y_percent"] <= 18
-        for box in custom_boxes
-    )
-    if not has_top_left_watermark:
-        top_left_box = {
-            "x_percent": 0,
-            "y_percent": 0,
-            "width_percent": 45,
-            "height_percent": 13,
-        }
-        if not any(_overlap_ratio(top_left_box, existing) > 0.35 for existing in custom_boxes):
-            custom_boxes.append(top_left_box)
-            notes.append("Them vung mo chu/logo phia tren trai neu AI bo sot.")
-
-    has_top_middle_watermark = any(
-        35 <= box["x_percent"] + box["width_percent"] / 2 <= 75
-        and box["y_percent"] <= 28
-        for box in custom_boxes
-    )
-    has_top_watermark = any(box["y_percent"] <= 15 for box in custom_boxes)
-    if not has_top_middle_watermark:
-        top_middle_box = {
-            "x_percent": 44,
-            "y_percent": 7,
-            "width_percent": 32,
-            "height_percent": 16,
-        }
-        if not any(_overlap_ratio(top_middle_box, existing) > 0.35 for existing in custom_boxes):
-            custom_boxes.append(top_middle_box)
-            notes.append("Them vung mo watermark chu o phia tren giua neu AI bo sot.")
-
-    has_top_right_watermark = any(
-        box["x_percent"] >= 70 and box["y_percent"] <= 18
-        for box in custom_boxes
-    )
-    if (has_top_watermark or custom_boxes) and not has_top_right_watermark:
-        top_right_box = {
-            "x_percent": 76,
-            "y_percent": 0,
-            "width_percent": 24,
-            "height_percent": 13,
-        }
-        if not any(_overlap_ratio(top_right_box, existing) > 0.35 for existing in custom_boxes):
-            custom_boxes.append(top_right_box)
-            notes.append("Them vung mo watermark goc phai tren neu AI bo sot.")
+    if logo_regions and len(custom_boxes) < len(logo_regions):
+        notes.append("Da gop cac box logo trung lap de giu dung so vung can lam mo.")
 
     config = {
         "blur_box_enabled": bool(subtitle_region),

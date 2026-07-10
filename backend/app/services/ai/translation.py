@@ -11,6 +11,7 @@ Các cải tiến chính:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections import Counter
 
@@ -30,6 +31,7 @@ class TranslationEngine:
         events: list[SubtitleEvent],
         source_language: str,
         target_language: str,
+        context: dict | None = None,
     ) -> list[SubtitleEvent]:
         raise NotImplementedError
 
@@ -40,6 +42,7 @@ class PassthroughTranslation(TranslationEngine):
         events: list[SubtitleEvent],
         source_language: str,
         target_language: str,
+        context: dict | None = None,
     ) -> list[SubtitleEvent]:
         return events
 
@@ -50,6 +53,7 @@ class GoogleTranslation(TranslationEngine):
         events: list[SubtitleEvent],
         source_language: str,
         target_language: str,
+        context: dict | None = None,
     ) -> list[SubtitleEvent]:
         if not events:
             return []
@@ -99,13 +103,264 @@ class GoogleTranslation(TranslationEngine):
                 for i, event in enumerate(events)
             ]
 
-        return await asyncio.to_thread(translate)
+        translated_events = await asyncio.to_thread(translate)
+        if target_language.lower() == "vi":
+            translated_events = await _polish_vietnamese_events_with_ai(
+                events,
+                translated_events,
+                source_language,
+                context,
+            )
+        return translated_events
 
 
 def get_translation_engine() -> TranslationEngine:
     if settings.translation_engine.lower() == "google":
         return GoogleTranslation()
     return PassthroughTranslation()
+
+
+# ─── AI Vietnamese subtitle editor ───────────────────────────────────────────
+
+async def _polish_vietnamese_events_with_ai(
+    source_events: list[SubtitleEvent],
+    draft_events: list[SubtitleEvent],
+    source_language: str,
+    context: dict | None = None,
+) -> list[SubtitleEvent]:
+    if not draft_events or not settings.ninerouter_api_key:
+        return draft_events
+
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        return draft_events
+
+    polished: list[SubtitleEvent] = []
+    failed_batches = 0
+    client = AsyncOpenAI(
+        api_key=settings.ninerouter_api_key,
+        base_url=settings.ninerouter_api_url,
+    )
+
+    for batch in _ai_polish_batches(source_events, draft_events):
+        try:
+            edited = await _polish_vietnamese_batch_with_retries(client, batch, source_language, context)
+        except Exception as exc:
+            print(f"AI subtitle polish fallback: {exc}")
+            failed_batches += 1
+            edited = [item["draft"] for item in batch]
+
+        for item, text in zip(batch, edited):
+            cleaned = _clean_polished_subtitle(text, item["draft"])
+            cleaned = _guard_relationship_terms(cleaned, str(item["source"]), str(item["draft"]))
+            polished.append(
+                SubtitleEvent(
+                    item["start"],
+                    item["end"],
+                    _fix_character_names(cleaned),
+                )
+            )
+
+    if len(polished) != len(draft_events):
+        return draft_events
+    if failed_batches and _source_requires_ai_polish(source_events):
+        raise TranslationError(
+            "AI biên tập phụ đề không chạy được nên không dùng bản dịch thô. "
+            "Hãy bật 9router/AI ở localhost:20128 rồi chạy lại."
+        )
+    return polished
+
+
+def _ai_polish_batches(
+    source_events: list[SubtitleEvent],
+    draft_events: list[SubtitleEvent],
+    max_items: int = 18,
+    max_chars: int = 5200,
+) -> list[list[dict[str, object]]]:
+    batches: list[list[dict[str, object]]] = []
+    current: list[dict[str, object]] = []
+    current_chars = 0
+
+    for index, (source, draft) in enumerate(zip(source_events, draft_events), start=1):
+        source_text = _normalize_source_text(source.text.strip())
+        draft_text = draft.text.strip()
+        item = {
+            "id": index,
+            "start": draft.start,
+            "end": draft.end,
+            "source": source_text,
+            "draft": draft_text,
+        }
+        item_chars = len(source_text) + len(draft_text) + 80
+        if current and (len(current) >= max_items or current_chars + item_chars > max_chars):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(item)
+        current_chars += item_chars
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def _polish_vietnamese_batch(
+    client,
+    batch: list[dict[str, object]],
+    source_language: str,
+    context: dict | None,
+) -> list[str]:
+    system_prompt = (
+        "Bạn là biên tập viên phụ đề/lồng tiếng Việt chuyên review phim cổ trang Trung Quốc, donghua. "
+        "Nhiệm vụ: sửa bản dịch nháp để câu thoại tự nhiên, đúng xưng hô và dễ đọc khi lồng tiếng.\n\n"
+        "Quy tắc bắt buộc:\n"
+        "- Trả về đúng JSON object: {\"items\":[{\"id\":1,\"text\":\"...\"}]}.\n"
+        "- Giữ nguyên số lượng item và id. Không thêm, xoá, gộp, tách dòng.\n"
+        "- Không thêm sự kiện mới, không bịa nội dung ngoài câu gốc.\n"
+        "- Câu ngắn, hợp phụ đề và giọng đọc; ưu tiên 1-2 câu mỗi item.\n"
+        "- Dùng xưng hô cổ trang hợp ngữ cảnh: bệ hạ, thần, phụ hoàng, phụ thân, huynh, tỷ, công tử, đại nhân.\n"
+        "- Nếu là vua/hoàng đế nói với quần thần dùng 'trẫm/khanh'; thần tử nói với vua dùng 'thần/bệ hạ'.\n"
+        "- Không đổi quan hệ. Tuyệt đối không dịch thành vợ/chồng/kết hôn nếu câu gốc không có 老婆, 妻子, 丈夫, 结婚, 婚约 hoặc nghĩa hôn nhân rõ ràng.\n"
+        "- Nếu quan hệ chưa rõ, dùng trung tính: người phụ nữ, người đàn ông, cô ấy, hắn ta, người tình một đêm, nam chính/nữ chính.\n"
+        "- Giữ tên riêng nhất quán theo Hán Việt nếu nhận ra: Chu Nguyên Chương, Chu Kỳ Ngọc, Hồng Vũ, Vĩnh Lạc, Mặc Nguyệt, Tần ca, Long tỷ.\n"
+        "- Các cụm bị ASR/OCR sai phải sửa theo nghĩa: 照办 = làm theo, 照常 = như thường, 父亲 = phụ thân.\n"
+        "- Nếu gặp 海繁的动物/还能翻得动不 hoặc 翻得动: hiểu là 'còn nhào lộn nổi không', tuyệt đối không dịch thành động vật/biển.\n"
+        "- Nếu phần CONTEXT có tên phim, nhân vật, quan hệ, vai vế hoặc glossary thì ưu tiên dùng để sửa tên và xưng hô.\n"
+        "- Không để sót tiếng Trung, pinyin thô hoặc tên sai kiểu Zhaoban/Zhan Xiang/Qixia/Mo Yue nếu có thể sửa.\n"
+    )
+    user_prompt = {
+        "source_language": source_language,
+        "context": _compact_context(context),
+        "items": [
+            {
+                "id": item["id"],
+                "source": item["source"],
+                "draft_vi": item["draft"],
+            }
+            for item in batch
+        ],
+    }
+    response = await client.chat.completions.create(
+        model="ag/gemini-3.5-flash-low",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.25,
+        timeout=90,
+    )
+    content = response.choices[0].message.content or ""
+    data = _loads_json_object(content)
+    items = data.get("items")
+    if not isinstance(items, list):
+        raise TranslationError("AI polish không trả về items.")
+
+    by_id: dict[int, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_id = int(item.get("id"))
+        except Exception:
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            by_id[item_id] = text
+
+    result: list[str] = []
+    for item in batch:
+        item_id = int(item["id"])
+        result.append(by_id.get(item_id, str(item["draft"])))
+    return result
+
+
+async def _polish_vietnamese_batch_with_retries(
+    client,
+    batch: list[dict[str, object]],
+    source_language: str,
+    context: dict | None,
+    retries: int = 3,
+) -> list[str]:
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await _polish_vietnamese_batch(client, batch, source_language, context)
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                await asyncio.sleep(min(2 * attempt, 6))
+    assert last_error is not None
+    raise last_error
+
+
+def _source_requires_ai_polish(events: list[SubtitleEvent]) -> bool:
+    joined = " ".join(event.text for event in events[:80])
+    return _looks_chinese(joined)
+
+
+def _compact_context(context: dict | None) -> dict:
+    if not isinstance(context, dict):
+        return {}
+    allowed = {
+        "film_title",
+        "genre",
+        "setting",
+        "characters",
+        "relationships",
+        "glossary",
+        "honorific_rules",
+        "translation_notes",
+        "relationship_constraints",
+    }
+    compact = {key: context.get(key) for key in allowed if context.get(key)}
+    return compact
+
+
+def _loads_json_object(content: str) -> dict:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", content, flags=re.S)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def _clean_polished_subtitle(text: str, fallback: str) -> str:
+    cleaned = _clean_translation(text)
+    cleaned = cleaned.replace("\\N", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n\"'")
+    cleaned = re.sub(r"\.{4,}", "...", cleaned)
+    cleaned = re.sub(r"\s+([.,!?:;])", r"\1", cleaned)
+    cleaned = re.sub(r",([^\s])", r", \1", cleaned)
+    if not cleaned or _looks_chinese(cleaned):
+        return fallback
+    return cleaned
+
+
+_MARRIAGE_SOURCE_RE = re.compile(
+    r"(老婆|妻子|夫人|丈夫|老公|结婚|婚姻|婚约|未婚妻|未婚夫|新娘|新郎|成亲|拜堂|夫妻|太太)"
+)
+
+
+def _guard_relationship_terms(text: str, source: str, fallback: str) -> str:
+    if _MARRIAGE_SOURCE_RE.search(source):
+        return text
+    guarded = text
+    guarded = re.sub(r"\bngười vợ\b", "người phụ nữ", guarded, flags=re.IGNORECASE)
+    guarded = re.sub(r"\bvợ\b", "người phụ nữ", guarded, flags=re.IGNORECASE)
+    guarded = re.sub(r"\bngười chồng\b", "người đàn ông", guarded, flags=re.IGNORECASE)
+    guarded = re.sub(r"\bchồng\b", "người đàn ông", guarded, flags=re.IGNORECASE)
+    guarded = re.sub(r"\bphu nhân\b", "cô ấy", guarded, flags=re.IGNORECASE)
+    guarded = re.sub(r"\bphu quân\b", "anh ấy", guarded, flags=re.IGNORECASE)
+    guarded = re.sub(r"\bkết hôn\b", "ở bên nhau", guarded, flags=re.IGNORECASE)
+    guarded = re.sub(r"\bcưới\b", "ở bên", guarded, flags=re.IGNORECASE)
+    guarded = re.sub(r"\shôn nhân\b", " mối quan hệ", guarded, flags=re.IGNORECASE)
+    if guarded != text:
+        return guarded
+    return text or fallback
 
 
 # ─── Google Translate API ─────────────────────────────────────────────────────
@@ -224,7 +479,12 @@ _SOURCE_TEXT_FIXES: list[tuple[re.Pattern, str]] = [
     (re.compile("战相"), "照常"),
     (re.compile("太阳照常"), "太阳照常"),
     (re.compile("不清"), "父亲"),
+    (re.compile("不苦"), "不哭"),
+    (re.compile("莫苦"), "莫哭"),
+    (re.compile("一莫哭"), "莫哭"),
     (re.compile("初期"), "朱祁钰"),
+    (re.compile("朱言此精花此数"), "朱颜辞镜花辞树"),
+    (re.compile("尊是人间留不住"), "最是人间留不住"),
     (re.compile("朱言"), "朱元璋"),
     (re.compile("红武朝"), "洪武朝"),
     (re.compile("从西朝"), "正统朝"),
@@ -233,6 +493,11 @@ _SOURCE_TEXT_FIXES: list[tuple[re.Pattern, str]] = [
     (re.compile("七夏山"), "栖霞山"),
     (re.compile("秦哥"), "秦哥"),
     (re.compile("龙姐"), "龙姐"),
+    (re.compile("海繁的动物"), "还能翻得动不"),
+    (re.compile("繁的动"), "翻得动"),
+    (re.compile("能连繁"), "能连翻"),
+    (re.compile("能繁多少"), "能翻多少"),
+    (re.compile("不插气"), "不喘气"),
 ]
 
 
@@ -499,12 +764,31 @@ _VI_NAME_FIXES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"Thái tử và đại sư", re.IGNORECASE), "Thái tử thái sư"),
     (re.compile(r"Hãy hứa với chúng tôi một điều", re.IGNORECASE), "Xin hãy hứa với thần một điều"),
     (re.compile(r"Thưa bệ hạ, tôi sẽ làm theo lời ngài", re.IGNORECASE), "Bệ hạ nói gì, thần nhất định sẽ làm theo"),
+    (re.compile(r"Xin hãy hứa với ta một chuyện", re.IGNORECASE), "Xin hãy hứa với trẫm một chuyện"),
+    (re.compile(r"\bHứa với ta một chuyện", re.IGNORECASE), "Hứa với trẫm một chuyện"),
+    (re.compile(r"\bHứa với ta một việc", re.IGNORECASE), "Hứa với trẫm một việc"),
+    (re.compile(r"Hãy thay ta bảo vệ", re.IGNORECASE), "Hãy thay trẫm bảo vệ"),
+    (re.compile(r"\bThay ta bảo vệ", re.IGNORECASE), "Thay trẫm bảo vệ"),
+    (re.compile(r"bảo vệ nó", re.IGNORECASE), "bảo vệ người ấy"),
+    (re.compile(r"bảo vệ người\. Dốc", re.IGNORECASE), "bảo vệ người ấy. Dốc"),
+    (re.compile(r"để nó sống", re.IGNORECASE), "để người ấy sống"),
+    (re.compile(r"Hãy bảo vệ nó, bảo vệ cho tốt", re.IGNORECASE), "Hãy bảo vệ người ấy, bảo vệ cho tốt"),
+    (re.compile(r"Bảo nó cứ sống như thường", re.IGNORECASE), "Bảo người ấy cứ sống như thường"),
+    (re.compile(r"bảo vệ hắn", re.IGNORECASE), "bảo vệ người ấy"),
+    (re.compile(r"Bệ hạ cứ nói, tôi", re.IGNORECASE), "Bệ hạ cứ nói, thần"),
+    (re.compile(r"Bệ hạ cứ nói, con", re.IGNORECASE), "Bệ hạ cứ nói, thần"),
+    (re.compile(r"Bệ hạ nói gì, tôi", re.IGNORECASE), "Bệ hạ nói gì, thần"),
+    (re.compile(r"Bệ hạ nói gì, con", re.IGNORECASE), "Bệ hạ nói gì, thần"),
     (re.compile(r"Hãy bảo vệ anh ấy bằng gần như toàn bộ sức lực của bạn", re.IGNORECASE), "Thần sẽ dốc gần như toàn lực để bảo vệ người ấy"),
     (re.compile(r"Hãy bảo anh ấy làm như bình thường\.?\s*Gọi mặt trời như thường lệ\.?\s*Gọi mặt trời như thường lệ\.?", re.IGNORECASE), "Hãy để mặt trời vẫn chiếu như thường."),
     (re.compile(r"Xin đừng giữ Mặc Nguyệt lên núi Tê Hà", re.IGNORECASE), "Xin hãy ôm Mặc Nguyệt lên núi Tê Hà"),
+    (re.compile(r"Làm phiền ôm Mặc Nguyệt lên núi Tê Hà", re.IGNORECASE), "Xin hãy ôm Mặc Nguyệt lên núi Tê Hà"),
     (re.compile(r"Đừng để mọi người tan vỡ", re.IGNORECASE), "Sinh ly tử biệt khiến người ta rơi lệ"),
     (re.compile(r"Đếm xem Tần ca có thể nhân lên bao nhiêu lần", re.IGNORECASE), "Đếm xem Tần ca làm được bao nhiêu lần"),
+    (re.compile(r"Tần ca, huynh nói xem, động vật dưới biển\.{0,3}", re.IGNORECASE), "Tần ca, huynh nói xem, huynh còn nhào lộn nổi không?"),
+    (re.compile(r"Tần ca, huynh nói xem, .*?dưới biển\.{0,3}", re.IGNORECASE), "Tần ca, huynh nói xem, huynh còn nhào lộn nổi không?"),
     (re.compile(r"Cha ơi con ở đây", re.IGNORECASE), "Phụ thân, con ở đây"),
+    (re.compile(r"Được\.\.\. ta sẽ sống thật tốt", re.IGNORECASE), "Được... con sẽ sống thật tốt"),
     (re.compile(r"Cha ơi, sao trời tối thế", re.IGNORECASE), "Phụ thân, sao trời tối thế"),
     (re.compile(r"ngay cả cha tôi cũng là học trò của ông", re.IGNORECASE), "ngay cả phụ hoàng của ta cũng là học trò của ông"),
 ]

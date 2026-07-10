@@ -7,11 +7,12 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from app.core import settings
+from app.services.ai.context import analyze_video_context
 from app.services.ai.asr import get_asr_engine
 from app.services.ai.translation import get_translation_engine
 from app.services.media.ffmpeg import find_ffmpeg
 from app.services.subtitles.ass import write_srt
-from app.services.subtitles.timing import group_subtitle_events, parse_srt
+from app.services.subtitles.timing import group_subtitle_events, parse_srt, split_long_subtitle_events
 
 
 class SubtitleSourceError(RuntimeError):
@@ -99,11 +100,12 @@ async def get_or_create_subtitles(
     work_dir: Path,
     source_language: str,
     progress: Callable[[str, int], None],
+    source_video: Path | None = None,
 ) -> Path:
     if source_url and settings.prefer_youtube_subtitles:
         try:
             subtitle_file = await download_platform_subtitles(source_url, work_dir, progress)
-            return await _prepare_target_subtitles(subtitle_file, work_dir, source_language, progress)
+            return await _prepare_target_subtitles(subtitle_file, work_dir, source_language, progress, source_video)
         except SubtitleSourceError:
             progress("Nền tảng không có phụ đề phù hợp, tự tạo phụ đề bằng Whisper", 58)
 
@@ -116,7 +118,7 @@ async def get_or_create_subtitles(
         70,
         settings.asr_timeout_seconds,
     )
-    return await _prepare_target_subtitles(subtitle_file, work_dir, source_language, progress)
+    return await _prepare_target_subtitles(subtitle_file, work_dir, source_language, progress, source_video)
 
 
 async def _prepare_target_subtitles(
@@ -124,12 +126,22 @@ async def _prepare_target_subtitles(
     work_dir: Path,
     source_language: str,
     progress: Callable[[str, int], None],
+    source_video: Path | None = None,
 ) -> Path:
+    grouped_max_chars = min(settings.subtitle_group_max_chars, 42)
+    grouped_max_duration = min(settings.subtitle_group_max_duration, 3.2)
+    grouped_max_gap = min(settings.subtitle_group_max_gap, 0.45)
+
     events = group_subtitle_events(
         parse_srt(subtitle_file),
-        max_chars=settings.subtitle_group_max_chars,
-        max_duration=settings.subtitle_group_max_duration,
-        max_gap=settings.subtitle_group_max_gap,
+        max_chars=grouped_max_chars,
+        max_duration=grouped_max_duration,
+        max_gap=grouped_max_gap,
+    )
+    events = split_long_subtitle_events(
+        events,
+        max_chars=grouped_max_chars,
+        max_duration=grouped_max_duration,
     )
     grouped_file = work_dir / "subtitles.grouped.srt"
     write_srt(events, grouped_file)
@@ -140,8 +152,21 @@ async def _prepare_target_subtitles(
     ):
         return grouped_file
 
+    progress("AI nhận diện tên phim, nhân vật và vai vế", 67)
+    context = await analyze_video_context(source_video, events, work_dir)
+
     progress("Dịch phụ đề sang tiếng Việt", 68)
-    translated_events = await get_translation_engine().translate_events(events, source_language, target_language)
+    translated_events = await get_translation_engine().translate_events(
+        events,
+        source_language,
+        target_language,
+        context=context,
+    )
+    translated_events = split_long_subtitle_events(
+        translated_events,
+        max_chars=grouped_max_chars,
+        max_duration=grouped_max_duration,
+    )
     return write_srt(translated_events, work_dir / f"subtitles.{target_language}.srt")
 
 

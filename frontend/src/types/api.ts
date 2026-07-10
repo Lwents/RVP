@@ -68,3 +68,41 @@ export interface UploadResponse {
   url: string;
   local_file_path?: string | null;
 }
+
+export interface ReviewDraftRequest {
+  video_path: string;
+  target_minutes: number;
+  style: "story" | "fast" | "emotional" | "funny";
+  source_language: SourceLanguage;
+  notes?: string | null;
+}
+
+export interface ReviewBeat {
+  time_hint: string;
+  purpose: string;
+  narration: string;
+}
+
+export interface ReviewDraftResult {
+  title: string;
+  target_minutes: number;
+  hook: string;
+  summary: string;
+  narration_script: string;
+  beats: ReviewBeat[];
+  thumbnail_text: string;
+  tags: string[];
+  subtitle_file_path?: string | null;
+}
+
+export interface ReviewDraftJob {
+  job_id: string;
+  status: JobStatus;
+  progress: number;
+  stage: string;
+  request: ReviewDraftRequest;
+  created_at: string;
+  updated_at: string;
+  result?: ReviewDraftResult | null;
+  error?: string | null;
+}

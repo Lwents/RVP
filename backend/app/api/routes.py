@@ -1,9 +1,12 @@
 from pathlib import Path
 from uuid import uuid4
+from datetime import UTC, datetime
 
+import cv2
+import numpy as np
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core import settings
 from app.models.job import DubbingRequest, JobCreateResponse, JobProgress, UploadResponse
@@ -14,6 +17,77 @@ from app.services.media.downloader import download_preview_video
 router = APIRouter()
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+
+
+class ReviewDraftRequest(BaseModel):
+    video_path: str
+    target_minutes: int = Field(default=8, ge=1, le=30)
+    style: str = "story"
+    source_language: str = "auto"
+    notes: str | None = None
+
+
+class ReviewBeatResponse(BaseModel):
+    time_hint: str
+    purpose: str
+    narration: str
+
+
+class ReviewDraftResult(BaseModel):
+    title: str
+    target_minutes: int
+    hook: str
+    summary: str
+    narration_script: str
+    beats: list[ReviewBeatResponse]
+    thumbnail_text: str
+    tags: list[str]
+    subtitle_file_path: str | None = None
+
+
+class ReviewDraftJob(BaseModel):
+    job_id: str
+    status: str
+    progress: int = Field(ge=0, le=100)
+    stage: str
+    request: ReviewDraftRequest
+    created_at: datetime
+    updated_at: datetime
+    result: ReviewDraftResult | None = None
+    error: str | None = None
+
+
+review_draft_jobs: dict[str, ReviewDraftJob] = {}
+
+
+def _encode_round_logo_png(image_bytes: bytes) -> bytes:
+    buffer = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(buffer, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise ValueError("Khong doc duoc file logo.")
+
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGRA)
+    elif image.shape[2] == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+    elif image.shape[2] != 4:
+        raise ValueError("Dinh dang logo khong ho tro.")
+
+    height, width = image.shape[:2]
+    size = min(height, width)
+    offset_y = max(0, (height - size) // 2)
+    offset_x = max(0, (width - size) // 2)
+    square = image[offset_y:offset_y + size, offset_x:offset_x + size].copy()
+
+    alpha_mask = np.zeros((size, size), dtype=np.uint8)
+    radius = max(1, size // 2 - max(2, size // 50))
+    cv2.circle(alpha_mask, (size // 2, size // 2), radius, 255, -1, lineType=cv2.LINE_AA)
+    square[:, :, 3] = np.minimum(square[:, :, 3], alpha_mask)
+
+    ok, encoded = cv2.imencode(".png", square)
+    if not ok:
+        raise ValueError("Khong the ma hoa logo PNG.")
+    return encoded.tobytes()
 
 
 @router.post("/uploads/watermark", response_model=UploadResponse, tags=["uploads"])
@@ -105,6 +179,135 @@ async def upload_url_preview(request: UrlPreviewRequest) -> UploadResponse:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _resolve_video_path(video_path: str) -> Path:
+    path_obj = Path(video_path)
+    if path_obj.exists():
+        return path_obj.resolve()
+
+    storage_path = Path(settings.storage_dir) / video_path
+    if storage_path.exists():
+        return storage_path.resolve()
+
+    if video_path.startswith("storage/") or video_path.startswith("storage\\"):
+        relative = video_path.replace("\\", "/").removeprefix("storage/")
+        storage_relative = Path(settings.storage_dir) / relative
+        if storage_relative.exists():
+            return storage_relative.resolve()
+
+    raise FileNotFoundError(f"Khong tim thay video: {video_path}")
+
+
+def _update_review_job(job_id: str, **changes: object) -> ReviewDraftJob:
+    current = review_draft_jobs[job_id]
+    data = current.model_dump()
+    data.update(changes)
+    data["updated_at"] = datetime.now(UTC)
+    updated = ReviewDraftJob.model_validate(data)
+    review_draft_jobs[job_id] = updated
+    return updated
+
+
+async def _process_review_draft_job(job_id: str) -> None:
+    from app.services.ai.content import generate_movie_review_plan
+    from app.services.media.ffmpeg import extract_audio, find_ffmpeg
+    from app.services.subtitles.source import get_or_create_subtitles
+
+    job = review_draft_jobs[job_id]
+    try:
+        _update_review_job(job_id, status="processing", progress=5, stage="Kiem tra video")
+        source_video = _resolve_video_path(job.request.video_path)
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            raise RuntimeError("Khong tim thay FFmpeg.")
+
+        work_dir = Path(settings.storage_dir) / "review_jobs" / job_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        def progress(stage: str, percent: int) -> None:
+            _update_review_job(job_id, stage=stage, progress=max(5, min(80, percent)))
+
+        _update_review_job(job_id, progress=20, stage="Tach audio phim")
+        audio_file = work_dir / "source_audio.wav"
+        await extract_audio(ffmpeg, source_video, audio_file)
+
+        _update_review_job(job_id, progress=35, stage="Tao transcript va phu de tam")
+        subtitle_file = await get_or_create_subtitles(
+            None,
+            audio_file,
+            work_dir,
+            job.request.source_language,
+            progress,
+            source_video,
+        )
+
+        _update_review_job(job_id, progress=82, stage="AI viet kich ban review phim")
+        plan = await generate_movie_review_plan(
+            subtitle_file.read_text(encoding="utf-8"),
+            target_minutes=job.request.target_minutes,
+            style=job.request.style,
+            custom_prompt=job.request.notes,
+        )
+        result = ReviewDraftResult(
+            title=plan.title,
+            target_minutes=plan.target_minutes,
+            hook=plan.hook,
+            summary=plan.summary,
+            narration_script=plan.narration_script,
+            beats=[
+                ReviewBeatResponse(
+                    time_hint=beat.time_hint,
+                    purpose=beat.purpose,
+                    narration=beat.narration,
+                )
+                for beat in plan.beats
+            ],
+            thumbnail_text=plan.thumbnail_text,
+            tags=plan.tags,
+            subtitle_file_path=str(subtitle_file),
+        )
+        _update_review_job(
+            job_id,
+            status="completed",
+            progress=100,
+            stage="Hoan tat ban review phim",
+            result=result,
+        )
+    except Exception as exc:
+        _update_review_job(
+            job_id,
+            status="failed",
+            stage="Tao review phim that bai",
+            error=str(exc),
+        )
+
+
+@router.post("/review/jobs", response_model=ReviewDraftJob, tags=["review"])
+async def create_review_draft_job(request: ReviewDraftRequest) -> ReviewDraftJob:
+    import asyncio
+
+    now = datetime.now(UTC)
+    job = ReviewDraftJob(
+        job_id=str(uuid4()),
+        status="queued",
+        progress=0,
+        stage="Da nhan phim",
+        request=request,
+        created_at=now,
+        updated_at=now,
+    )
+    review_draft_jobs[job.job_id] = job
+    asyncio.create_task(_process_review_draft_job(job.job_id))
+    return job
+
+
+@router.get("/review/jobs/{job_id}", response_model=ReviewDraftJob, tags=["review"])
+async def get_review_draft_job(job_id: str) -> ReviewDraftJob:
+    job = review_draft_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Review job not found.")
+    return job
+
+
 from app.services import task_manager
 
 @router.post("/jobs", response_model=JobCreateResponse, tags=["jobs"])
@@ -127,8 +330,19 @@ async def list_jobs() -> list[JobProgress]:
 
 @router.delete("/jobs", tags=["jobs"])
 async def clear_jobs() -> dict[str, str]:
-    job_store.clear()
-    return {"message": "Jobs and generated files were moved to the recycle bin."}
+    cancelled = task_manager.cancel_all_tasks()
+    warnings = job_store.clear()
+
+    message = "Jobs and generated files were moved to the recycle bin."
+    if cancelled:
+        message = f"{message} Cancelled {cancelled} running task(s)."
+    if warnings:
+        message = f"{message} Some files could not be moved because they are in use."
+
+    response = {"message": message}
+    if warnings:
+        response["warnings"] = "\n".join(warnings)
+    return response
 
 
 @router.get("/jobs/{job_id}", response_model=JobProgress, tags=["jobs"])
@@ -294,13 +508,14 @@ async def detect_blur_regions(req: DetectRegionsRequest):
                 try:
                     dest_dir = Path(settings.storage_dir)
                     dest_dir.mkdir(parents=True, exist_ok=True)
-                    safe_name = f"logo_kenh{logo_src.suffix}"
-                    import shutil
-                    shutil.copy(logo_src, dest_dir / safe_name)
+                    safe_name = "logo_kenh.png"
+                    encoded_logo = _encode_round_logo_png(logo_src.read_bytes())
+                    (dest_dir / safe_name).write_bytes(encoded_logo)
                     auto_logo_data = {
                         "watermark_file_name": safe_name,
-                        "logo_x_percent": 2,
-                        "logo_y_percent": 3,
+                        "logo_width": 88,
+                        "logo_x_percent": 3,
+                        "logo_y_percent": 4,
                         "logo_enabled": True,
                         "display_name": logo_src.name
                     }
