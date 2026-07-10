@@ -101,6 +101,7 @@ async def get_or_create_subtitles(
     source_language: str,
     progress: Callable[[str, int], None],
     source_video: Path | None = None,
+    asr_timeout_seconds: int | None = None,
 ) -> Path:
     if source_url and settings.prefer_youtube_subtitles:
         try:
@@ -116,7 +117,7 @@ async def get_or_create_subtitles(
         "Đang nghe audio và tạo phụ đề tự động",
         62,
         70,
-        settings.asr_timeout_seconds,
+        asr_timeout_seconds or settings.asr_timeout_seconds,
     )
     return await _prepare_target_subtitles(subtitle_file, work_dir, source_language, progress, source_video)
 

@@ -209,7 +209,7 @@ def _update_review_job(job_id: str, **changes: object) -> ReviewDraftJob:
 
 async def _process_review_draft_job(job_id: str) -> None:
     from app.services.ai.content import generate_movie_review_plan
-    from app.services.media.ffmpeg import extract_audio, find_ffmpeg
+    from app.services.media.ffmpeg import extract_audio, find_ffmpeg, probe_video_duration
     from app.services.subtitles.source import get_or_create_subtitles
 
     job = review_draft_jobs[job_id]
@@ -229,6 +229,8 @@ async def _process_review_draft_job(job_id: str) -> None:
         _update_review_job(job_id, progress=20, stage="Tach audio phim")
         audio_file = work_dir / "source_audio.wav"
         await extract_audio(ffmpeg, source_video, audio_file)
+        video_duration = await probe_video_duration(ffmpeg, source_video)
+        asr_timeout_seconds = _review_asr_timeout(video_duration)
 
         _update_review_job(job_id, progress=35, stage="Tao transcript va phu de tam")
         subtitle_file = await get_or_create_subtitles(
@@ -238,6 +240,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             job.request.source_language,
             progress,
             source_video,
+            asr_timeout_seconds=asr_timeout_seconds,
         )
 
         _update_review_job(job_id, progress=82, stage="AI viet kich ban review phim")
@@ -279,6 +282,16 @@ async def _process_review_draft_job(job_id: str) -> None:
             stage="Tao review phim that bai",
             error=str(exc),
         )
+
+
+def _review_asr_timeout(video_duration_seconds: float) -> int:
+    if video_duration_seconds <= 0:
+        return max(settings.asr_timeout_seconds, 1800)
+
+    # Full movie review jobs can legitimately need much longer than the default
+    # short-video ASR timeout. Give Whisper time proportional to the movie length.
+    duration_based_timeout = int(video_duration_seconds * 2.5)
+    return min(max(settings.asr_timeout_seconds, duration_based_timeout, 1800), 6 * 60 * 60)
 
 
 @router.post("/review/jobs", response_model=ReviewDraftJob, tags=["review"])
