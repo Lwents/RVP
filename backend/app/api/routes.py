@@ -43,6 +43,8 @@ class ReviewDraftResult(BaseModel):
     thumbnail_text: str
     tags: list[str]
     subtitle_file_path: str | None = None
+    output_video_url: str | None = None
+    output_file_path: str | None = None
 
 
 class ReviewDraftJob(BaseModel):
@@ -209,7 +211,10 @@ def _update_review_job(job_id: str, **changes: object) -> ReviewDraftJob:
 
 async def _process_review_draft_job(job_id: str) -> None:
     from app.services.ai.content import generate_movie_review_plan
+    from app.services.ai.voice import get_voice_engine
     from app.services.media.ffmpeg import extract_audio, find_ffmpeg, probe_video_duration
+    from app.services.media.review_renderer import render_movie_review_video
+    from app.models.job import VoiceGender
     from app.services.subtitles.source import get_or_create_subtitles
 
     job = review_draft_jobs[job_id]
@@ -250,6 +255,27 @@ async def _process_review_draft_job(job_id: str) -> None:
             style=job.request.style,
             custom_prompt=job.request.notes,
         )
+        _update_review_job(job_id, progress=84, stage="Tao giong doc review")
+        narration_audio = await get_voice_engine().synthesize(
+            plan.narration_script,
+            work_dir / "review_narration.mp3",
+            VoiceGender.female,
+            lambda stage, percent: _update_review_job(job_id, stage=stage, progress=max(84, min(90, percent))),
+        )
+
+        _update_review_job(job_id, progress=90, stage="Cat ghep video review")
+        output_file = work_dir / "review_output.mp4"
+        await render_movie_review_video(
+            ffmpeg,
+            source_video,
+            narration_audio,
+            output_file,
+            work_dir,
+            job.request.target_minutes,
+            len(plan.beats),
+            lambda percent: _update_review_job(job_id, progress=max(90, min(99, percent))),
+        )
+
         result = ReviewDraftResult(
             title=plan.title,
             target_minutes=plan.target_minutes,
@@ -267,6 +293,8 @@ async def _process_review_draft_job(job_id: str) -> None:
             thumbnail_text=plan.thumbnail_text,
             tags=plan.tags,
             subtitle_file_path=str(subtitle_file),
+            output_video_url=f"/api/review/jobs/{job_id}/download",
+            output_file_path=str(output_file),
         )
         _update_review_job(
             job_id,
@@ -319,6 +347,17 @@ async def get_review_draft_job(job_id: str) -> ReviewDraftJob:
     if not job:
         raise HTTPException(status_code=404, detail="Review job not found.")
     return job
+
+
+@router.get("/review/jobs/{job_id}/download", tags=["review"])
+async def download_review_output(job_id: str) -> FileResponse:
+    job = review_draft_jobs.get(job_id)
+    if not job or not job.result or not job.result.output_file_path:
+        raise HTTPException(status_code=404, detail="Review video not found.")
+    output_file = Path(job.result.output_file_path)
+    if not output_file.exists():
+        raise HTTPException(status_code=404, detail="Review video file no longer exists.")
+    return FileResponse(output_file, media_type="video/mp4", filename=f"review_{job_id}.mp4")
 
 
 from app.services import task_manager

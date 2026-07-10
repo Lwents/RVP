@@ -93,6 +93,8 @@ export interface ReviewDraftResult {
   thumbnail_text: string;
   tags: string[];
   subtitle_file_path?: string | null;
+  output_video_url?: string | null;
+  output_file_path?: string | null;
 }
 
 export interface ReviewDraftJob {

@@ -68,6 +68,17 @@ async def run_command(command: list[str], error_message: str) -> None:
         raise
 
 
+async def run_command_with_progress(
+    command: list[str],
+    error_message: str,
+    duration: float,
+    progress_start: int,
+    progress_end: int,
+    on_progress: ProgressCallback,
+) -> None:
+    await run_ffmpeg_with_progress(command, error_message, duration, progress_start, progress_end, on_progress)
+
+
 async def extract_audio(ffmpeg: str, source_video: Path, audio_file: Path) -> None:
     await run_command(
         [ffmpeg, "-y", "-i", str(source_video), "-vn", "-ac", "1", "-ar", "16000", str(audio_file)],

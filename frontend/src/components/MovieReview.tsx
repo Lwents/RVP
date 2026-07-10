@@ -1,6 +1,6 @@
 import React, { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Clapperboard, Copy, FileText, Loader2, Sparkles, Upload, Video } from "lucide-react";
-import { createReviewDraftJob, getReviewDraftJob, uploadVideo } from "../lib/api";
+import { Clapperboard, Copy, Download, Loader2, Sparkles, Upload, Video } from "lucide-react";
+import { createReviewDraftJob, getReviewDraftJob, toAbsoluteApiUrl, uploadVideo } from "../lib/api";
 import type { UploadProgress } from "../lib/api";
 import type { ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
 
@@ -232,6 +232,12 @@ export const MovieReview = React.memo(function MovieReview() {
 
           {result && (
             <div className="review-result">
+              {result.output_video_url && (
+                <a className="ios-button review-download" href={toAbsoluteApiUrl(result.output_video_url)} target="_blank" rel="noreferrer">
+                  <Download size={17} />
+                  Tải video review {result.target_minutes} phút
+                </a>
+              )}
               <ReviewBlock title="Tiêu đề" value={result.title} onCopy={copyText} />
               <ReviewBlock title="Hook mở đầu" value={result.hook} onCopy={copyText} />
               <ReviewBlock title="Tóm tắt lõi truyện" value={result.summary} onCopy={copyText} />

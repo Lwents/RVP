@@ -974,6 +974,11 @@ input[type="range"]:active::-moz-range-thumb {
   gap: 14px;
 }
 
+.review-download {
+  width: 100%;
+  text-decoration: none;
+}
+
 .review-block {
   border: 1px solid #e5e5ea;
   border-radius: 16px;
