@@ -58,7 +58,14 @@ def build_review_scenes(
         clip_seconds = target_seconds / max(len(starts), 1)
         return [(start, clip_seconds) for start in starts]
 
-    return _fit_scenes_to_duration(scenes, target_seconds)
+    clip_seconds = target_seconds / len(scenes)
+    fitted: list[tuple[float, float]] = []
+    for start, _duration in scenes:
+        duration = max(3.0, clip_seconds)
+        if start + duration > source_duration:
+            start = max(0.0, source_duration - duration)
+        fitted.append((start, duration))
+    return fitted
 
 
 async def render_movie_review_video(
@@ -86,6 +93,12 @@ async def render_movie_review_video(
         percent = 84 + int(((index - 1) / max(len(scenes), 1)) * 8)
         on_progress(percent)
         segment = segment_dir / f"segment_{index:04d}.mp4"
+        fade_out_start = max(0.0, clip_seconds - 0.22)
+        video_filter = (
+            "scale=1280:720:force_original_aspect_ratio=decrease,"
+            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,"
+            f"fade=t=in:st=0:d=0.18,fade=t=out:st={fade_out_start:.3f}:d=0.18"
+        )
         command = [
             ffmpeg,
             "-y",
@@ -97,7 +110,7 @@ async def render_movie_review_video(
             str(source_video),
             "-an",
             "-vf",
-            "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+            video_filter,
             "-c:v",
             "libx264",
             "-preset",
@@ -146,9 +159,9 @@ async def render_movie_review_video(
             "-filter_complex",
             (
                 f"[0:v]subtitles='{_filter_path(subtitle_file)}':"
-                "force_style='FontName=Arial,FontSize=28,"
+                "force_style='FontName=Arial,FontSize=24,"
                 "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-                "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=42'[v];"
+                "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=34'[v];"
                 f"[1:a]apad,atrim=0:{target_seconds:.3f},asetpts=N/SR/TB[a]"
             ),
             "-map",
@@ -198,7 +211,7 @@ def write_review_subtitles(narration_script: str, output_file: Path, target_minu
     return write_srt(events, output_file)
 
 
-def _split_review_subtitle_chunks(text: str, max_chars: int = 52) -> list[str]:
+def _split_review_subtitle_chunks(text: str, max_chars: int = 38) -> list[str]:
     normalized = " ".join(text.replace("\n", " ").split())
     if not normalized:
         return []

@@ -60,16 +60,20 @@ async def generate_movie_review_plan(
         ),
     }
     style_text = style_map.get(style, style_map["story"])
+    beat_target = max(10, min(24, target_minutes * 2 + 4))
     prompt = (
         "Ban la bien tap vien kenh review phim tieng Viet. Hay bien transcript phim dai thanh mot ban review co the dung de dung video.\n"
         f"Muc tieu do dai: {target_minutes} phut. Phong cach: {style_text}.\n"
         "Yeu cau:\n"
         "- Khong bia dat ngoai noi dung transcript.\n"
         "- Viet loi dan tieng Viet tu nhien, giong nguoi review phim.\n"
+        "- narration_script phai gom ca phan danh gia phim: diem hay, diem chua tot neu co, va cam nhan tong ket.\n"
         "- Chia thanh cac beat/canh de editor cat ghep minh hoa.\n"
+        f"- Tao khoang {beat_target} beats, du de cat video co nhip dep theo thoi luong muc tieu.\n"
         "- Moi beat can co time_hint, start_seconds, end_seconds, purpose va narration.\n"
         "- start_seconds/end_seconds phai la so giay trong phim goc, dua tren timestamp transcript; chon canh that su lien quan toi narration.\n"
-        "- Canh cat nen dai 8-45 giay, uu tien nhung khoanh khac co hinh anh/hanh dong/bieu cam ro.\n"
+        "- Canh cat nen dai 8-45 giay trong phim goc, uu tien khoanh khac co hinh anh/hanh dong/bieu cam ro.\n"
+        "- Sap xep beats theo dung mach review, mo dau manh, giua phim day cao trao, cuoi co danh gia va ket luan.\n"
         "- narration_script phai doc lien mach duoc, khong chi la dan y.\n"
         "- Tra ve dung JSON voi key: title, target_minutes, hook, summary, narration_script, beats, thumbnail_text, tags.\n"
     )
@@ -108,7 +112,7 @@ async def generate_movie_review_plan(
                     purpose=str(item.get("purpose") or "Canh minh hoa noi dung chinh."),
                     narration=str(item.get("narration") or ""),
                 )
-                for item in beats[:18]
+                for item in beats[:24]
                 if isinstance(item, dict)
             ],
             thumbnail_text=str(data.get("thumbnail_text") or "Cai ket khong ai ngo"),
