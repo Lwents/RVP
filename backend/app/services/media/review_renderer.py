@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from typing import Callable
 
 from app.services.media.ffmpeg import probe_video_duration, run_command, run_command_with_progress
+from app.services.subtitles.ass import write_srt
+from app.services.subtitles.timing import SubtitleEvent
 
 
 def build_review_starts(source_duration: float, target_seconds: float, clip_count: int) -> list[float]:
@@ -20,6 +23,7 @@ async def render_movie_review_video(
     ffmpeg: str,
     source_video: Path,
     narration_audio: Path,
+    subtitle_file: Path,
     output_file: Path,
     work_dir: Path,
     target_minutes: int,
@@ -100,15 +104,25 @@ async def render_movie_review_video(
             "-i",
             str(narration_audio),
             "-filter_complex",
-            f"[1:a]apad,atrim=0:{target_seconds:.3f},asetpts=N/SR/TB[a]",
+            (
+                f"[0:v]subtitles='{_filter_path(subtitle_file)}':"
+                "force_style='FontName=Arial,FontSize=28,"
+                "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+                "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=42'[v];"
+                f"[1:a]apad,atrim=0:{target_seconds:.3f},asetpts=N/SR/TB[a]"
+            ),
             "-map",
-            "0:v:0",
+            "[v]",
             "-map",
             "[a]",
             "-t",
             f"{target_seconds:.3f}",
             "-c:v",
-            "copy",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
             "-c:a",
             "aac",
             "-b:a",
@@ -126,5 +140,52 @@ async def render_movie_review_video(
     return output_file
 
 
+def write_review_subtitles(narration_script: str, output_file: Path, target_minutes: int) -> Path:
+    target_seconds = max(60.0, float(target_minutes) * 60.0)
+    chunks = _split_review_subtitle_chunks(narration_script)
+    if not chunks:
+        chunks = ["Video review phim."]
+
+    duration_per_chunk = target_seconds / len(chunks)
+    events = [
+        SubtitleEvent(
+            start=index * duration_per_chunk,
+            end=min(target_seconds, (index + 1) * duration_per_chunk),
+            text=chunk,
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+    return write_srt(events, output_file)
+
+
+def _split_review_subtitle_chunks(text: str, max_chars: int = 52) -> list[str]:
+    normalized = " ".join(text.replace("\n", " ").split())
+    if not normalized:
+        return []
+
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?…])\s+", normalized) if part.strip()]
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        words = sentence.split()
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if current and len(candidate) > max_chars:
+                chunks.append(current)
+                current = word
+            else:
+                current = candidate
+        if current and current[-1:] in ".!?…" and len(current) >= max_chars * 0.5:
+            chunks.append(current)
+            current = ""
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def _concat_path(path: Path) -> str:
     return path.resolve().as_posix().replace("'", "'\\''")
+
+
+def _filter_path(path: Path) -> str:
+    return path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")

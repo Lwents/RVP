@@ -213,7 +213,7 @@ async def _process_review_draft_job(job_id: str) -> None:
     from app.services.ai.content import generate_movie_review_plan
     from app.services.ai.voice import get_voice_engine
     from app.services.media.ffmpeg import extract_audio, find_ffmpeg, probe_video_duration
-    from app.services.media.review_renderer import render_movie_review_video
+    from app.services.media.review_renderer import render_movie_review_video, write_review_subtitles
     from app.models.job import VoiceGender
     from app.services.subtitles.source import get_or_create_subtitles
 
@@ -265,10 +265,16 @@ async def _process_review_draft_job(job_id: str) -> None:
 
         _update_review_job(job_id, progress=90, stage="Cat ghep video review")
         output_file = work_dir / "review_output.mp4"
+        review_subtitle_file = write_review_subtitles(
+            plan.narration_script,
+            work_dir / "review_subtitles.srt",
+            job.request.target_minutes,
+        )
         await render_movie_review_video(
             ffmpeg,
             source_video,
             narration_audio,
+            review_subtitle_file,
             output_file,
             work_dir,
             job.request.target_minutes,
@@ -292,7 +298,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             ],
             thumbnail_text=plan.thumbnail_text,
             tags=plan.tags,
-            subtitle_file_path=str(subtitle_file),
+            subtitle_file_path=str(review_subtitle_file),
             output_video_url=f"/api/review/jobs/{job_id}/download",
             output_file_path=str(output_file),
         )
