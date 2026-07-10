@@ -1,6 +1,24 @@
 import type { DubbingRequest, JobProgress, ReviewDraftJob, ReviewDraftRequest, UploadResponse } from "../types/api";
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
+const ENV_API_URL = import.meta.env.VITE_API_URL?.trim();
+
+function resolveApiUrl(): string {
+  if (typeof window === "undefined") {
+    return ENV_API_URL || "http://127.0.0.1:8000";
+  }
+
+  const hostname = window.location.hostname;
+  const isLocalFrontend = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+
+  // Local development should not be blocked by an expired Cloudflare quick tunnel in .env.local.
+  if (isLocalFrontend) {
+    return "http://127.0.0.1:8000";
+  }
+
+  return ENV_API_URL || "http://127.0.0.1:8000";
+}
+
+const API_URL = resolveApiUrl();
 
 export interface UploadProgress {
   loaded: number;
