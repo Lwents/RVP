@@ -12,6 +12,8 @@ class VideoDetails(BaseModel):
 
 class ReviewBeat(BaseModel):
     time_hint: str = Field(description="Moc thoi gian uoc luong, vi du 00:12:30-00:13:20.")
+    start_seconds: float | None = Field(default=None, description="Thoi diem bat dau canh nen cat, tinh bang giay.")
+    end_seconds: float | None = Field(default=None, description="Thoi diem ket thuc canh nen cat, tinh bang giay.")
     purpose: str = Field(description="Vai tro cua canh trong video review.")
     narration: str = Field(description="Loi dan ngan gan voi canh nay.")
 
@@ -40,10 +42,22 @@ async def generate_movie_review_plan(
     )
 
     style_map = {
-        "story": "ke chuyen cuon hut, ro mach nhan vat va bien co",
-        "fast": "nhanh, gon, nhieu hook, hop video 3-5 phut",
-        "emotional": "cam xuc, nhan vao hy sinh, bi kich va cao trao",
-        "funny": "duyen, nhe nhang, co chut hai nhung khong pha nat noi dung",
+        "story": (
+            "ke chuyen dien anh, mo dau co hook, dan mach nhan vat va bien co ro rang, "
+            "chon canh theo tien trinh cau chuyen"
+        ),
+        "fast": (
+            "nhanh, gon, nhieu hook, cat canh nhieu hon, uu tien cao trao/hanh dong/twist, "
+            "loi dan ngan va day nhip"
+        ),
+        "emotional": (
+            "cam xuc, nhan vao tinh ban, hy sinh, mat mat, lua chon kho khan, "
+            "chon nhung canh co bieu cam va cao trao tinh cam"
+        ),
+        "funny": (
+            "duyen hai, nhe nhang, uu tien canh gay cuoi/phan ung nhan vat, "
+            "nhung khong pha nat noi dung chinh"
+        ),
     }
     style_text = style_map.get(style, style_map["story"])
     prompt = (
@@ -53,7 +67,9 @@ async def generate_movie_review_plan(
         "- Khong bia dat ngoai noi dung transcript.\n"
         "- Viet loi dan tieng Viet tu nhien, giong nguoi review phim.\n"
         "- Chia thanh cac beat/canh de editor cat ghep minh hoa.\n"
-        "- Moi beat can co time_hint, purpose va narration.\n"
+        "- Moi beat can co time_hint, start_seconds, end_seconds, purpose va narration.\n"
+        "- start_seconds/end_seconds phai la so giay trong phim goc, dua tren timestamp transcript; chon canh that su lien quan toi narration.\n"
+        "- Canh cat nen dai 8-45 giay, uu tien nhung khoanh khac co hinh anh/hanh dong/bieu cam ro.\n"
         "- narration_script phai doc lien mach duoc, khong chi la dan y.\n"
         "- Tra ve dung JSON voi key: title, target_minutes, hook, summary, narration_script, beats, thumbnail_text, tags.\n"
     )
@@ -87,6 +103,8 @@ async def generate_movie_review_plan(
             beats=[
                 ReviewBeat(
                     time_hint=str(item.get("time_hint") or "auto"),
+                    start_seconds=_optional_float(item.get("start_seconds")),
+                    end_seconds=_optional_float(item.get("end_seconds")),
                     purpose=str(item.get("purpose") or "Canh minh hoa noi dung chinh."),
                     narration=str(item.get("narration") or ""),
                 )
@@ -105,9 +123,9 @@ async def generate_movie_review_plan(
             summary=clean_transcript[:700] or "Chua co transcript du de tom tat.",
             narration_script=_fallback_description(clean_transcript),
             beats=[
-                ReviewBeat(time_hint="00:00:00-00:01:00", purpose="Mo dau va dat van de", narration="Mo dau cau chuyen va gioi thieu xung dot chinh."),
-                ReviewBeat(time_hint="auto", purpose="Cao trao", narration="Chon cac canh co bien co lon de day nhip review."),
-                ReviewBeat(time_hint="auto", purpose="Ket", narration="Tom lai cai ket va dat cau hoi keo binh luan."),
+                ReviewBeat(time_hint="00:00:00-00:01:00", start_seconds=0, end_seconds=60, purpose="Mo dau va dat van de", narration="Mo dau cau chuyen va gioi thieu xung dot chinh."),
+                ReviewBeat(time_hint="auto", start_seconds=None, end_seconds=None, purpose="Cao trao", narration="Chon cac canh co bien co lon de day nhip review."),
+                ReviewBeat(time_hint="auto", start_seconds=None, end_seconds=None, purpose="Ket", narration="Tom lai cai ket va dat cau hoi keo binh luan."),
             ],
             thumbnail_text="Cai ket khong ai ngo",
             tags=_default_tags(),
@@ -192,6 +210,16 @@ def _loads_json_object(content: str) -> dict:
         if not match:
             raise
         return json.loads(match.group(0))
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def _plain_transcript(transcript: str) -> str:

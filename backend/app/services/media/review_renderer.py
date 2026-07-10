@@ -3,11 +3,17 @@ from __future__ import annotations
 import math
 import re
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypedDict
 
 from app.services.media.ffmpeg import probe_video_duration, run_command, run_command_with_progress
 from app.services.subtitles.ass import write_srt
 from app.services.subtitles.timing import SubtitleEvent
+
+
+class ReviewSceneHint(TypedDict, total=False):
+    time_hint: str | None
+    start_seconds: float | None
+    end_seconds: float | None
 
 
 def build_review_starts(source_duration: float, target_seconds: float, clip_count: int) -> list[float]:
@@ -19,6 +25,42 @@ def build_review_starts(source_duration: float, target_seconds: float, clip_coun
     return [min(max_start, (max_start * index) / (clip_count - 1)) for index in range(clip_count)]
 
 
+def build_review_scenes(
+    source_duration: float,
+    target_seconds: float,
+    scene_hints: list[ReviewSceneHint] | int | None,
+) -> list[tuple[float, float]]:
+    if isinstance(scene_hints, int):
+        starts = build_review_starts(source_duration, target_seconds, scene_hints)
+        clip_seconds = target_seconds / max(len(starts), 1)
+        return [(start, clip_seconds) for start in starts]
+
+    scenes: list[tuple[float, float]] = []
+    for hint in scene_hints or []:
+        start = _coerce_seconds(hint.get("start_seconds"))
+        end = _coerce_seconds(hint.get("end_seconds"))
+        if start is None or end is None:
+            parsed = _parse_time_hint(hint.get("time_hint") or "")
+            if parsed:
+                start, end = parsed
+        if start is None or end is None:
+            continue
+        start = max(0.0, min(start, max(0.0, source_duration - 1.0)))
+        end = max(start + 3.0, min(end, source_duration))
+        duration = max(3.0, min(45.0, end - start))
+        if start + duration > source_duration:
+            start = max(0.0, source_duration - duration)
+        scenes.append((start, duration))
+
+    if len(scenes) < 3:
+        clip_count = max(8, min(24, math.ceil(target_seconds / 30)))
+        starts = build_review_starts(source_duration, target_seconds, clip_count)
+        clip_seconds = target_seconds / max(len(starts), 1)
+        return [(start, clip_seconds) for start in starts]
+
+    return _fit_scenes_to_duration(scenes, target_seconds)
+
+
 async def render_movie_review_video(
     ffmpeg: str,
     source_video: Path,
@@ -27,23 +69,21 @@ async def render_movie_review_video(
     output_file: Path,
     work_dir: Path,
     target_minutes: int,
-    beat_count: int,
+    scene_hints: list[ReviewSceneHint] | int | None,
     on_progress: Callable[[int], None],
 ) -> Path:
     target_seconds = max(60.0, float(target_minutes) * 60.0)
     source_duration = await probe_video_duration(ffmpeg, source_video)
-    clip_count = max(8, min(24, beat_count * 2 if beat_count else math.ceil(target_seconds / 30)))
-    clip_seconds = target_seconds / clip_count
+    scenes = build_review_scenes(source_duration, target_seconds, scene_hints)
 
     segment_dir = work_dir / "review_segments"
     segment_dir.mkdir(parents=True, exist_ok=True)
     for old_file in segment_dir.glob("*"):
         old_file.unlink()
 
-    starts = build_review_starts(source_duration, target_seconds, clip_count)
     segment_files: list[Path] = []
-    for index, start in enumerate(starts, start=1):
-        percent = 84 + int(((index - 1) / max(len(starts), 1)) * 8)
+    for index, (start, clip_seconds) in enumerate(scenes, start=1):
+        percent = 84 + int(((index - 1) / max(len(scenes), 1)) * 8)
         on_progress(percent)
         segment = segment_dir / f"segment_{index:04d}.mp4"
         command = [
@@ -189,3 +229,53 @@ def _concat_path(path: Path) -> str:
 
 def _filter_path(path: Path) -> str:
     return path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def _fit_scenes_to_duration(scenes: list[tuple[float, float]], target_seconds: float) -> list[tuple[float, float]]:
+    current_total = sum(duration for _, duration in scenes)
+    if current_total <= 0:
+        return scenes
+
+    scale = target_seconds / current_total
+    fitted = [(start, max(3.0, min(55.0, duration * scale))) for start, duration in scenes]
+    fitted_total = sum(duration for _, duration in fitted)
+    if fitted_total <= 0:
+        return fitted
+
+    correction = target_seconds / fitted_total
+    return [(start, max(2.5, duration * correction)) for start, duration in fitted]
+
+
+def _coerce_seconds(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _parse_time_hint(value: str) -> tuple[float, float] | None:
+    matches = re.findall(r"(\d{1,2}:\d{2}(?::\d{2})?(?:[,.]\d+)?)", value)
+    if len(matches) < 2:
+        return None
+    start = _timestamp_to_seconds(matches[0])
+    end = _timestamp_to_seconds(matches[1])
+    if start is None or end is None or end <= start:
+        return None
+    return start, end
+
+
+def _timestamp_to_seconds(value: str) -> float | None:
+    parts = value.replace(",", ".").split(":")
+    try:
+        if len(parts) == 2:
+            minutes, seconds = parts
+            return int(minutes) * 60 + float(seconds)
+        if len(parts) == 3:
+            hours, minutes, seconds = parts
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except ValueError:
+        return None
+    return None

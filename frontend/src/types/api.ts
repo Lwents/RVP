@@ -79,6 +79,8 @@ export interface ReviewDraftRequest {
 
 export interface ReviewBeat {
   time_hint: string;
+  start_seconds?: number | null;
+  end_seconds?: number | null;
   purpose: string;
   narration: string;
 }

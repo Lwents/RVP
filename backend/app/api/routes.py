@@ -29,6 +29,8 @@ class ReviewDraftRequest(BaseModel):
 
 class ReviewBeatResponse(BaseModel):
     time_hint: str
+    start_seconds: float | None = None
+    end_seconds: float | None = None
     purpose: str
     narration: str
 
@@ -278,7 +280,14 @@ async def _process_review_draft_job(job_id: str) -> None:
             output_file,
             work_dir,
             job.request.target_minutes,
-            len(plan.beats),
+            [
+                {
+                    "time_hint": beat.time_hint,
+                    "start_seconds": beat.start_seconds,
+                    "end_seconds": beat.end_seconds,
+                }
+                for beat in plan.beats
+            ],
             lambda percent: _update_review_job(job_id, progress=max(90, min(99, percent))),
         )
 
@@ -291,6 +300,8 @@ async def _process_review_draft_job(job_id: str) -> None:
             beats=[
                 ReviewBeatResponse(
                     time_hint=beat.time_hint,
+                    start_seconds=beat.start_seconds,
+                    end_seconds=beat.end_seconds,
                     purpose=beat.purpose,
                     narration=beat.narration,
                 )
