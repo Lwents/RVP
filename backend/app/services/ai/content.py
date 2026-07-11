@@ -67,7 +67,7 @@ async def generate_movie_review_plan(
         "Yeu cau:\n"
         "- Khong bia dat ngoai noi dung transcript.\n"
         "- Viet loi dan tieng Viet tu nhien, giong nguoi review phim.\n"
-        "- narration_script phai gom ca phan danh gia phim: diem hay, diem chua tot neu co, va cam nhan tong ket.\n"
+        "- Khong tu chen phan cham diem, uu nhuoc diem, hay danh gia phim; chi them neu ghi chu nguoi dung yeu cau ro rang chen vao video.\n"
         "- Chia thanh cac beat/canh de editor cat ghep minh hoa.\n"
         f"- Tao khoang {beat_target} beats, du de cat video co nhip dep theo thoi luong muc tieu.\n"
         "- Moi beat can co time_hint, start_seconds, end_seconds, purpose va narration.\n"
@@ -75,7 +75,7 @@ async def generate_movie_review_plan(
         "- narration_script phai di theo dung thu tu beats; khong viet mot bai rieng lech voi beat.\n"
         "- start_seconds/end_seconds phai la so giay trong phim goc, dua tren timestamp transcript; chon canh that su lien quan toi narration.\n"
         "- Canh cat nen dai 8-45 giay trong phim goc, uu tien khoanh khac co hinh anh/hanh dong/bieu cam ro.\n"
-        "- Sap xep beats theo dung mach review, mo dau manh, giua phim day cao trao, cuoi co danh gia va ket luan.\n"
+        "- Sap xep beats theo dung mach review, mo dau manh, giua phim day cao trao, cuoi bang cai ket/cau chot/cau goi binh luan.\n"
         "- narration_script phai doc lien mach duoc, khong chi la dan y.\n"
         "- Tra ve dung JSON voi key: title, target_minutes, hook, summary, narration_script, beats, thumbnail_text, tags.\n"
     )
