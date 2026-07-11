@@ -257,6 +257,16 @@ async def _process_review_draft_job(job_id: str) -> None:
             style=job.request.style,
             custom_prompt=job.request.notes,
         )
+        scene_hints = [
+            {
+                "time_hint": beat.time_hint,
+                "start_seconds": beat.start_seconds,
+                "end_seconds": beat.end_seconds,
+                "narration": beat.narration,
+            }
+            for beat in plan.beats
+        ]
+
         _update_review_job(job_id, progress=84, stage="Tao giong doc review")
         narration_audio = await get_voice_engine().synthesize(
             plan.narration_script,
@@ -271,6 +281,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             plan.narration_script,
             work_dir / "review_subtitles.srt",
             job.request.target_minutes,
+            scene_hints,
         )
         await render_movie_review_video(
             ffmpeg,
@@ -280,14 +291,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             output_file,
             work_dir,
             job.request.target_minutes,
-            [
-                {
-                    "time_hint": beat.time_hint,
-                    "start_seconds": beat.start_seconds,
-                    "end_seconds": beat.end_seconds,
-                }
-                for beat in plan.beats
-            ],
+            scene_hints,
             lambda percent: _update_review_job(job_id, progress=max(90, min(99, percent))),
         )
 

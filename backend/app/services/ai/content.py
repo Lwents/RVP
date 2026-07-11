@@ -71,6 +71,8 @@ async def generate_movie_review_plan(
         "- Chia thanh cac beat/canh de editor cat ghep minh hoa.\n"
         f"- Tao khoang {beat_target} beats, du de cat video co nhip dep theo thoi luong muc tieu.\n"
         "- Moi beat can co time_hint, start_seconds, end_seconds, purpose va narration.\n"
+        "- Moi beat.narration phai la loi doc that su cho dung canh do, khong chi la mo ta ngan.\n"
+        "- narration_script phai di theo dung thu tu beats; khong viet mot bai rieng lech voi beat.\n"
         "- start_seconds/end_seconds phai la so giay trong phim goc, dua tren timestamp transcript; chon canh that su lien quan toi narration.\n"
         "- Canh cat nen dai 8-45 giay trong phim goc, uu tien khoanh khac co hinh anh/hanh dong/bieu cam ro.\n"
         "- Sap xep beats theo dung mach review, mo dau manh, giua phim day cao trao, cuoi co danh gia va ket luan.\n"

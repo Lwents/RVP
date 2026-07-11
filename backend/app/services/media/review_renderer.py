@@ -14,6 +14,7 @@ class ReviewSceneHint(TypedDict, total=False):
     time_hint: str | None
     start_seconds: float | None
     end_seconds: float | None
+    narration: str | None
 
 
 def build_review_starts(source_duration: float, target_seconds: float, clip_count: int) -> list[float]:
@@ -35,37 +36,38 @@ def build_review_scenes(
         clip_seconds = target_seconds / max(len(starts), 1)
         return [(start, clip_seconds) for start in starts]
 
+    hints = scene_hints or []
+    if not hints:
+        clip_count = max(8, min(24, math.ceil(target_seconds / 30)))
+        starts = build_review_starts(source_duration, target_seconds, clip_count)
+        clip_seconds = target_seconds / max(len(starts), 1)
+        return [(start, clip_seconds) for start in starts]
+
+    durations = _allocate_weighted_durations(
+        [_narration_weight(hint.get("narration")) for hint in hints],
+        target_seconds,
+    )
+    fallback_starts = build_review_starts(source_duration, target_seconds, len(hints))
+
     scenes: list[tuple[float, float]] = []
-    for hint in scene_hints or []:
+    for index, hint in enumerate(hints):
         start = _coerce_seconds(hint.get("start_seconds"))
         end = _coerce_seconds(hint.get("end_seconds"))
         if start is None or end is None:
             parsed = _parse_time_hint(hint.get("time_hint") or "")
             if parsed:
                 start, end = parsed
-        if start is None or end is None:
-            continue
+
+        fallback_start = fallback_starts[min(index, len(fallback_starts) - 1)]
+        start = fallback_start if start is None else start
+        end = start + durations[index] if end is None else end
         start = max(0.0, min(start, max(0.0, source_duration - 1.0)))
         end = max(start + 3.0, min(end, source_duration))
-        duration = max(3.0, min(45.0, end - start))
+        duration = max(3.0, durations[index])
         if start + duration > source_duration:
             start = max(0.0, source_duration - duration)
         scenes.append((start, duration))
-
-    if len(scenes) < 3:
-        clip_count = max(8, min(24, math.ceil(target_seconds / 30)))
-        starts = build_review_starts(source_duration, target_seconds, clip_count)
-        clip_seconds = target_seconds / max(len(starts), 1)
-        return [(start, clip_seconds) for start in starts]
-
-    clip_seconds = target_seconds / len(scenes)
-    fitted: list[tuple[float, float]] = []
-    for start, _duration in scenes:
-        duration = max(3.0, clip_seconds)
-        if start + duration > source_duration:
-            start = max(0.0, source_duration - duration)
-        fitted.append((start, duration))
-    return fitted
+    return scenes
 
 
 async def render_movie_review_video(
@@ -193,21 +195,54 @@ async def render_movie_review_video(
     return output_file
 
 
-def write_review_subtitles(narration_script: str, output_file: Path, target_minutes: int) -> Path:
+def write_review_subtitles(
+    narration_script: str,
+    output_file: Path,
+    target_minutes: int,
+    scene_hints: list[ReviewSceneHint] | None = None,
+) -> Path:
     target_seconds = max(60.0, float(target_minutes) * 60.0)
     chunks = _split_review_subtitle_chunks(narration_script)
     if not chunks:
         chunks = ["Video review phim."]
 
-    duration_per_chunk = target_seconds / len(chunks)
-    events = [
-        SubtitleEvent(
-            start=index * duration_per_chunk,
-            end=min(target_seconds, (index + 1) * duration_per_chunk),
-            text=chunk,
+    if scene_hints:
+        durations = _allocate_weighted_durations(
+            [_narration_weight(hint.get("narration")) for hint in scene_hints],
+            target_seconds,
         )
-        for index, chunk in enumerate(chunks)
-    ]
+        chunk_counts = _allocate_chunk_counts(len(chunks), durations)
+    else:
+        durations = [target_seconds]
+        chunk_counts = [len(chunks)]
+
+    events: list[SubtitleEvent] = []
+    cursor = 0.0
+    chunk_index = 0
+    for beat_index, beat_duration in enumerate(durations):
+        count = chunk_counts[beat_index] if beat_index < len(chunk_counts) else 0
+        beat_chunks = chunks[chunk_index : chunk_index + count]
+        chunk_index += count
+        if not beat_chunks:
+            cursor += beat_duration
+            continue
+
+        duration_per_chunk = beat_duration / len(beat_chunks)
+        for index, chunk in enumerate(beat_chunks):
+            start = cursor + index * duration_per_chunk
+            end = min(target_seconds, cursor + (index + 1) * duration_per_chunk)
+            events.append(SubtitleEvent(start=start, end=end, text=chunk))
+        cursor += beat_duration
+
+    if chunk_index < len(chunks):
+        tail_start = events[-1].end if events else 0.0
+        remaining = chunks[chunk_index:]
+        duration_per_chunk = max(0.5, (target_seconds - tail_start) / len(remaining))
+        for index, chunk in enumerate(remaining):
+            start = min(target_seconds, tail_start + index * duration_per_chunk)
+            end = min(target_seconds, tail_start + (index + 1) * duration_per_chunk)
+            events.append(SubtitleEvent(start=start, end=end, text=chunk))
+
     return write_srt(events, output_file)
 
 
@@ -244,19 +279,65 @@ def _filter_path(path: Path) -> str:
     return path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
 
 
-def _fit_scenes_to_duration(scenes: list[tuple[float, float]], target_seconds: float) -> list[tuple[float, float]]:
-    current_total = sum(duration for _, duration in scenes)
-    if current_total <= 0:
-        return scenes
+def _narration_weight(text: str | None) -> float:
+    normalized = " ".join((text or "").split())
+    if not normalized:
+        return 1.0
+    return max(1.0, float(len(normalized)))
 
-    scale = target_seconds / current_total
-    fitted = [(start, max(3.0, min(55.0, duration * scale))) for start, duration in scenes]
-    fitted_total = sum(duration for _, duration in fitted)
-    if fitted_total <= 0:
-        return fitted
 
-    correction = target_seconds / fitted_total
-    return [(start, max(2.5, duration * correction)) for start, duration in fitted]
+def _allocate_weighted_durations(weights: list[float], target_seconds: float) -> list[float]:
+    if not weights:
+        return [target_seconds]
+
+    total_weight = sum(max(1.0, weight) for weight in weights)
+    if total_weight <= 0:
+        return [target_seconds / len(weights) for _ in weights]
+
+    min_duration = min(7.0, max(2.5, target_seconds / len(weights) * 0.45))
+    durations = [max(min_duration, target_seconds * max(1.0, weight) / total_weight) for weight in weights]
+    total_duration = sum(durations)
+    if total_duration <= 0:
+        return [target_seconds / len(weights) for _ in weights]
+
+    scale = target_seconds / total_duration
+    fitted = [max(2.5, duration * scale) for duration in durations]
+    drift = target_seconds - sum(fitted)
+    fitted[-1] = max(2.5, fitted[-1] + drift)
+    return fitted
+
+
+def _allocate_chunk_counts(total_chunks: int, durations: list[float]) -> list[int]:
+    if not durations:
+        return [total_chunks]
+    if total_chunks <= 0:
+        return [0 for _ in durations]
+
+    total_duration = sum(durations)
+    if total_duration <= 0:
+        counts = [total_chunks // len(durations) for _ in durations]
+    else:
+        counts = [int(round(total_chunks * duration / total_duration)) for duration in durations]
+
+    if total_chunks >= len(durations):
+        counts = [max(1, count) for count in counts]
+    else:
+        counts = [0 for _ in durations]
+        for index in range(total_chunks):
+            counts[index] = 1
+
+    diff = total_chunks - sum(counts)
+    index = 0
+    while diff != 0 and counts:
+        target = index % len(counts)
+        if diff > 0:
+            counts[target] += 1
+            diff -= 1
+        elif counts[target] > 0:
+            counts[target] -= 1
+            diff += 1
+        index += 1
+    return counts
 
 
 def _coerce_seconds(value: object) -> float | None:
