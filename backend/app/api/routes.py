@@ -216,6 +216,7 @@ async def _process_review_draft_job(job_id: str) -> None:
     from app.services.ai.voice import get_voice_engine
     from app.services.media.ffmpeg import extract_audio, find_ffmpeg, probe_video_duration
     from app.services.media.review_renderer import render_movie_review_video, write_review_subtitles
+    from app.services.media.scene_alignment import align_review_beats_to_transcript
     from app.models.job import VoiceGender
     from app.services.subtitles.source import get_or_create_subtitles
 
@@ -257,7 +258,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             style=job.request.style,
             custom_prompt=job.request.notes,
         )
-        scene_hints = [
+        ai_scene_hints = [
             {
                 "time_hint": beat.time_hint,
                 "start_seconds": beat.start_seconds,
@@ -266,6 +267,12 @@ async def _process_review_draft_job(job_id: str) -> None:
             }
             for beat in plan.beats
         ]
+        scene_hints = align_review_beats_to_transcript(
+            plan.beats,
+            subtitle_file,
+            video_duration,
+            work_dir / "review_alignment.json",
+        ) or ai_scene_hints
 
         _update_review_job(job_id, progress=84, stage="Tao giong doc review")
         narration_audio = await get_voice_engine().synthesize(
@@ -304,12 +311,12 @@ async def _process_review_draft_job(job_id: str) -> None:
             beats=[
                 ReviewBeatResponse(
                     time_hint=beat.time_hint,
-                    start_seconds=beat.start_seconds,
-                    end_seconds=beat.end_seconds,
+                    start_seconds=scene_hints[index]["start_seconds"] if index < len(scene_hints) else beat.start_seconds,
+                    end_seconds=scene_hints[index]["end_seconds"] if index < len(scene_hints) else beat.end_seconds,
                     purpose=beat.purpose,
                     narration=beat.narration,
                 )
-                for beat in plan.beats
+                for index, beat in enumerate(plan.beats)
             ],
             thumbnail_text=plan.thumbnail_text,
             tags=plan.tags,
