@@ -5,8 +5,10 @@ import re
 from pathlib import Path
 from typing import Callable, TypedDict
 
+from app.core import settings
+from app.models.job import DubbingRequest
 from app.services.media.ffmpeg import probe_video_duration, run_command, run_command_with_progress
-from app.services.subtitles.ass import write_srt
+from app.services.subtitles.ass import srt_to_positioned_ass, write_srt
 from app.services.subtitles.timing import SubtitleEvent
 
 
@@ -80,6 +82,7 @@ async def render_movie_review_video(
     target_minutes: int,
     scene_hints: list[ReviewSceneHint] | int | None,
     on_progress: Callable[[int], None],
+    render_request: DubbingRequest | None = None,
 ) -> Path:
     target_seconds = max(60.0, float(target_minutes) * 60.0)
     source_duration = await probe_video_duration(ffmpeg, source_video)
@@ -150,26 +153,136 @@ async def render_movie_review_video(
 
     on_progress(93)
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    command = _build_review_output_command(
+        ffmpeg,
+        silent_video,
+        narration_audio,
+        subtitle_file,
+        output_file,
+        work_dir,
+        target_seconds,
+        render_request,
+    )
     await run_command_with_progress(
+        command,
+        "Khong render duoc video review dau ra.",
+        target_seconds,
+        93,
+        99,
+        on_progress,
+    )
+    return output_file
+
+
+def _build_review_output_command(
+    ffmpeg: str,
+    silent_video: Path,
+    narration_audio: Path,
+    subtitle_file: Path,
+    output_file: Path,
+    work_dir: Path,
+    target_seconds: float,
+    request: DubbingRequest | None,
+) -> list[str]:
+    command = [ffmpeg, "-y", "-i", str(silent_video), "-i", str(narration_audio)]
+    filter_parts: list[str] = []
+    video_label = "[0:v]"
+    video_map = "0:v"
+    next_input_index = 2
+    width, height = 1280, 720
+
+    if request:
+        if request.blur_box_enabled:
+            blur_y_percent, blur_height_percent = _render_blur_band(
+                request.blur_box_y_percent,
+                request.blur_box_height_percent,
+            )
+            blur_h = max(2, round(height * blur_height_percent / 100))
+            blur_y = round(height * blur_y_percent / 100)
+            blur_y = max(0, min(height - blur_h, blur_y))
+            blur_radius = _boxblur_radius(width, blur_h)
+            small_w, small_h = _mosaic_size(width, blur_h)
+            filter_parts.append(f"{video_label}split=2[vblur_base][vblur_crop]")
+            filter_parts.append(
+                f"[vblur_crop]crop=iw:{blur_h}:0:{blur_y},"
+                f"scale={small_w}:{small_h}:flags=bilinear,"
+                f"scale={width}:{blur_h}:flags=neighbor,"
+                f"boxblur={blur_radius}:10[blurred]"
+            )
+            filter_parts.append(f"[vblur_base][blurred]overlay=0:{blur_y}[vblur]")
+            video_label = "[vblur]"
+
+        for index, custom_blur in enumerate(request.custom_blur_boxes):
+            cb_w = max(2, round(width * custom_blur.width_percent / 100))
+            cb_h = max(2, round(height * custom_blur.height_percent / 100))
+            cb_x = max(0, min(width - 2, round(width * custom_blur.x_percent / 100)))
+            cb_y = max(0, min(height - 2, round(height * custom_blur.y_percent / 100)))
+            cb_w = min(cb_w, width - cb_x)
+            cb_h = min(cb_h, height - cb_y)
+            if cb_w < 2 or cb_h < 2:
+                continue
+
+            blur_radius = _boxblur_radius(cb_w, cb_h)
+            small_w, small_h = _mosaic_size(cb_w, cb_h)
+            filter_parts.append(f"{video_label}split=2[vcb_base_{index}][vcb_crop_{index}]")
+            filter_parts.append(
+                f"[vcb_crop_{index}]crop={cb_w}:{cb_h}:{cb_x}:{cb_y},"
+                f"scale={small_w}:{small_h}:flags=bilinear,"
+                f"scale={cb_w}:{cb_h}:flags=neighbor,"
+                f"boxblur={blur_radius}:10[cblur_{index}]"
+            )
+            filter_parts.append(f"[vcb_base_{index}][cblur_{index}]overlay={cb_x}:{cb_y}[vcb_{index}]")
+            video_label = f"[vcb_{index}]"
+
+        subtitle_filters: list[str] = []
+        if request.cinematic_bars_enabled:
+            bar_h = round(height * request.cinematic_bars_height_percent / 100)
+            if bar_h > 0:
+                subtitle_filters.append(f"drawbox=x=0:y=0:w=iw:h={bar_h}:color=black:t=fill")
+                subtitle_filters.append(f"drawbox=x=0:y=ih-{bar_h}:w=iw:h={bar_h}:color=black:t=fill")
+
+        if request.hard_subtitles:
+            ass_file = srt_to_positioned_ass(subtitle_file, work_dir / "review_subtitles.positioned.ass", width, height, request)
+            if request.subtitle_box_enabled and request.subtitle_box_opacity > 0:
+                box_height = max(24, round(height * request.subtitle_box_height_percent / 100))
+                box_y = round((height * request.subtitle_y_percent / 100) - (box_height / 2))
+                box_y = max(0, min(height - box_height, box_y))
+                alpha = round(request.subtitle_box_opacity / 100, 2)
+                subtitle_filters.append(f"drawbox=x=0:y={box_y}:w=iw:h={box_height}:color=black@{alpha}:t=fill")
+            subtitle_filters.append(f"subtitles='{_filter_path(ass_file)}'")
+
+        if subtitle_filters:
+            filter_parts.append(f"{video_label}{','.join(subtitle_filters)}[vsub]")
+            video_label = "[vsub]"
+
+        if request.watermark_file_name and request.logo_enabled:
+            watermark = Path(settings.storage_dir) / request.watermark_file_name
+            if watermark.exists():
+                command.extend(["-i", str(watermark)])
+                watermark_index = next_input_index
+                next_input_index += 1
+                filter_parts.append(f"[{watermark_index}:v]scale={request.logo_width}:-1[wm]")
+                x_expr = f"(W-w)*{request.logo_x_percent}/100"
+                y_expr = f"(H-h)*{request.logo_y_percent}/100"
+                filter_parts.append(f"{video_label}[wm]overlay={x_expr}:{y_expr}[vwm]")
+                video_label = "[vwm]"
+    else:
+        filter_parts.append(
+            f"[0:v]subtitles='{_filter_path(subtitle_file)}':"
+            "force_style='FontName=Arial,FontSize=24,"
+            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+            "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=34'[v]"
+        )
+        video_label = "[v]"
+
+    if video_label != "[0:v]":
+        video_map = video_label
+
+    filter_parts.append(f"[1:a]apad,atrim=0:{target_seconds:.3f},asetpts=N/SR/TB[a]")
+
+    command.extend(["-filter_complex", ";".join(filter_parts), "-map", video_map, "-map", "[a]"])
+    command.extend(
         [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(silent_video),
-            "-i",
-            str(narration_audio),
-            "-filter_complex",
-            (
-                f"[0:v]subtitles='{_filter_path(subtitle_file)}':"
-                "force_style='FontName=Arial,FontSize=24,"
-                "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-                "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=34'[v];"
-                f"[1:a]apad,atrim=0:{target_seconds:.3f},asetpts=N/SR/TB[a]"
-            ),
-            "-map",
-            "[v]",
-            "-map",
-            "[a]",
             "-t",
             f"{target_seconds:.3f}",
             "-c:v",
@@ -185,14 +298,9 @@ async def render_movie_review_video(
             "-movflags",
             "+faststart",
             str(output_file),
-        ],
-        "Khong render duoc video review dau ra.",
-        target_seconds,
-        93,
-        99,
-        on_progress,
+        ]
     )
-    return output_file
+    return command
 
 
 def write_review_subtitles(
@@ -277,6 +385,21 @@ def _concat_path(path: Path) -> str:
 
 def _filter_path(path: Path) -> str:
     return path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def _boxblur_radius(width: int, height: int) -> int:
+    return max(1, min(20, min(width, height) // 4 - 1))
+
+
+def _mosaic_size(width: int, height: int) -> tuple[int, int]:
+    return max(8, width // 80), max(4, height // 80)
+
+
+def _render_blur_band(y_percent: int, height_percent: int) -> tuple[int, int]:
+    if y_percent >= 65:
+        y_percent = min(y_percent, 76)
+        height_percent = max(height_percent, 100 - y_percent)
+    return y_percent, min(40, max(2, height_percent))
 
 
 def _narration_weight(text: str | None) -> float:

@@ -1,8 +1,9 @@
 import React, { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Clapperboard, Copy, Download, Loader2, Sparkles, Trash2, Upload, Video } from "lucide-react";
-import { clearReviewDraftJobs, createReviewDraftJob, getReviewDraftJob, listReviewDraftJobs, toAbsoluteApiUrl, uploadVideo } from "../lib/api";
+import { Check, Clapperboard, Copy, Download, FileImage, Loader2, Plus, Sparkles, Trash2, Upload, Video, Wand2 } from "lucide-react";
+import { clearReviewDraftJobs, createReviewDraftJob, detectBlurRegions, getReviewDraftJob, listReviewDraftJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "../lib/api";
 import type { UploadProgress } from "../lib/api";
-import type { ReviewBeat, ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
+import type { CustomBlurBox, ReviewBeat, ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
+import { LivePreview } from "./LivePreview";
 
 const reviewStyles: Array<{ label: string; value: ReviewDraftRequest["style"] }> = [
   { label: "Kể chuyện", value: "story" },
@@ -17,6 +18,51 @@ const sourceLanguages: Array<{ label: string; value: SourceLanguage }> = [
   { label: "Tiếng Anh", value: "en" },
   { label: "Tiếng Việt", value: "vi" },
 ];
+
+type ReviewRenderOptions = Pick<
+  ReviewDraftRequest,
+  | "hard_subtitles"
+  | "subtitle_x_percent"
+  | "subtitle_y_percent"
+  | "subtitle_font_size"
+  | "subtitle_box_enabled"
+  | "subtitle_box_opacity"
+  | "subtitle_box_height_percent"
+  | "logo_enabled"
+  | "logo_width"
+  | "logo_x_percent"
+  | "logo_y_percent"
+  | "cinematic_bars_enabled"
+  | "cinematic_bars_height_percent"
+  | "blur_box_enabled"
+  | "blur_box_y_percent"
+  | "blur_box_height_percent"
+  | "custom_blur_boxes"
+  | "watermark_file_name"
+  | "output_resolution"
+>;
+
+const defaultReviewRenderOptions: ReviewRenderOptions = {
+  hard_subtitles: true,
+  subtitle_x_percent: 50,
+  subtitle_y_percent: 84,
+  subtitle_font_size: 38,
+  subtitle_box_enabled: true,
+  subtitle_box_opacity: 45,
+  subtitle_box_height_percent: 18,
+  logo_enabled: true,
+  logo_width: 86,
+  logo_x_percent: 6,
+  logo_y_percent: 8,
+  cinematic_bars_enabled: false,
+  cinematic_bars_height_percent: 10,
+  blur_box_enabled: false,
+  blur_box_y_percent: 80,
+  blur_box_height_percent: 15,
+  custom_blur_boxes: [],
+  watermark_file_name: null,
+  output_resolution: "original",
+};
 
 const ACTIVE_REVIEW_JOB_STORAGE_KEY = "auto-translate-ai.activeReviewJobId";
 
@@ -33,6 +79,7 @@ function pickInitialReviewJob(items: ReviewDraftJob[]): ReviewDraftJob | null {
 export const MovieReview = React.memo(function MovieReview() {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const previewRef = useRef<HTMLVideoElement | null>(null);
+  const logoInputRef = useRef<HTMLInputElement | null>(null);
   const didLoadInitialReviewJobRef = useRef(false);
   const [videoPath, setVideoPath] = useState("");
   const [sourceVideoUrl, setSourceVideoUrl] = useState<string | null>(null);
@@ -43,10 +90,14 @@ export const MovieReview = React.memo(function MovieReview() {
   const [notes, setNotes] = useState("");
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [isUploading, setUploading] = useState(false);
+  const [isLogoUploading, setLogoUploading] = useState(false);
+  const [isDetectingAI, setDetectingAI] = useState(false);
   const [isCreating, setCreating] = useState(false);
   const [isClearingHistory, setClearingHistory] = useState(false);
   const [job, setJob] = useState<ReviewDraftJob | null>(null);
   const [reviewJobs, setReviewJobs] = useState<ReviewDraftJob[]>([]);
+  const [renderOptions, setRenderOptions] = useState<ReviewRenderOptions>(defaultReviewRenderOptions);
+  const [watermarkName, setWatermarkName] = useState("Chưa có logo được tải lên");
   const [previewMode, setPreviewMode] = useState<"source" | "output">("source");
   const [selectedBeatIndex, setSelectedBeatIndex] = useState(0);
   const [message, setMessage] = useState<string | null>(null);
@@ -57,11 +108,17 @@ export const MovieReview = React.memo(function MovieReview() {
     return items;
   }, []);
 
+  const setRenderField = useCallback(<K extends keyof ReviewRenderOptions>(key: K, value: ReviewRenderOptions[K]) => {
+    setRenderOptions((current) => ({ ...current, [key]: value }));
+  }, []);
+
   const applyReviewJob = useCallback((item: ReviewDraftJob, resetBeat = true) => {
     setJob(item);
     setVideoPath(item.request.video_path);
     setSourceVideoUrl(sourceUrlFromPath(item.request.video_path));
     setVideoName(fileNameFromPath(item.request.video_path));
+    setRenderOptions(renderOptionsFromRequest(item.request));
+    setWatermarkName(item.request.watermark_file_name ? "Logo đã lưu trong job" : "Chưa có logo được tải lên");
     setPreviewMode(item.result?.output_video_url ? "output" : "source");
     if (resetBeat) setSelectedBeatIndex(0);
     window.localStorage.setItem(ACTIVE_REVIEW_JOB_STORAGE_KEY, item.job_id);
@@ -143,6 +200,80 @@ export const MovieReview = React.memo(function MovieReview() {
     if (!isUploading) inputRef.current?.click();
   }, [isUploading]);
 
+  const openLogoPicker = useCallback(() => {
+    if (!isLogoUploading) logoInputRef.current?.click();
+  }, [isLogoUploading]);
+
+  const handleWatermark = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setLogoUploading(true);
+    setMessage(null);
+    try {
+      const uploaded = await uploadWatermark(file);
+      setRenderField("watermark_file_name", uploaded.file_name);
+      setRenderField("logo_enabled", true);
+      setWatermarkName(file.name);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Tải logo thất bại.");
+    } finally {
+      setLogoUploading(false);
+      event.target.value = "";
+    }
+  }, [setRenderField]);
+
+  const addBlurBox = useCallback(() => {
+    setRenderOptions((current) => ({
+      ...current,
+      custom_blur_boxes: [
+        ...current.custom_blur_boxes,
+        { x_percent: 72, y_percent: 6, width_percent: 20, height_percent: 9 },
+      ],
+    }));
+  }, []);
+
+  const detectReviewRegions = useCallback(async () => {
+    if (!videoPath.trim()) {
+      setMessage("Import phim trước khi cho AI nhận diện vùng mờ.");
+      return;
+    }
+
+    setDetectingAI(true);
+    setMessage("AI đang nhận diện logo/sub gốc để đặt vùng làm mờ...");
+    try {
+      const result = await detectBlurRegions(videoPath, true, true, "ai");
+      if (result.config) {
+        setRenderOptions((current) => ({
+          ...current,
+          blur_box_enabled: result.config?.blur_box_enabled ?? current.blur_box_enabled,
+          blur_box_y_percent: result.config?.blur_box_y_percent ?? current.blur_box_y_percent,
+          blur_box_height_percent: result.config?.blur_box_height_percent ?? current.blur_box_height_percent,
+          custom_blur_boxes: result.config?.custom_blur_boxes ?? current.custom_blur_boxes,
+          subtitle_y_percent: typeof result.config?.subtitle_y_percent === "number"
+            ? Math.max(8, Math.min(94, Math.round(result.config.subtitle_y_percent)))
+            : current.subtitle_y_percent,
+        }));
+      }
+      if (result.auto_logo) {
+        setRenderOptions((current) => ({
+          ...current,
+          watermark_file_name: result.auto_logo?.watermark_file_name ?? current.watermark_file_name,
+          logo_width: result.auto_logo?.logo_width ?? current.logo_width,
+          logo_x_percent: result.auto_logo?.logo_x_percent ?? current.logo_x_percent,
+          logo_y_percent: result.auto_logo?.logo_y_percent ?? current.logo_y_percent,
+          logo_enabled: result.auto_logo?.logo_enabled ?? current.logo_enabled,
+        }));
+        setWatermarkName("logo kenh.png");
+      }
+      setMessage(result.count > 0 ? `AI đã nhận diện ${result.count} vùng cần xử lý.` : "AI chưa thấy vùng logo/sub rõ ràng, bạn có thể thêm box thủ công.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "AI nhận diện vùng mờ thất bại.");
+    } finally {
+      setDetectingAI(false);
+    }
+  }, [videoPath]);
+
   const handleImport = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -184,6 +315,7 @@ export const MovieReview = React.memo(function MovieReview() {
         style,
         source_language: sourceLanguage,
         notes: notes.trim() || null,
+        ...renderOptions,
       });
       applyReviewJob(created);
       await refreshReviewJobs();
@@ -192,7 +324,7 @@ export const MovieReview = React.memo(function MovieReview() {
     } finally {
       setCreating(false);
     }
-  }, [applyReviewJob, notes, refreshReviewJobs, sourceLanguage, style, targetMinutes, videoPath]);
+  }, [applyReviewJob, notes, refreshReviewJobs, renderOptions, sourceLanguage, style, targetMinutes, videoPath]);
 
   const selectReviewJob = useCallback((item: ReviewDraftJob) => {
     applyReviewJob(item);
@@ -340,6 +472,24 @@ export const MovieReview = React.memo(function MovieReview() {
             />
           </label>
 
+          <ReviewDisplayControls
+            options={renderOptions}
+            watermarkName={watermarkName}
+            isLogoUploading={isLogoUploading}
+            isDetectingAI={isDetectingAI}
+            onFieldChange={setRenderField}
+            onOpenLogoPicker={openLogoPicker}
+            onDetectAI={detectReviewRegions}
+            onAddBlurBox={addBlurBox}
+          />
+          <input
+            ref={logoInputRef}
+            className="file-input-hidden"
+            type="file"
+            accept="image/*"
+            onChange={handleWatermark}
+          />
+
           {message && <div className="review-error">{message}</div>}
 
           <div className="review-block" style={{ marginTop: "18px" }}>
@@ -383,6 +533,8 @@ export const MovieReview = React.memo(function MovieReview() {
             outputVideoUrl={outputVideoUrl}
             activeVideoUrl={activePreviewUrl}
             selectedBeat={selectedBeat}
+            renderOptions={renderOptions}
+            onRenderFieldChange={setRenderField}
           />
 
           <section className="ios-card">
@@ -448,6 +600,143 @@ export const MovieReview = React.memo(function MovieReview() {
   );
 });
 
+function ReviewDisplayControls({
+  options,
+  watermarkName,
+  isLogoUploading,
+  isDetectingAI,
+  onFieldChange,
+  onOpenLogoPicker,
+  onDetectAI,
+  onAddBlurBox,
+}: {
+  options: ReviewRenderOptions;
+  watermarkName: string;
+  isLogoUploading: boolean;
+  isDetectingAI: boolean;
+  onFieldChange: <K extends keyof ReviewRenderOptions>(key: K, value: ReviewRenderOptions[K]) => void;
+  onOpenLogoPicker: () => void;
+  onDetectAI: () => void;
+  onAddBlurBox: () => void;
+}) {
+  return (
+    <div className="review-block review-display-controls">
+      <div className="review-block-head">
+        <h3>Chỉnh hiển thị video review</h3>
+        <button className="ios-button ios-button-secondary" type="button" onClick={onDetectAI} disabled={isDetectingAI}>
+          {isDetectingAI ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />}
+          AI nhận diện
+        </button>
+      </div>
+
+      <div className="review-control-checks">
+        <ReviewCheckBox
+          checked={options.hard_subtitles}
+          label="Ghi phụ đề cứng"
+          onChange={() => onFieldChange("hard_subtitles", !options.hard_subtitles)}
+        />
+        <ReviewCheckBox
+          checked={options.subtitle_box_enabled}
+          label="Nền mờ sau phụ đề"
+          onChange={() => onFieldChange("subtitle_box_enabled", !options.subtitle_box_enabled)}
+        />
+        <ReviewCheckBox
+          checked={options.blur_box_enabled}
+          label="Làm mờ chữ gốc"
+          onChange={() => onFieldChange("blur_box_enabled", !options.blur_box_enabled)}
+        />
+        <ReviewCheckBox
+          checked={options.logo_enabled}
+          label="Chèn logo"
+          onChange={() => onFieldChange("logo_enabled", !options.logo_enabled)}
+        />
+        <ReviewCheckBox
+          checked={options.cinematic_bars_enabled}
+          label="Dải đen cinematic"
+          onChange={() => onFieldChange("cinematic_bars_enabled", !options.cinematic_bars_enabled)}
+        />
+      </div>
+
+      <div className="editor-grid review-editor-grid">
+        <ReviewRangeField label="Sub ngang" value={options.subtitle_x_percent} min={0} max={100} suffix="%" onChange={(value) => onFieldChange("subtitle_x_percent", value)} />
+        <ReviewRangeField label="Sub dọc" value={options.subtitle_y_percent} min={8} max={94} suffix="%" onChange={(value) => onFieldChange("subtitle_y_percent", value)} />
+        <ReviewRangeField label="Cỡ sub" value={options.subtitle_font_size} min={16} max={72} suffix="px" onChange={(value) => onFieldChange("subtitle_font_size", value)} />
+        <ReviewRangeField label="Cao nền sub" value={options.subtitle_box_height_percent} min={8} max={45} suffix="%" onChange={(value) => onFieldChange("subtitle_box_height_percent", value)} />
+        <ReviewRangeField label="Độ mờ nền" value={options.subtitle_box_opacity} min={0} max={100} suffix="%" onChange={(value) => onFieldChange("subtitle_box_opacity", value)} />
+      </div>
+
+      {options.blur_box_enabled && (
+        <div className="editor-grid review-editor-grid">
+          <ReviewRangeField label="Vị trí mờ chữ" value={options.blur_box_y_percent} min={0} max={95} suffix="%" onChange={(value) => onFieldChange("blur_box_y_percent", value)} />
+          <ReviewRangeField label="Cao vùng mờ" value={options.blur_box_height_percent} min={5} max={45} suffix="%" onChange={(value) => onFieldChange("blur_box_height_percent", value)} />
+        </div>
+      )}
+
+      <div className="review-logo-tools">
+        <button type="button" className="ios-button" onClick={onOpenLogoPicker} disabled={isLogoUploading}>
+          {isLogoUploading ? <Loader2 className="spin" size={16} /> : <FileImage size={16} />}
+          Chọn logo
+        </button>
+        <span>{watermarkName}</span>
+      </div>
+
+      {options.logo_enabled && (
+        <div className="editor-grid review-editor-grid">
+          <ReviewRangeField label="Logo ngang" value={options.logo_x_percent} min={0} max={100} suffix="%" onChange={(value) => onFieldChange("logo_x_percent", value)} />
+          <ReviewRangeField label="Logo dọc" value={options.logo_y_percent} min={0} max={100} suffix="%" onChange={(value) => onFieldChange("logo_y_percent", value)} />
+          <ReviewRangeField label="Rộng logo" value={options.logo_width} min={32} max={260} suffix="px" onChange={(value) => onFieldChange("logo_width", value)} />
+        </div>
+      )}
+
+      {options.cinematic_bars_enabled && (
+        <ReviewRangeField label="Cao dải đen" value={options.cinematic_bars_height_percent} min={0} max={30} suffix="%" onChange={(value) => onFieldChange("cinematic_bars_height_percent", value)} />
+      )}
+
+      <button type="button" className="ios-button ios-button-secondary review-add-blur" onClick={onAddBlurBox}>
+        <Plus size={15} />
+        Thêm vùng mờ kéo tay
+      </button>
+      <p className="hint-text blur-hint">Mẹo: có thể kéo trực tiếp phụ đề, logo và vùng mờ trên Live View; các chỉnh này áp dụng cho lần tạo video review tiếp theo.</p>
+    </div>
+  );
+}
+
+function ReviewRangeField({
+  label,
+  value,
+  min,
+  max,
+  suffix,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  suffix: string;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className="range-field">
+      <span>
+        {label}
+        <strong>{value}{suffix}</strong>
+      </span>
+      <input type="range" min={min} max={max} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+    </label>
+  );
+}
+
+function ReviewCheckBox({ checked, label, onChange }: { checked: boolean; label: string; onChange: () => void }) {
+  return (
+    <label className="check-item">
+      <input type="checkbox" checked={checked} onChange={onChange} />
+      <span>{checked && <Check size={14} />}</span>
+      {label}
+    </label>
+  );
+}
+
 const ReviewLivePreview = React.forwardRef<HTMLVideoElement, {
   mode: "source" | "output";
   onModeChange: (mode: "source" | "output") => void;
@@ -455,7 +744,9 @@ const ReviewLivePreview = React.forwardRef<HTMLVideoElement, {
   outputVideoUrl: string | null;
   activeVideoUrl: string | null;
   selectedBeat: ReviewBeat | null;
-}>(function ReviewLivePreview({ mode, onModeChange, sourceVideoUrl, outputVideoUrl, activeVideoUrl, selectedBeat }, ref) {
+  renderOptions: ReviewRenderOptions;
+  onRenderFieldChange: <K extends keyof ReviewRenderOptions>(key: K, value: ReviewRenderOptions[K]) => void;
+}>(function ReviewLivePreview({ mode, onModeChange, sourceVideoUrl, outputVideoUrl, activeVideoUrl, selectedBeat, renderOptions, onRenderFieldChange }, ref) {
   return (
     <section className="ios-card review-live-card">
       <div className="section-title">
@@ -470,17 +761,37 @@ const ReviewLivePreview = React.forwardRef<HTMLVideoElement, {
           Video review
         </button>
       </div>
-      <div className="video-frame review-live-frame">
-        {activeVideoUrl ? (
-          <video ref={ref} className="preview-video-element" src={activeVideoUrl} controls playsInline />
+      {mode === "source" ? (
+        sourceVideoUrl ? (
+          <LivePreview
+            {...renderOptions}
+            watermark_file_name={renderOptions.watermark_file_name ?? null}
+            previewVideoUrl={sourceVideoUrl}
+            setField={onRenderFieldChange}
+            videoRef={ref}
+          />
         ) : (
-          <div className="review-live-empty">
-            <Video size={36} />
-            <strong>Import phim để xem live view</strong>
-            <span>Khi có bản review, bạn có thể đổi qua tab Video review.</span>
+          <div className="video-frame review-live-frame">
+            <div className="review-live-empty">
+              <Video size={36} />
+              <strong>Import phim để xem live view</strong>
+              <span>Khi có phim, bạn có thể kéo logo, sub và vùng làm mờ trực tiếp.</span>
+            </div>
           </div>
-        )}
-      </div>
+        )
+      ) : (
+        <div className="video-frame review-live-frame">
+          {activeVideoUrl ? (
+          <video ref={ref} className="preview-video-element" src={activeVideoUrl} controls playsInline />
+          ) : (
+            <div className="review-live-empty">
+              <Video size={36} />
+              <strong>Chưa có video review</strong>
+              <span>Tạo bản review xong tab này sẽ xem được output.</span>
+            </div>
+          )}
+        </div>
+      )}
       <div className="review-preview-meta">
         <strong>{mode === "output" ? "Đang xem video review đã render" : "Đang xem phim gốc để so cảnh"}</strong>
         {selectedBeat ? (
@@ -529,6 +840,35 @@ function sourceUrlFromPath(value: string): string | null {
   if (markerIndex < 0) return null;
   const fileName = normalized.slice(markerIndex + marker.length);
   return fileName ? toAbsoluteApiUrl(`/api/uploads/video/${encodeURIComponent(fileName)}`) : null;
+}
+
+function renderOptionsFromRequest(request: Partial<ReviewDraftRequest>): ReviewRenderOptions {
+  const boxes: CustomBlurBox[] = Array.isArray(request.custom_blur_boxes)
+    ? request.custom_blur_boxes.map((box) => ({ ...box }))
+    : [];
+
+  return {
+    ...defaultReviewRenderOptions,
+    hard_subtitles: request.hard_subtitles ?? defaultReviewRenderOptions.hard_subtitles,
+    subtitle_x_percent: request.subtitle_x_percent ?? defaultReviewRenderOptions.subtitle_x_percent,
+    subtitle_y_percent: request.subtitle_y_percent ?? defaultReviewRenderOptions.subtitle_y_percent,
+    subtitle_font_size: request.subtitle_font_size ?? defaultReviewRenderOptions.subtitle_font_size,
+    subtitle_box_enabled: request.subtitle_box_enabled ?? defaultReviewRenderOptions.subtitle_box_enabled,
+    subtitle_box_opacity: request.subtitle_box_opacity ?? defaultReviewRenderOptions.subtitle_box_opacity,
+    subtitle_box_height_percent: request.subtitle_box_height_percent ?? defaultReviewRenderOptions.subtitle_box_height_percent,
+    logo_enabled: request.logo_enabled ?? defaultReviewRenderOptions.logo_enabled,
+    logo_width: request.logo_width ?? defaultReviewRenderOptions.logo_width,
+    logo_x_percent: request.logo_x_percent ?? defaultReviewRenderOptions.logo_x_percent,
+    logo_y_percent: request.logo_y_percent ?? defaultReviewRenderOptions.logo_y_percent,
+    cinematic_bars_enabled: request.cinematic_bars_enabled ?? defaultReviewRenderOptions.cinematic_bars_enabled,
+    cinematic_bars_height_percent: request.cinematic_bars_height_percent ?? defaultReviewRenderOptions.cinematic_bars_height_percent,
+    blur_box_enabled: request.blur_box_enabled ?? defaultReviewRenderOptions.blur_box_enabled,
+    blur_box_y_percent: request.blur_box_y_percent ?? defaultReviewRenderOptions.blur_box_y_percent,
+    blur_box_height_percent: request.blur_box_height_percent ?? defaultReviewRenderOptions.blur_box_height_percent,
+    custom_blur_boxes: boxes,
+    watermark_file_name: request.watermark_file_name ?? null,
+    output_resolution: request.output_resolution ?? defaultReviewRenderOptions.output_resolution,
+  };
 }
 
 function formatDateTime(value: string): string {

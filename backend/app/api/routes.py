@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 import json
 
 from app.core import settings
-from app.models.job import DubbingRequest, JobCreateResponse, JobProgress, UploadResponse
+from app.models.job import BgmMode, CustomBlurBox, DubbingRequest, JobCreateResponse, JobProgress, UploadResponse
 from app.services.processor import process_job
 from app.services.store import job_store
 from app.services.media.downloader import download_preview_video
@@ -26,6 +26,25 @@ class ReviewDraftRequest(BaseModel):
     style: str = "story"
     source_language: str = "auto"
     notes: str | None = None
+    hard_subtitles: bool = True
+    subtitle_x_percent: int = Field(default=50, ge=0, le=100)
+    subtitle_y_percent: int = Field(default=84, ge=8, le=94)
+    subtitle_font_size: int = Field(default=38, ge=16, le=72)
+    subtitle_box_enabled: bool = True
+    subtitle_box_opacity: int = Field(default=45, ge=0, le=100)
+    subtitle_box_height_percent: int = Field(default=18, ge=8, le=45)
+    logo_enabled: bool = True
+    logo_width: int = Field(default=86, ge=32, le=800)
+    logo_x_percent: int = Field(default=6, ge=0, le=100)
+    logo_y_percent: int = Field(default=8, ge=0, le=100)
+    cinematic_bars_enabled: bool = False
+    cinematic_bars_height_percent: int = Field(default=10, ge=0, le=40)
+    blur_box_enabled: bool = False
+    blur_box_y_percent: int = Field(default=80, ge=0, le=100)
+    blur_box_height_percent: int = Field(default=15, ge=5, le=100)
+    custom_blur_boxes: list[CustomBlurBox] = Field(default_factory=list)
+    watermark_file_name: str | None = None
+    output_resolution: str = "original"
 
 
 class ReviewBeatResponse(BaseModel):
@@ -351,6 +370,37 @@ async def _process_review_draft_job(job_id: str) -> None:
 
         _update_review_job(job_id, progress=90, stage="Cat ghep video review")
         output_file = work_dir / "review_output.mp4"
+        render_request = DubbingRequest(
+            local_file_path=str(source_video),
+            voice_gender=VoiceGender.female,
+            bgm_mode=BgmMode.none,
+            use_demucs=True,
+            video_speed=1.0,
+            auto_publish=[],
+            clone_voice=False,
+            hard_subtitles=job.request.hard_subtitles,
+            source_has_hard_subtitles=False,
+            subtitle_x_percent=job.request.subtitle_x_percent,
+            subtitle_y_percent=job.request.subtitle_y_percent,
+            subtitle_font_size=job.request.subtitle_font_size,
+            subtitle_box_enabled=job.request.subtitle_box_enabled,
+            subtitle_box_opacity=job.request.subtitle_box_opacity,
+            subtitle_box_height_percent=job.request.subtitle_box_height_percent,
+            source_language=job.request.source_language,
+            ducking_volume_db=-12,
+            output_resolution=job.request.output_resolution,
+            logo_enabled=job.request.logo_enabled,
+            logo_width=job.request.logo_width,
+            logo_x_percent=job.request.logo_x_percent,
+            logo_y_percent=job.request.logo_y_percent,
+            cinematic_bars_enabled=job.request.cinematic_bars_enabled,
+            cinematic_bars_height_percent=job.request.cinematic_bars_height_percent,
+            blur_box_enabled=job.request.blur_box_enabled,
+            blur_box_y_percent=job.request.blur_box_y_percent,
+            blur_box_height_percent=job.request.blur_box_height_percent,
+            custom_blur_boxes=job.request.custom_blur_boxes,
+            watermark_file_name=job.request.watermark_file_name,
+        )
         review_subtitle_file = write_review_subtitles(
             plan.narration_script,
             work_dir / "review_subtitles.srt",
@@ -367,6 +417,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             job.request.target_minutes,
             scene_hints,
             lambda percent: _update_review_job(job_id, progress=max(90, min(99, percent))),
+            render_request,
         )
 
         result = ReviewDraftResult(

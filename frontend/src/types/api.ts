@@ -75,6 +75,25 @@ export interface ReviewDraftRequest {
   style: "story" | "fast" | "emotional" | "funny";
   source_language: SourceLanguage;
   notes?: string | null;
+  hard_subtitles: boolean;
+  subtitle_x_percent: number;
+  subtitle_y_percent: number;
+  subtitle_font_size: number;
+  subtitle_box_enabled: boolean;
+  subtitle_box_opacity: number;
+  subtitle_box_height_percent: number;
+  logo_enabled: boolean;
+  logo_width: number;
+  logo_x_percent: number;
+  logo_y_percent: number;
+  cinematic_bars_enabled: boolean;
+  cinematic_bars_height_percent: number;
+  blur_box_enabled: boolean;
+  blur_box_y_percent: number;
+  blur_box_height_percent: number;
+  custom_blur_boxes: CustomBlurBox[];
+  watermark_file_name?: string | null;
+  output_resolution: string;
 }
 
 export interface ReviewBeat {

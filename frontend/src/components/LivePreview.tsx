@@ -35,6 +35,7 @@ interface LivePreviewProps {
   cinematic_bars_height_percent: number;
 
   setField: (key: any, value: any) => void;
+  videoRef?: React.Ref<HTMLVideoElement>;
 }
 
 interface DragState {
@@ -74,6 +75,7 @@ export const LivePreview = React.memo(function LivePreview({
   cinematic_bars_enabled,
   cinematic_bars_height_percent,
   setField,
+  videoRef,
 }: LivePreviewProps) {
   const frameRef = useRef<HTMLDivElement | null>(null);
   const dragStartRef = useRef<DragState | null>(null);
@@ -360,6 +362,7 @@ export const LivePreview = React.memo(function LivePreview({
       <div className="video-frame" ref={frameRef}>
         {previewVideoUrl ? (
           <video
+            ref={videoRef}
             className="preview-video-element"
             src={previewVideoUrl}
             controls
@@ -539,6 +542,7 @@ export const LivePreview = React.memo(function LivePreview({
     prev.blur_box_height_percent === next.blur_box_height_percent &&
     prev.cinematic_bars_enabled === next.cinematic_bars_enabled &&
     prev.cinematic_bars_height_percent === next.cinematic_bars_height_percent &&
+    prev.videoRef === next.videoRef &&
     prev.custom_blur_boxes === next.custom_blur_boxes // reference check is sufficient since we replace array reference on change
   );
 });
