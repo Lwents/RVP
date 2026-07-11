@@ -276,7 +276,7 @@ export function App() {
       setActiveJob(null);
       setActiveJobId(null);
       await refreshJobs();
-      setMessage("Đã xoá lịch sử job.");
+      setMessage(result.message || "Đã xoá lịch sử job và đưa file vào Thùng rác.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Không thể xoá lịch sử job.");
     } finally {

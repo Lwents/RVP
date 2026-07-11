@@ -1,6 +1,6 @@
 import React, { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Clapperboard, Copy, Download, Loader2, Sparkles, Upload, Video } from "lucide-react";
-import { createReviewDraftJob, getReviewDraftJob, toAbsoluteApiUrl, uploadVideo } from "../lib/api";
+import { Clapperboard, Copy, Download, Loader2, Sparkles, Trash2, Upload, Video } from "lucide-react";
+import { clearReviewDraftJobs, createReviewDraftJob, getReviewDraftJob, listReviewDraftJobs, toAbsoluteApiUrl, uploadVideo } from "../lib/api";
 import type { UploadProgress } from "../lib/api";
 import type { ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
 
@@ -29,8 +29,30 @@ export const MovieReview = React.memo(function MovieReview() {
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [isUploading, setUploading] = useState(false);
   const [isCreating, setCreating] = useState(false);
+  const [isClearingHistory, setClearingHistory] = useState(false);
   const [job, setJob] = useState<ReviewDraftJob | null>(null);
+  const [reviewJobs, setReviewJobs] = useState<ReviewDraftJob[]>([]);
   const [message, setMessage] = useState<string | null>(null);
+
+  const refreshReviewJobs = useCallback(async () => {
+    const items = await listReviewDraftJobs();
+    setReviewJobs(items);
+    return items;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    refreshReviewJobs().then((items) => {
+      if (!cancelled && items.length > 0) {
+        setJob((current) => current ?? items[0]);
+      }
+    }).catch((error) => {
+      setMessage(error instanceof Error ? error.message : "Không thể tải lịch sử review job.");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshReviewJobs]);
 
   useEffect(() => {
     if (!job || job.status === "completed" || job.status === "failed") return;
@@ -39,7 +61,10 @@ export const MovieReview = React.memo(function MovieReview() {
     const timer = window.setInterval(async () => {
       try {
         const nextJob = await getReviewDraftJob(job.job_id);
-        if (!cancelled) setJob(nextJob);
+        if (!cancelled) {
+          setJob(nextJob);
+          setReviewJobs((items) => items.map((item) => item.job_id === nextJob.job_id ? nextJob : item));
+        }
       } catch (error) {
         if (!cancelled) setMessage(error instanceof Error ? error.message : "Không thể lấy trạng thái review job.");
       }
@@ -95,12 +120,37 @@ export const MovieReview = React.memo(function MovieReview() {
         notes: notes.trim() || null,
       });
       setJob(created);
+      await refreshReviewJobs();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Không thể tạo review job.");
     } finally {
       setCreating(false);
     }
-  }, [notes, sourceLanguage, style, targetMinutes, videoPath]);
+  }, [notes, refreshReviewJobs, sourceLanguage, style, targetMinutes, videoPath]);
+
+  const selectReviewJob = useCallback((item: ReviewDraftJob) => {
+    setJob(item);
+    setVideoPath(item.request.video_path);
+    setVideoName(fileNameFromPath(item.request.video_path));
+  }, []);
+
+  const clearReviewHistory = useCallback(async () => {
+    const confirmed = window.confirm("Đưa toàn bộ file review job vào Thùng rác và xóa lịch sử review?");
+    if (!confirmed) return;
+
+    setClearingHistory(true);
+    setMessage(null);
+    try {
+      const result = await clearReviewDraftJobs();
+      setReviewJobs([]);
+      setJob(null);
+      setMessage(result.message || "Đã xóa lịch sử review và đưa file vào Thùng rác.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Không thể xóa lịch sử review.");
+    } finally {
+      setClearingHistory(false);
+    }
+  }, []);
 
   const copyText = useCallback(async (value: string) => {
     if (!value) return;
@@ -202,6 +252,37 @@ export const MovieReview = React.memo(function MovieReview() {
           </label>
 
           {message && <div className="review-error">{message}</div>}
+
+          <div className="review-block" style={{ marginTop: "18px" }}>
+            <div className="review-block-head">
+              <h3>Lịch sử review job</h3>
+              {reviewJobs.length > 0 && (
+                <button className="ios-button ios-button-secondary" type="button" onClick={clearReviewHistory} disabled={isClearingHistory}>
+                  {isClearingHistory ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
+                  Xóa tất cả
+                </button>
+              )}
+            </div>
+            {reviewJobs.length === 0 ? (
+              <p style={{ color: "#86868b", margin: 0 }}>Chưa có review job nào.</p>
+            ) : (
+              <div className="review-beats">
+                {reviewJobs.map((item) => (
+                  <button
+                    key={item.job_id}
+                    type="button"
+                    className="review-beat"
+                    onClick={() => selectReviewJob(item)}
+                    style={{ textAlign: "left", cursor: "pointer" }}
+                  >
+                    <strong>{item.stage}</strong>
+                    <span>{item.progress}% • {item.status} • {formatDateTime(item.created_at)}</span>
+                    <p>{fileNameFromPath(item.request.video_path)} • {item.request.target_minutes} phút</p>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </section>
 
         <section className="ios-card">
@@ -288,4 +369,15 @@ function formatBytes(bytes: number): string {
   const value = bytes / 1024 ** exponent;
   const digits = exponent === 0 ? 0 : value >= 100 ? 0 : value >= 10 ? 1 : 2;
   return `${value.toFixed(digits)} ${units[exponent]}`;
+}
+
+function fileNameFromPath(value: string): string {
+  const normalized = value.replace(/\\/g, "/");
+  return normalized.split("/").pop() || value || "Phim đã import";
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("vi-VN", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
 }

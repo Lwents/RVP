@@ -271,6 +271,18 @@ export async function createReviewDraftJob(payload: ReviewDraftRequest): Promise
   });
 }
 
+export async function listReviewDraftJobs(): Promise<ReviewDraftJob[]> {
+  return request("/api/review/jobs");
+}
+
 export async function getReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
   return request(`/api/review/jobs/${jobId}`);
+}
+
+export async function clearReviewDraftJobs(): Promise<{ message?: string; warnings?: string }> {
+  const response = await fetch(`${API_URL}/api/review/jobs`, { method: "DELETE" });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json().catch(() => ({}));
 }

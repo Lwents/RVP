@@ -7,6 +7,7 @@ import numpy as np
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+import json
 
 from app.core import settings
 from app.models.job import DubbingRequest, JobCreateResponse, JobProgress, UploadResponse
@@ -61,7 +62,70 @@ class ReviewDraftJob(BaseModel):
     error: str | None = None
 
 
+REVIEW_JOBS_INDEX_FILE = Path(settings.storage_dir) / "review_jobs_index.json"
 review_draft_jobs: dict[str, ReviewDraftJob] = {}
+
+
+def _load_review_jobs() -> None:
+    global review_draft_jobs
+    if not REVIEW_JOBS_INDEX_FILE.exists():
+        return
+    try:
+        data = json.loads(REVIEW_JOBS_INDEX_FILE.read_text(encoding="utf-8"))
+        review_draft_jobs = {
+            item["job_id"]: ReviewDraftJob.model_validate(item)
+            for item in data
+            if isinstance(item, dict) and item.get("job_id")
+        }
+        _mark_interrupted_review_jobs()
+    except Exception:
+        review_draft_jobs = {}
+
+
+def _mark_interrupted_review_jobs() -> None:
+    changed = False
+    for job_id, job in list(review_draft_jobs.items()):
+        if job.status not in {"queued", "processing"}:
+            continue
+        data = job.model_dump()
+        data.update(
+            {
+                "status": "failed",
+                "stage": "Review job bị gián đoạn khi backend khởi động lại",
+                "error": "Backend đã restart trước khi review job hoàn tất. Hãy chạy lại job này.",
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        review_draft_jobs[job_id] = ReviewDraftJob.model_validate(data)
+        changed = True
+    if changed:
+        _save_review_jobs()
+
+
+def _save_review_jobs() -> None:
+    REVIEW_JOBS_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = [job.model_dump(mode="json") for job in review_draft_jobs.values()]
+    REVIEW_JOBS_INDEX_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _trash_review_jobs() -> list[str]:
+    try:
+        from send2trash import send2trash
+    except ImportError as exc:
+        raise RuntimeError("Thiếu Send2Trash. Chạy pip install -r requirements.txt trong backend.") from exc
+
+    warnings: list[str] = []
+    review_dir = Path(settings.storage_dir) / "review_jobs"
+    paths = [path for path in review_dir.iterdir() if path.is_dir()] if review_dir.exists() else []
+    for path in paths:
+        try:
+            send2trash(str(path))
+        except Exception as exc:
+            warnings.append(f"{path}: {exc}")
+    return warnings[:10]
+
+
+_load_review_jobs()
 
 
 def _encode_round_logo_png(image_bytes: bytes) -> bytes:
@@ -202,12 +266,15 @@ def _resolve_video_path(video_path: str) -> Path:
 
 
 def _update_review_job(job_id: str, **changes: object) -> ReviewDraftJob:
-    current = review_draft_jobs[job_id]
+    current = review_draft_jobs.get(job_id)
+    if current is None:
+        raise RuntimeError("Review job đã bị xóa khỏi lịch sử.")
     data = current.model_dump()
     data.update(changes)
     data["updated_at"] = datetime.now(UTC)
     updated = ReviewDraftJob.model_validate(data)
     review_draft_jobs[job_id] = updated
+    _save_review_jobs()
     return updated
 
 
@@ -332,12 +399,13 @@ async def _process_review_draft_job(job_id: str) -> None:
             result=result,
         )
     except Exception as exc:
-        _update_review_job(
-            job_id,
-            status="failed",
-            stage="Tao review phim that bai",
-            error=str(exc),
-        )
+        if job_id in review_draft_jobs:
+            _update_review_job(
+                job_id,
+                status="failed",
+                stage="Tao review phim that bai",
+                error=str(exc),
+            )
 
 
 def _review_asr_timeout(video_duration_seconds: float) -> int:
@@ -365,8 +433,30 @@ async def create_review_draft_job(request: ReviewDraftRequest) -> ReviewDraftJob
         updated_at=now,
     )
     review_draft_jobs[job.job_id] = job
+    _save_review_jobs()
     asyncio.create_task(_process_review_draft_job(job.job_id))
     return job
+
+
+@router.get("/review/jobs", response_model=list[ReviewDraftJob], tags=["review"])
+async def list_review_draft_jobs() -> list[ReviewDraftJob]:
+    return sorted(review_draft_jobs.values(), key=lambda item: item.created_at, reverse=True)
+
+
+@router.delete("/review/jobs", tags=["review"])
+async def clear_review_draft_jobs() -> dict[str, str]:
+    warnings = _trash_review_jobs()
+    review_draft_jobs.clear()
+    _save_review_jobs()
+
+    message = "Đã đưa toàn bộ file review job vào Thùng rác và xóa lịch sử review."
+    if warnings:
+        message = f"{message} Một số file chưa chuyển được vì đang được dùng."
+
+    response = {"message": message}
+    if warnings:
+        response["warnings"] = "\n".join(warnings)
+    return response
 
 
 @router.get("/review/jobs/{job_id}", response_model=ReviewDraftJob, tags=["review"])
