@@ -31,6 +31,7 @@ const languages = [
 type AppTab = "workspace" | "youtube" | "review";
 
 const APP_TAB_STORAGE_KEY = "auto-translate-ai.activeTab";
+const ACTIVE_WORKSPACE_JOB_STORAGE_KEY = "auto-translate-ai.activeWorkspaceJobId";
 const appTabs: AppTab[] = ["workspace", "youtube", "review"];
 
 function isAppTab(value: string | null): value is AppTab {
@@ -48,6 +49,11 @@ function readInitialTab(): AppTab {
   if (hashTab) return hashTab;
   const storedTab = window.localStorage.getItem(APP_TAB_STORAGE_KEY);
   return isAppTab(storedTab) ? storedTab : "workspace";
+}
+
+function readInitialActiveJobId(): string | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(ACTIVE_WORKSPACE_JOB_STORAGE_KEY);
 }
 
 const defaultForm: DubbingRequest = {
@@ -105,6 +111,10 @@ function needsYoutubeMetadata(job: JobProgress): boolean {
   return !title || title === "Video đã được xử lý" || tags.length === 0;
 }
 
+function isRunningJob(job: JobProgress): boolean {
+  return job.status === "queued" || job.status === "processing";
+}
+
 interface DebouncedInputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, "onChange"> {
   value: string;
   onChange: (val: string) => void;
@@ -133,7 +143,7 @@ function DebouncedInput({ value, onChange, debounceMs = 300, ...props }: Debounc
 
 export function App() {
   const [form, setForm] = useState<DubbingRequest>(defaultForm);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [activeJobId, setActiveJobId] = useState<string | null>(() => readInitialActiveJobId());
   const [activeJob, setActiveJob] = useState<JobProgress | null>(null);
   const [jobs, setJobs] = useState<JobProgress[]>([]);
   const [isSubmitting, setSubmitting] = useState(false);
@@ -149,6 +159,15 @@ export function App() {
   const [activeTab, setActiveTab] = useState<AppTab>(() => readInitialTab());
 
   const videoInputRef = useRef<HTMLInputElement | null>(null);
+
+  const trackActiveJobId = useCallback((jobId: string | null) => {
+    setActiveJobId(jobId);
+    if (jobId) {
+      window.localStorage.setItem(ACTIVE_WORKSPACE_JOB_STORAGE_KEY, jobId);
+    } else {
+      window.localStorage.removeItem(ACTIVE_WORKSPACE_JOB_STORAGE_KEY);
+    }
+  }, []);
 
   const goToTab = useCallback((tab: AppTab) => {
     setActiveTab(tab);
@@ -189,12 +208,33 @@ export function App() {
     return nextJobs;
   }, []);
 
-  useEffect(() => {
-    refreshJobs().catch(() => undefined);
-  }, [refreshJobs]);
+  const hasRunningJobs = useMemo(() => jobs.some(isRunningJob), [jobs]);
+  const activeJobFinished = Boolean(activeJobId && activeJob?.job_id === activeJobId && !isRunningJob(activeJob));
 
   useEffect(() => {
-    if (!activeJobId) return;
+    let cancelled = false;
+    refreshJobs().then((nextJobs) => {
+      if (cancelled || nextJobs.length === 0) return;
+
+      const storedJob = activeJobId ? nextJobs.find((item) => item.job_id === activeJobId) : null;
+      const runningJob = nextJobs.find(isRunningJob);
+      const nextActiveJob = storedJob ?? runningJob ?? nextJobs[0];
+
+      setActiveJob(nextActiveJob);
+      if (!storedJob && runningJob) {
+        trackActiveJobId(runningJob.job_id);
+      } else if (activeJobId && !storedJob && !runningJob) {
+        trackActiveJobId(null);
+      }
+    }).catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeJobId, refreshJobs, trackActiveJobId]);
+
+  useEffect(() => {
+    if (!activeJobId || activeJobFinished) return;
 
     let cancelled = false;
     const poll = async () => {
@@ -217,7 +257,39 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeJobId]);
+  }, [activeJobFinished, activeJobId]);
+
+  useEffect(() => {
+    if (!hasRunningJobs) return;
+
+    let cancelled = false;
+    const refreshRunningHistory = async () => {
+      try {
+        const nextJobs = await refreshJobs();
+        if (cancelled) return;
+
+        const selectedJob = activeJobId ? nextJobs.find((item) => item.job_id === activeJobId) : null;
+        if (selectedJob) {
+          setActiveJob(selectedJob);
+          return;
+        }
+
+        const runningJob = nextJobs.find(isRunningJob);
+        if (runningJob) {
+          setActiveJob(runningJob);
+          trackActiveJobId(runningJob.job_id);
+        }
+      } catch {
+        // History refresh is best-effort; the active job poll still reports hard errors.
+      }
+    };
+
+    const timer = window.setInterval(refreshRunningHistory, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeJobId, hasRunningJobs, refreshJobs, trackActiveJobId]);
 
   const setField = useCallback(<K extends keyof DubbingRequest>(key: K, value: DubbingRequest[K]) => {
     setForm((current) => ({ ...current, [key]: value }));
@@ -298,7 +370,7 @@ export function App() {
 
     try {
       const response = await createJob(payload);
-      setActiveJobId(response.job_id);
+      trackActiveJobId(response.job_id);
       setMessage("Đã gửi job. Backend sẽ render đúng vị trí phụ đề trong live view.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Không thể tạo job.");
@@ -317,7 +389,7 @@ export function App() {
       const result = await clearJobs();
       setJobs([]);
       setActiveJob(null);
-      setActiveJobId(null);
+      trackActiveJobId(null);
       await refreshJobs();
       setMessage(result.message || "Đã xoá lịch sử job và đưa file vào Thùng rác.");
     } catch (error) {
@@ -325,11 +397,11 @@ export function App() {
     } finally {
       setClearingJobs(false);
     }
-  }, [refreshJobs]);
+  }, [refreshJobs, trackActiveJobId]);
 
   const handleSelectJob = useCallback((id: string) => {
-    setActiveJobId(id);
-  }, []);
+    trackActiveJobId(id);
+  }, [trackActiveJobId]);
 
   const handleAddBlurBox = useCallback(() => {
     const boxes = [...form.custom_blur_boxes];

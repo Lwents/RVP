@@ -18,9 +18,22 @@ const sourceLanguages: Array<{ label: string; value: SourceLanguage }> = [
   { label: "Tiếng Việt", value: "vi" },
 ];
 
+const ACTIVE_REVIEW_JOB_STORAGE_KEY = "auto-translate-ai.activeReviewJobId";
+
+function isRunningReviewJob(job: ReviewDraftJob): boolean {
+  return job.status === "queued" || job.status === "processing";
+}
+
+function pickInitialReviewJob(items: ReviewDraftJob[]): ReviewDraftJob | null {
+  if (items.length === 0) return null;
+  const storedJobId = typeof window === "undefined" ? null : window.localStorage.getItem(ACTIVE_REVIEW_JOB_STORAGE_KEY);
+  return items.find((item) => item.job_id === storedJobId) ?? items.find(isRunningReviewJob) ?? items[0];
+}
+
 export const MovieReview = React.memo(function MovieReview() {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const previewRef = useRef<HTMLVideoElement | null>(null);
+  const didLoadInitialReviewJobRef = useRef(false);
   const [videoPath, setVideoPath] = useState("");
   const [sourceVideoUrl, setSourceVideoUrl] = useState<string | null>(null);
   const [videoName, setVideoName] = useState("Chưa có phim được import");
@@ -44,27 +57,34 @@ export const MovieReview = React.memo(function MovieReview() {
     return items;
   }, []);
 
+  const applyReviewJob = useCallback((item: ReviewDraftJob, resetBeat = true) => {
+    setJob(item);
+    setVideoPath(item.request.video_path);
+    setSourceVideoUrl(sourceUrlFromPath(item.request.video_path));
+    setVideoName(fileNameFromPath(item.request.video_path));
+    setPreviewMode(item.result?.output_video_url ? "output" : "source");
+    if (resetBeat) setSelectedBeatIndex(0);
+    window.localStorage.setItem(ACTIVE_REVIEW_JOB_STORAGE_KEY, item.job_id);
+  }, []);
+
+  const hasRunningReviewJobs = reviewJobs.some(isRunningReviewJob);
+  const selectedReviewJobId = job?.job_id ?? null;
+
   useEffect(() => {
     let cancelled = false;
     refreshReviewJobs().then((items) => {
-      if (!cancelled && items.length > 0) {
-        setJob((current) => {
-          if (current) return current;
-          const item = items[0];
-          setVideoPath(item.request.video_path);
-          setSourceVideoUrl(sourceUrlFromPath(item.request.video_path));
-          setVideoName(fileNameFromPath(item.request.video_path));
-          setPreviewMode(item.result?.output_video_url ? "output" : "source");
-          return item;
-        });
-      }
+      if (cancelled || didLoadInitialReviewJobRef.current) return;
+      const item = pickInitialReviewJob(items);
+      if (!item) return;
+      didLoadInitialReviewJobRef.current = true;
+      applyReviewJob(item);
     }).catch((error) => {
       setMessage(error instanceof Error ? error.message : "Không thể tải lịch sử review job.");
     });
     return () => {
       cancelled = true;
     };
-  }, [refreshReviewJobs]);
+  }, [applyReviewJob, refreshReviewJobs]);
 
   useEffect(() => {
     if (!job || job.status === "completed" || job.status === "failed") return;
@@ -87,6 +107,37 @@ export const MovieReview = React.memo(function MovieReview() {
       window.clearInterval(timer);
     };
   }, [job]);
+
+  useEffect(() => {
+    if (!hasRunningReviewJobs) return;
+
+    let cancelled = false;
+    const refreshRunningHistory = async () => {
+      try {
+        const items = await refreshReviewJobs();
+        if (cancelled) return;
+
+        const selectedJob = selectedReviewJobId ? items.find((item) => item.job_id === selectedReviewJobId) : null;
+        if (selectedJob) {
+          applyReviewJob(selectedJob, false);
+          return;
+        }
+
+        const runningJob = items.find(isRunningReviewJob);
+        if (runningJob) {
+          applyReviewJob(runningJob);
+        }
+      } catch {
+        // The selected review job poll will surface hard failures; history refresh stays quiet.
+      }
+    };
+
+    const timer = window.setInterval(refreshRunningHistory, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [applyReviewJob, hasRunningReviewJobs, refreshReviewJobs, selectedReviewJobId]);
 
   const openPicker = useCallback(() => {
     if (!isUploading) inputRef.current?.click();
@@ -134,24 +185,18 @@ export const MovieReview = React.memo(function MovieReview() {
         source_language: sourceLanguage,
         notes: notes.trim() || null,
       });
-      setJob(created);
-      setSelectedBeatIndex(0);
+      applyReviewJob(created);
       await refreshReviewJobs();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Không thể tạo review job.");
     } finally {
       setCreating(false);
     }
-  }, [notes, refreshReviewJobs, sourceLanguage, style, targetMinutes, videoPath]);
+  }, [applyReviewJob, notes, refreshReviewJobs, sourceLanguage, style, targetMinutes, videoPath]);
 
   const selectReviewJob = useCallback((item: ReviewDraftJob) => {
-    setJob(item);
-    setVideoPath(item.request.video_path);
-    setSourceVideoUrl(sourceUrlFromPath(item.request.video_path));
-    setVideoName(fileNameFromPath(item.request.video_path));
-    setPreviewMode(item.result?.output_video_url ? "output" : "source");
-    setSelectedBeatIndex(0);
-  }, []);
+    applyReviewJob(item);
+  }, [applyReviewJob]);
 
   const result = job?.result ?? null;
   const outputVideoUrl = result?.output_video_url ? toAbsoluteApiUrl(result.output_video_url) : null;
@@ -189,6 +234,7 @@ export const MovieReview = React.memo(function MovieReview() {
       setReviewJobs([]);
       setJob(null);
       setSelectedBeatIndex(0);
+      window.localStorage.removeItem(ACTIVE_REVIEW_JOB_STORAGE_KEY);
       setMessage(result.message || "Đã xóa lịch sử review và đưa file vào Thùng rác.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Không thể xóa lịch sử review.");
