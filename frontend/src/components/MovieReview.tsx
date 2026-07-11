@@ -2,7 +2,7 @@ import React, { ChangeEvent, useCallback, useEffect, useRef, useState } from "re
 import { Clapperboard, Copy, Download, Loader2, Sparkles, Trash2, Upload, Video } from "lucide-react";
 import { clearReviewDraftJobs, createReviewDraftJob, getReviewDraftJob, listReviewDraftJobs, toAbsoluteApiUrl, uploadVideo } from "../lib/api";
 import type { UploadProgress } from "../lib/api";
-import type { ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
+import type { ReviewBeat, ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
 
 const reviewStyles: Array<{ label: string; value: ReviewDraftRequest["style"] }> = [
   { label: "Kể chuyện", value: "story" },
@@ -20,7 +20,9 @@ const sourceLanguages: Array<{ label: string; value: SourceLanguage }> = [
 
 export const MovieReview = React.memo(function MovieReview() {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const previewRef = useRef<HTMLVideoElement | null>(null);
   const [videoPath, setVideoPath] = useState("");
+  const [sourceVideoUrl, setSourceVideoUrl] = useState<string | null>(null);
   const [videoName, setVideoName] = useState("Chưa có phim được import");
   const [targetMinutes, setTargetMinutes] = useState(8);
   const [style, setStyle] = useState<ReviewDraftRequest["style"]>("story");
@@ -32,6 +34,8 @@ export const MovieReview = React.memo(function MovieReview() {
   const [isClearingHistory, setClearingHistory] = useState(false);
   const [job, setJob] = useState<ReviewDraftJob | null>(null);
   const [reviewJobs, setReviewJobs] = useState<ReviewDraftJob[]>([]);
+  const [previewMode, setPreviewMode] = useState<"source" | "output">("source");
+  const [selectedBeatIndex, setSelectedBeatIndex] = useState(0);
   const [message, setMessage] = useState<string | null>(null);
 
   const refreshReviewJobs = useCallback(async () => {
@@ -44,7 +48,15 @@ export const MovieReview = React.memo(function MovieReview() {
     let cancelled = false;
     refreshReviewJobs().then((items) => {
       if (!cancelled && items.length > 0) {
-        setJob((current) => current ?? items[0]);
+        setJob((current) => {
+          if (current) return current;
+          const item = items[0];
+          setVideoPath(item.request.video_path);
+          setSourceVideoUrl(sourceUrlFromPath(item.request.video_path));
+          setVideoName(fileNameFromPath(item.request.video_path));
+          setPreviewMode(item.result?.output_video_url ? "output" : "source");
+          return item;
+        });
       }
     }).catch((error) => {
       setMessage(error instanceof Error ? error.message : "Không thể tải lịch sử review job.");
@@ -93,7 +105,10 @@ export const MovieReview = React.memo(function MovieReview() {
         throw new Error("Backend không trả về đường dẫn phim đã import.");
       }
       setVideoPath(uploaded.local_file_path);
+      setSourceVideoUrl(toAbsoluteApiUrl(uploaded.url));
       setVideoName(file.name);
+      setPreviewMode("source");
+      setSelectedBeatIndex(0);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Import phim thất bại.");
       setUploadProgress(null);
@@ -120,6 +135,7 @@ export const MovieReview = React.memo(function MovieReview() {
         notes: notes.trim() || null,
       });
       setJob(created);
+      setSelectedBeatIndex(0);
       await refreshReviewJobs();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Không thể tạo review job.");
@@ -131,8 +147,36 @@ export const MovieReview = React.memo(function MovieReview() {
   const selectReviewJob = useCallback((item: ReviewDraftJob) => {
     setJob(item);
     setVideoPath(item.request.video_path);
+    setSourceVideoUrl(sourceUrlFromPath(item.request.video_path));
     setVideoName(fileNameFromPath(item.request.video_path));
+    setPreviewMode(item.result?.output_video_url ? "output" : "source");
+    setSelectedBeatIndex(0);
   }, []);
+
+  const result = job?.result ?? null;
+  const outputVideoUrl = result?.output_video_url ? toAbsoluteApiUrl(result.output_video_url) : null;
+  const activePreviewUrl = previewMode === "output" ? outputVideoUrl : sourceVideoUrl;
+  const selectedBeat = result?.beats[selectedBeatIndex] ?? null;
+
+  const jumpToBeat = useCallback((index: number) => {
+    const beat = result?.beats[index];
+    if (!beat || !previewRef.current) return;
+    setSelectedBeatIndex(index);
+    if (previewMode !== "source") {
+      setPreviewMode("source");
+      window.setTimeout(() => {
+        if (previewRef.current && beat.start_seconds != null) {
+          previewRef.current.currentTime = Math.max(0, beat.start_seconds);
+          previewRef.current.play().catch(() => undefined);
+        }
+      }, 80);
+      return;
+    }
+    if (beat.start_seconds != null) {
+      previewRef.current.currentTime = Math.max(0, beat.start_seconds);
+      previewRef.current.play().catch(() => undefined);
+    }
+  }, [previewMode, result]);
 
   const clearReviewHistory = useCallback(async () => {
     const confirmed = window.confirm("Đưa toàn bộ file review job vào Thùng rác và xóa lịch sử review?");
@@ -144,6 +188,7 @@ export const MovieReview = React.memo(function MovieReview() {
       const result = await clearReviewDraftJobs();
       setReviewJobs([]);
       setJob(null);
+      setSelectedBeatIndex(0);
       setMessage(result.message || "Đã xóa lịch sử review và đưa file vào Thùng rác.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Không thể xóa lịch sử review.");
@@ -156,8 +201,6 @@ export const MovieReview = React.memo(function MovieReview() {
     if (!value) return;
     await navigator.clipboard.writeText(value);
   }, []);
-
-  const result = job?.result ?? null;
 
   return (
     <div className="ios-view-transition">
@@ -285,7 +328,18 @@ export const MovieReview = React.memo(function MovieReview() {
           </div>
         </section>
 
-        <section className="ios-card">
+        <div className="review-preview-stack">
+          <ReviewLivePreview
+            ref={previewRef}
+            mode={previewMode}
+            onModeChange={setPreviewMode}
+            sourceVideoUrl={sourceVideoUrl}
+            outputVideoUrl={outputVideoUrl}
+            activeVideoUrl={activePreviewUrl}
+            selectedBeat={selectedBeat}
+          />
+
+          <section className="ios-card">
           <div className="section-title">
             <span>02</span>
             <h2>Bản review AI</h2>
@@ -329,11 +383,11 @@ export const MovieReview = React.memo(function MovieReview() {
                 </div>
                 <div className="review-beats">
                   {result.beats.map((beat, index) => (
-                    <div key={`${beat.time_hint}-${index}`} className="review-beat">
+                    <button key={`${beat.time_hint}-${index}`} type="button" className={`review-beat ${index === selectedBeatIndex ? "active" : ""}`} onClick={() => jumpToBeat(index)}>
                       <strong>{beat.time_hint}</strong>
                       <span>{beat.purpose}</span>
                       <p>{beat.narration}</p>
-                    </div>
+                    </button>
                   ))}
                 </div>
               </div>
@@ -341,9 +395,55 @@ export const MovieReview = React.memo(function MovieReview() {
               <ReviewBlock title="Hashtag" value={result.tags.map((tag) => `#${tag.replace(/^#+/, "")}`).join(" ")} onCopy={copyText} />
             </div>
           )}
-        </section>
+          </section>
+        </div>
       </div>
     </div>
+  );
+});
+
+const ReviewLivePreview = React.forwardRef<HTMLVideoElement, {
+  mode: "source" | "output";
+  onModeChange: (mode: "source" | "output") => void;
+  sourceVideoUrl: string | null;
+  outputVideoUrl: string | null;
+  activeVideoUrl: string | null;
+  selectedBeat: ReviewBeat | null;
+}>(function ReviewLivePreview({ mode, onModeChange, sourceVideoUrl, outputVideoUrl, activeVideoUrl, selectedBeat }, ref) {
+  return (
+    <section className="ios-card review-live-card">
+      <div className="section-title">
+        <span>Live</span>
+        <h2>Live view phim</h2>
+      </div>
+      <div className="review-preview-tabs">
+        <button type="button" className={mode === "source" ? "active" : ""} onClick={() => onModeChange("source")} disabled={!sourceVideoUrl}>
+          Phim gốc
+        </button>
+        <button type="button" className={mode === "output" ? "active" : ""} onClick={() => onModeChange("output")} disabled={!outputVideoUrl}>
+          Video review
+        </button>
+      </div>
+      <div className="video-frame review-live-frame">
+        {activeVideoUrl ? (
+          <video ref={ref} className="preview-video-element" src={activeVideoUrl} controls playsInline />
+        ) : (
+          <div className="review-live-empty">
+            <Video size={36} />
+            <strong>Import phim để xem live view</strong>
+            <span>Khi có bản review, bạn có thể đổi qua tab Video review.</span>
+          </div>
+        )}
+      </div>
+      <div className="review-preview-meta">
+        <strong>{mode === "output" ? "Đang xem video review đã render" : "Đang xem phim gốc để so cảnh"}</strong>
+        {selectedBeat ? (
+          <span>{selectedBeat.time_hint} • {selectedBeat.purpose}</span>
+        ) : (
+          <span>Click một beat bên dưới để nhảy tới đoạn cần kiểm tra.</span>
+        )}
+      </div>
+    </section>
   );
 });
 
@@ -374,6 +474,15 @@ function formatBytes(bytes: number): string {
 function fileNameFromPath(value: string): string {
   const normalized = value.replace(/\\/g, "/");
   return normalized.split("/").pop() || value || "Phim đã import";
+}
+
+function sourceUrlFromPath(value: string): string | null {
+  const normalized = value.replace(/\\/g, "/");
+  const marker = "/uploads/videos/";
+  const markerIndex = normalized.lastIndexOf(marker);
+  if (markerIndex < 0) return null;
+  const fileName = normalized.slice(markerIndex + marker.length);
+  return fileName ? toAbsoluteApiUrl(`/api/uploads/video/${encodeURIComponent(fileName)}`) : null;
 }
 
 function formatDateTime(value: string): string {
