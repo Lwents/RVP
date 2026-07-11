@@ -28,6 +28,28 @@ const languages = [
   { value: "vi", label: "Tiếng Việt" },
 ] as const;
 
+type AppTab = "workspace" | "youtube" | "review";
+
+const APP_TAB_STORAGE_KEY = "auto-translate-ai.activeTab";
+const appTabs: AppTab[] = ["workspace", "youtube", "review"];
+
+function isAppTab(value: string | null): value is AppTab {
+  return Boolean(value && appTabs.includes(value as AppTab));
+}
+
+function tabFromHash(hash: string): AppTab | null {
+  const value = hash.replace(/^#\/?/, "").trim();
+  return isAppTab(value) ? value : null;
+}
+
+function readInitialTab(): AppTab {
+  if (typeof window === "undefined") return "workspace";
+  const hashTab = tabFromHash(window.location.hash);
+  if (hashTab) return hashTab;
+  const storedTab = window.localStorage.getItem(APP_TAB_STORAGE_KEY);
+  return isAppTab(storedTab) ? storedTab : "workspace";
+}
+
 const defaultForm: DubbingRequest = {
   source_url: "",
   local_file_path: "",
@@ -124,9 +146,30 @@ export function App() {
   const [videoName, setVideoName] = useState("Chưa có video được import");
   const [previewVideoUrl, setPreviewVideoUrl] = useState<string | null>(null);
   const [isPreviewLoading, setPreviewLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState<"workspace" | "youtube" | "review">("workspace");
+  const [activeTab, setActiveTab] = useState<AppTab>(() => readInitialTab());
 
   const videoInputRef = useRef<HTMLInputElement | null>(null);
+
+  const goToTab = useCallback((tab: AppTab) => {
+    setActiveTab(tab);
+    window.localStorage.setItem(APP_TAB_STORAGE_KEY, tab);
+    const nextHash = `#${tab}`;
+    if (window.location.hash !== nextHash) {
+      window.history.pushState(null, "", nextHash);
+    }
+  }, []);
+
+  useEffect(() => {
+    const syncTabFromHash = () => {
+      const nextTab = tabFromHash(window.location.hash);
+      if (!nextTab) return;
+      setActiveTab(nextTab);
+      window.localStorage.setItem(APP_TAB_STORAGE_KEY, nextTab);
+    };
+
+    window.addEventListener("hashchange", syncTabFromHash);
+    return () => window.removeEventListener("hashchange", syncTabFromHash);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -404,19 +447,19 @@ export function App() {
           </span>
           <button
             className={`nav-tab ios-button ios-button-secondary ${activeTab === 'youtube' ? 'active' : ''}`}
-            onClick={() => setActiveTab('youtube')}
+            onClick={() => goToTab('youtube')}
           >
             <Youtube size={16} /> YouTube Stats
           </button>
           <button
             className={`nav-tab ios-button ios-button-secondary ${activeTab === 'review' ? 'active' : ''}`}
-            onClick={() => setActiveTab('review')}
+            onClick={() => goToTab('review')}
           >
             Review phim
           </button>
           <button
             className={`nav-tab ios-button ios-button-secondary ${activeTab === 'workspace' ? 'active' : ''}`}
-            onClick={() => setActiveTab('workspace')}
+            onClick={() => goToTab('workspace')}
           >
             Workspace
           </button>
