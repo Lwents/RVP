@@ -103,6 +103,11 @@ async def get_or_create_subtitles(
     source_video: Path | None = None,
     asr_timeout_seconds: int | None = None,
 ) -> Path:
+    target_file = work_dir / f"subtitles.{settings.target_language}.srt"
+    if target_file.exists() and target_file.stat().st_size > 0:
+        progress("Dùng lại phụ đề đã dịch xong", 69)
+        return target_file
+
     if source_url and settings.prefer_youtube_subtitles:
         try:
             subtitle_file = await download_platform_subtitles(source_url, work_dir, progress)
@@ -110,7 +115,12 @@ async def get_or_create_subtitles(
         except SubtitleSourceError:
             progress("Nền tảng không có phụ đề phù hợp, tự tạo phụ đề bằng Whisper", 58)
 
-    asr_task = get_asr_engine().transcribe_to_srt(audio_file, work_dir / "subtitles.whisper.srt", source_language)
+    whisper_file = work_dir / "subtitles.whisper.srt"
+    if whisper_file.exists() and whisper_file.stat().st_size > 0:
+        progress("Dùng lại phụ đề Whisper đã nhận diện xong", 66)
+        return await _prepare_target_subtitles(whisper_file, work_dir, source_language, progress, source_video)
+
+    asr_task = get_asr_engine().transcribe_to_srt(audio_file, whisper_file, source_language)
     subtitle_file = await _run_with_heartbeat(
         asr_task,
         progress,
@@ -120,6 +130,13 @@ async def get_or_create_subtitles(
         asr_timeout_seconds or settings.asr_timeout_seconds,
     )
     return await _prepare_target_subtitles(subtitle_file, work_dir, source_language, progress, source_video)
+
+
+def asr_timeout_for_duration(video_duration_seconds: float) -> int:
+    if video_duration_seconds <= 0:
+        return max(settings.asr_timeout_seconds, 1800)
+    duration_based_timeout = int(video_duration_seconds * 2.5)
+    return min(max(settings.asr_timeout_seconds, duration_based_timeout, 1800), 6 * 60 * 60)
 
 
 async def _prepare_target_subtitles(

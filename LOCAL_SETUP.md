@@ -126,7 +126,7 @@ Cau hinh quan trong hien tai:
 
 ```env
 AUTO_TRANSLATE_FFMPEG_PATH=C:\Users\kirit\Documents\AI_Video\tools\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe
-AUTO_TRANSLATE_TRANSLATION_ENGINE=google
+AUTO_TRANSLATE_TRANSLATION_ENGINE=gemini
 AUTO_TRANSLATE_VOICE_ENGINE=edge
 AUTO_TRANSLATE_WHISPER_MODEL=medium
 AUTO_TRANSLATE_WHISPER_DEVICE=cuda

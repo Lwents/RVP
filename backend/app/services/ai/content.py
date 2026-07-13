@@ -84,7 +84,7 @@ async def generate_movie_review_plan(
 
     try:
         response = await client.chat.completions.create(
-            model="ag/gemini-3.5-flash-low",
+            model=settings.ai_model,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": f"Transcript phim:\n{clean_transcript[:18000]}"},
@@ -173,7 +173,7 @@ async def generate_video_details(transcript: str, custom_prompt: str | None = No
 
     try:
         response = await client.chat.completions.create(
-            model="ag/gemini-3.5-flash-low",
+            model=settings.ai_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Transcript của video:\n{clean_transcript[:8000]}"}

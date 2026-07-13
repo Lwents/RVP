@@ -68,10 +68,10 @@ const defaultForm: DubbingRequest = {
   hard_subtitles: true,
   source_has_hard_subtitles: false,
   subtitle_x_percent: 50,
-  subtitle_y_percent: 78,
-  subtitle_font_size: 48,
-  subtitle_box_enabled: true,
-  subtitle_box_opacity: 55,
+  subtitle_y_percent: 92,
+  subtitle_font_size: 64,
+  subtitle_box_enabled: false,
+  subtitle_box_opacity: 0,
   subtitle_box_height_percent: 20,
   source_language: "auto",
   ducking_volume_db: -12,
@@ -84,24 +84,25 @@ const defaultForm: DubbingRequest = {
   cinematic_bars_height_percent: 10,
   blur_box_enabled: false,
   blur_box_y_percent: 80,
-  blur_box_height_percent: 15,
+  blur_box_height_percent: 13,
   custom_blur_boxes: [],
   watermark_file_name: null,
 };
 
 function normalizeBlurBand(yPercent: number, heightPercent: number) {
-  const height = Math.max(8, Math.min(18, Math.round(heightPercent)));
-  const y = Math.max(74, Math.min(90, Math.round(yPercent)));
+  const height = Math.max(6, Math.min(14, Math.round(heightPercent)));
+  const y = Math.max(72, Math.min(92, Math.round(yPercent)));
   const safeY = Math.min(y, 97 - height);
   return {
     y: safeY,
     height,
-    subtitleY: Math.max(82, Math.min(90, Math.round(safeY + height / 2 - 1))),
+    subtitleY: 92,
   };
 }
 
 function suggestSubtitleFontSize(blurHeightPercent: number) {
-  return Math.max(32, Math.min(42, Math.round(blurHeightPercent * 3.8 + 4)));
+  void blurHeightPercent;
+  return 64;
 }
 
 function needsYoutubeMetadata(job: JobProgress): boolean {
@@ -203,7 +204,9 @@ export function App() {
   }, [form.local_file_path, form.source_url, isSubmitting]);
 
   const refreshJobs = useCallback(async () => {
-    const nextJobs = await listJobs();
+    const nextJobs = (await listJobs()).sort(
+      (a, b) => new Date(b.completed_at || b.updated_at).getTime() - new Date(a.completed_at || a.updated_at).getTime(),
+    );
     setJobs(nextJobs);
     return nextJobs;
   }, []);
@@ -245,7 +248,15 @@ export function App() {
         }
         if (cancelled) return;
         setActiveJob(job);
-        setJobs((previous) => [job, ...previous.filter((item) => item.job_id !== job.job_id)].slice(0, 8));
+        setJobs((previous) =>
+          [job, ...previous.filter((item) => item.job_id !== job.job_id)]
+            .sort((a, b) => {
+              const aTime = new Date(a.completed_at || a.updated_at).getTime();
+              const bTime = new Date(b.completed_at || b.updated_at).getTime();
+              return bTime - aTime;
+            })
+            .slice(0, 8),
+        );
       } catch (error) {
         if (!cancelled) setMessage(error instanceof Error ? error.message : "Không thể lấy trạng thái job.");
       }
@@ -435,7 +446,8 @@ export function App() {
         setField("output_resolution", "original");
         setField("cinematic_bars_enabled", false);
         setField("subtitle_x_percent", 50);
-        setField("subtitle_font_size", 40);
+        setField("subtitle_y_percent", 92);
+        setField("subtitle_font_size", 64);
         setField("subtitle_box_enabled", false);
         setField("subtitle_box_opacity", 0);
         setField("subtitle_box_height_percent", 22);
@@ -454,18 +466,14 @@ export function App() {
           setField("custom_blur_boxes", result.config.custom_blur_boxes);
           setField("subtitle_font_size", subtitleFontSize);
 
-          if (typeof result.config.subtitle_y_percent === "number") {
-            setField("subtitle_y_percent", Math.max(82, Math.min(90, Math.round(result.config.subtitle_y_percent - 1))));
-          } else {
-            setField("subtitle_y_percent", normalized.subtitleY);
-          }
+          setField("subtitle_y_percent", 92);
         } else {
           const normalized = normalizeBlurBand(82, 12);
           const subtitleFontSize = suggestSubtitleFontSize(normalized.height);
           setField("blur_box_enabled", true);
           setField("blur_box_y_percent", normalized.y);
           setField("blur_box_height_percent", normalized.height);
-          setField("subtitle_y_percent", normalized.subtitleY);
+          setField("subtitle_y_percent", 92);
           setField("subtitle_font_size", subtitleFontSize);
           setField("custom_blur_boxes", result.regions.map(r => ({
             x_percent: r.x_percent,
@@ -478,9 +486,7 @@ export function App() {
         // 2. Tự động dịch chuyển phụ đề mới đè lên vùng mờ chữ Trung dưới đáy
         const subRegion = result.config ? undefined : result.regions.find(r => r.label?.toLowerCase().includes("sub"));
         if (subRegion) {
-          // Tính tâm dọc của vùng mờ để đặt chữ phụ đề đè lên
-          const targetY = Math.max(82, Math.min(90, Math.round(subRegion.y_percent + subRegion.height_percent / 2 - 1)));
-          setField("subtitle_y_percent", targetY);
+          setField("subtitle_y_percent", 92);
         }
 
         // 3. Tự động chèn logo kênh sang góc trái (nếu tìm thấy logo trong thư mục Pictures)
@@ -494,7 +500,10 @@ export function App() {
         }
 
         const notes = result.review?.notes?.length ? ` ${result.review.notes.join(" ")}` : "";
-        setMessage(`AI đã tự cấu hình đầy đủ: phụ đề, giọng đọc, Demucs, thanh mờ chữ gốc, logo và metadata YouTube. ${result.count} vùng hợp lý.${notes}`);
+        const engineMessage = result.engine_used === "ai"
+          ? `Gemini (${result.ai_model}) đã phân tích trực tiếp video.`
+          : `Gemini không trả về kết quả hợp lệ; đã dùng nhận diện local.${result.ai_error ? ` Chi tiết: ${result.ai_error}` : ""}`;
+        setMessage(`${engineMessage} Đã tự cấu hình đầy đủ: phụ đề, giọng đọc, Demucs, thanh mờ chữ gốc, logo và metadata YouTube. ${result.count} vùng hợp lý.${notes}`);
       }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "AI phân tích thất bại.");
@@ -1283,16 +1292,19 @@ const HistoryPanel = React.memo(function HistoryPanel({ jobs, onSelect, onClear,
                 <strong style={{ fontSize: "0.95rem" }}>{job.stage}</strong>
                 <span style={{ fontSize: "0.85rem", color: "#86868b" }}>
                   {job.progress}% - {languageLabel(job.request.source_language)}
-                  {job.status === "completed" && job.created_at && job.updated_at && (
-                    <>
-                      {" • "}
-                      {(() => {
-                        const diffSecs = Math.floor((new Date(job.updated_at).getTime() - new Date(job.created_at).getTime()) / 1000);
-                        return diffSecs > 60 ? `${Math.floor(diffSecs / 60)} phút ${diffSecs % 60} giây` : `${diffSecs} giây`;
-                      })()}
-                    </>
-                  )}
                 </span>
+                {job.status === "completed" && (job.completed_at || job.updated_at) && (
+                  <span style={{ fontSize: "0.78rem", color: "#a1a1a6" }}>
+                    Hoàn tất: {new Date(job.completed_at || job.updated_at).toLocaleString("vi-VN", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      second: "2-digit",
+                      day: "2-digit",
+                      month: "2-digit",
+                      year: "numeric",
+                    })}
+                  </span>
+                )}
               </div>
             </button>
           ))}

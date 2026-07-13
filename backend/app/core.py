@@ -1,4 +1,9 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
@@ -8,12 +13,12 @@ class Settings(BaseSettings):
         "http://127.0.0.1:4173",
         "http://localhost:4173",
     ]
-    storage_dir: str = "storage"
+    storage_dir: str = str(BACKEND_DIR / "storage")
     ai_engine: str = "passthrough"
-    translation_engine: str = "passthrough"
+    translation_engine: str = "gemini"
     voice_engine: str = "disabled"
     target_language: str = "vi"
-    ffmpeg_path: str | None = r"C:\Users\kirit\Documents\AI_Video\tools\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe"
+    ffmpeg_path: str | None = None
     video_encoder: str = "h264_nvenc"
     video_crf: int = 23
     video_preset: str = "slow"
@@ -49,10 +54,20 @@ class Settings(BaseSettings):
     
     ninerouter_api_url: str = "http://localhost:20128/v1"
     ninerouter_api_key: str | None = None
+    # One source of truth for every 9router/Gemini feature in this project.
+    ai_model: str = "ag/gemini-pro-agent"
+    review_scene_batch_size: int = 4
+    review_keyframes_per_scene: int = 3
+    review_max_scenes: int = 240
+    review_quality_threshold: int = 90
     youtube_client_secrets_file: str = "client_secret.json"
     youtube_credentials_file: str = "storage/youtube_credentials.json"
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="AUTO_TRANSLATE_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=BACKEND_DIR / ".env",
+        env_prefix="AUTO_TRANSLATE_",
+        extra="ignore",
+    )
 
 
 settings = Settings()

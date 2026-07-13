@@ -2,6 +2,7 @@
 Subtitle timing utilities: parse SRT, normalize, group events.
 """
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +15,7 @@ class SubtitleEvent:
 
 
 def parse_srt(path: Path) -> list[SubtitleEvent]:
-    content = path.read_text(encoding="utf-8-sig", errors="ignore")
+    content = unicodedata.normalize("NFC", path.read_text(encoding="utf-8-sig"))
     blocks = re.split(r"\n\s*\n", content.strip())
     events: list[SubtitleEvent] = []
     for block in blocks:

@@ -24,10 +24,12 @@ class PublishTarget(str, Enum):
 
 
 class CustomBlurBox(BaseModel):
-    x_percent: int = Field(ge=0, le=100)
-    y_percent: int = Field(ge=0, le=100)
-    width_percent: int = Field(ge=1, le=100)
-    height_percent: int = Field(ge=1, le=100)
+    x_percent: float = Field(ge=0, le=100)
+    y_percent: float = Field(ge=0, le=100)
+    width_percent: float = Field(ge=1, le=100)
+    height_percent: float = Field(ge=1, le=100)
+    start_seconds: float | None = Field(default=None, ge=0)
+    end_seconds: float | None = Field(default=None, ge=0)
 
 
 class JobStatus(str, Enum):
@@ -49,9 +51,9 @@ class DubbingRequest(BaseModel):
     hard_subtitles: bool = True
     source_has_hard_subtitles: bool = False
     subtitle_x_percent: int = Field(default=50, ge=0, le=100)
-    subtitle_y_percent: int = Field(default=78, ge=8, le=94)
-    subtitle_font_size: int = Field(default=32, ge=16, le=72)
-    subtitle_box_enabled: bool = True
+    subtitle_y_percent: int = Field(default=92, ge=8, le=94)
+    subtitle_font_size: int = Field(default=64, ge=16, le=120)
+    subtitle_box_enabled: bool = False
     subtitle_box_opacity: int = Field(default=55, ge=0, le=100)
     subtitle_box_height_percent: int = Field(default=20, ge=8, le=45)
     source_language: LanguageOption = "auto"
@@ -64,7 +66,7 @@ class DubbingRequest(BaseModel):
     cinematic_bars_height_percent: int = Field(default=10, ge=0, le=40)
     blur_box_enabled: bool = False
     blur_box_y_percent: int = Field(default=80, ge=0, le=100)
-    blur_box_height_percent: int = Field(default=15, ge=5, le=100)
+    blur_box_height_percent: int = Field(default=13, ge=5, le=100)
     custom_blur_boxes: list[CustomBlurBox] = Field(default_factory=list)
     watermark_file_name: str | None = None
     output_resolution: str = "original"
@@ -91,6 +93,7 @@ class JobProgress(BaseModel):
     request: DubbingRequest
     created_at: datetime
     updated_at: datetime
+    completed_at: datetime | None = None
     output_video_url: str | None = None
     output_file_path: str | None = None
     seo_title: str | None = None

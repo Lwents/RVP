@@ -1,6 +1,8 @@
 from pathlib import Path
 from uuid import uuid4
 from datetime import UTC, datetime
+import asyncio
+import shutil
 
 import cv2
 import numpy as np
@@ -10,7 +12,17 @@ from pydantic import BaseModel, Field
 import json
 
 from app.core import settings
-from app.models.job import BgmMode, CustomBlurBox, DubbingRequest, JobCreateResponse, JobProgress, UploadResponse
+from app.models.job import BgmMode, CustomBlurBox, DubbingRequest, JobCreateResponse, JobProgress, JobStatus, UploadResponse
+from app.models.review import (
+    AnalyzedScene,
+    EditDecision,
+    NarrationSegment,
+    QualityIssue,
+    ReviewQualityReport,
+    SceneCandidate,
+    StoryEvent,
+    VerifiedReviewPackage,
+)
 from app.services.processor import process_job
 from app.services.store import job_store
 from app.services.media.downloader import download_preview_video
@@ -28,10 +40,10 @@ class ReviewDraftRequest(BaseModel):
     notes: str | None = None
     hard_subtitles: bool = True
     subtitle_x_percent: int = Field(default=50, ge=0, le=100)
-    subtitle_y_percent: int = Field(default=84, ge=8, le=94)
-    subtitle_font_size: int = Field(default=38, ge=16, le=72)
-    subtitle_box_enabled: bool = True
-    subtitle_box_opacity: int = Field(default=45, ge=0, le=100)
+    subtitle_y_percent: int = Field(default=92, ge=8, le=94)
+    subtitle_font_size: int = Field(default=64, ge=16, le=120)
+    subtitle_box_enabled: bool = False
+    subtitle_box_opacity: int = Field(default=0, ge=0, le=100)
     subtitle_box_height_percent: int = Field(default=18, ge=8, le=45)
     logo_enabled: bool = True
     logo_width: int = Field(default=86, ge=32, le=800)
@@ -41,7 +53,7 @@ class ReviewDraftRequest(BaseModel):
     cinematic_bars_height_percent: int = Field(default=10, ge=0, le=40)
     blur_box_enabled: bool = False
     blur_box_y_percent: int = Field(default=80, ge=0, le=100)
-    blur_box_height_percent: int = Field(default=15, ge=5, le=100)
+    blur_box_height_percent: int = Field(default=13, ge=5, le=100)
     custom_blur_boxes: list[CustomBlurBox] = Field(default_factory=list)
     watermark_file_name: str | None = None
     output_resolution: str = "original"
@@ -53,6 +65,16 @@ class ReviewBeatResponse(BaseModel):
     end_seconds: float | None = None
     purpose: str
     narration: str
+    segment_id: str | None = None
+    event_id: str | None = None
+    scene_id: str | None = None
+    voice_start: float | None = None
+    voice_end: float | None = None
+    match_score: float | None = None
+    match_reason: str | None = None
+    selected_candidate_id: str | None = None
+    thumbnail_url: str | None = None
+    candidates: list[SceneCandidate] = Field(default_factory=list)
 
 
 class ReviewDraftResult(BaseModel):
@@ -67,6 +89,12 @@ class ReviewDraftResult(BaseModel):
     subtitle_file_path: str | None = None
     output_video_url: str | None = None
     output_file_path: str | None = None
+    scenes: list[AnalyzedScene] = Field(default_factory=list)
+    events: list[StoryEvent] = Field(default_factory=list)
+    narration_segments: list[NarrationSegment] = Field(default_factory=list)
+    edit_decision_list: list[EditDecision] = Field(default_factory=list)
+    quality_report: ReviewQualityReport | None = None
+    artifact_paths: dict[str, str] = Field(default_factory=dict)
 
 
 class ReviewDraftJob(BaseModel):
@@ -79,6 +107,14 @@ class ReviewDraftJob(BaseModel):
     updated_at: datetime
     result: ReviewDraftResult | None = None
     error: str | None = None
+
+
+class ReviewSegmentPatchRequest(BaseModel):
+    narration: str | None = None
+    candidate_id: str | None = None
+    scene_id: str | None = None
+    start_seconds: float | None = Field(default=None, ge=0)
+    end_seconds: float | None = Field(default=None, ge=0)
 
 
 REVIEW_JOBS_INDEX_FILE = Path(settings.storage_dir) / "review_jobs_index.json"
@@ -297,12 +333,155 @@ def _update_review_job(job_id: str, **changes: object) -> ReviewDraftJob:
     return updated
 
 
+def _review_decisions_with_urls(job_id: str, decisions: list[EditDecision]) -> list[EditDecision]:
+    def with_url(candidate: SceneCandidate) -> SceneCandidate:
+        if not candidate.thumbnail_path:
+            return candidate
+        file_name = Path(candidate.thumbnail_path).name
+        return candidate.model_copy(
+            update={"thumbnail_url": f"/api/review/jobs/{job_id}/thumbnails/{file_name}"}
+        )
+
+    return [
+        decision.model_copy(
+            update={
+                "source_clips": [with_url(candidate) for candidate in decision.source_clips],
+                "alternatives": [with_url(candidate) for candidate in decision.alternatives],
+            }
+        )
+        for decision in decisions
+    ]
+
+
+def _review_result_from_package(
+    job_id: str,
+    package: VerifiedReviewPackage,
+    subtitle_file_path: str | None = None,
+    output_file_path: str | None = None,
+) -> ReviewDraftResult:
+    segment_by_id = {segment.segment_id: segment for segment in package.narration_segments}
+    beats: list[ReviewBeatResponse] = []
+    for decision in package.edit_decision_list:
+        segment = segment_by_id.get(decision.segment_id)
+        selected = decision.source_clips[0] if decision.source_clips else None
+        if selected is None:
+            continue
+        beats.append(
+            ReviewBeatResponse(
+                time_hint=_format_review_time_hint(selected.start_seconds, selected.end_seconds),
+                start_seconds=selected.start_seconds,
+                end_seconds=selected.end_seconds,
+                purpose=segment.purpose if segment else "Minh họa sự kiện đã kiểm chứng",
+                narration=decision.narration,
+                segment_id=decision.segment_id,
+                event_id=decision.event_id,
+                scene_id=selected.scene_id,
+                voice_start=decision.voice_start,
+                voice_end=decision.voice_end,
+                match_score=selected.match_score,
+                match_reason=selected.match_reason,
+                selected_candidate_id=decision.selected_candidate_id,
+                thumbnail_url=selected.thumbnail_url,
+                candidates=decision.alternatives,
+            )
+        )
+    return ReviewDraftResult(
+        title=package.title,
+        target_minutes=package.target_minutes,
+        hook=package.hook,
+        summary=package.summary,
+        narration_script=package.narration_script,
+        beats=beats,
+        thumbnail_text=package.thumbnail_text,
+        tags=package.tags,
+        subtitle_file_path=subtitle_file_path,
+        output_video_url=f"/api/review/jobs/{job_id}/download" if output_file_path else None,
+        output_file_path=output_file_path,
+        scenes=package.scenes,
+        events=package.events,
+        narration_segments=package.narration_segments,
+        edit_decision_list=package.edit_decision_list,
+        quality_report=package.quality_report,
+        artifact_paths=package.artifact_paths,
+    )
+
+
+def _review_scene_hints(decisions: list[EditDecision]) -> list[dict]:
+    hints: list[dict] = []
+    for decision in decisions:
+        if not decision.source_clips:
+            continue
+        selected = decision.source_clips[0]
+        hints.append(
+            {
+                "time_hint": _format_review_time_hint(selected.start_seconds, selected.end_seconds),
+                "start_seconds": selected.start_seconds,
+                "end_seconds": selected.end_seconds,
+                "voice_start": decision.voice_start,
+                "voice_end": decision.voice_end,
+                "duration_seconds": max(0.8, decision.voice_end - decision.voice_start),
+                "narration": decision.narration,
+            }
+        )
+    return hints
+
+
+def _format_review_time_hint(start: float, end: float) -> str:
+    def stamp(value: float) -> str:
+        seconds = max(0, int(value))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    return f"{stamp(start)}-{stamp(end)}"
+
+
+def _build_review_render_request(request: ReviewDraftRequest, source_video: Path) -> DubbingRequest:
+    from app.models.job import VoiceGender
+
+    return DubbingRequest(
+        local_file_path=str(source_video),
+        voice_gender=VoiceGender.female,
+        bgm_mode=BgmMode.none,
+        use_demucs=True,
+        video_speed=1.0,
+        auto_publish=[],
+        clone_voice=False,
+        hard_subtitles=request.hard_subtitles,
+        source_has_hard_subtitles=False,
+        subtitle_x_percent=request.subtitle_x_percent,
+        subtitle_y_percent=request.subtitle_y_percent,
+        subtitle_font_size=request.subtitle_font_size,
+        subtitle_box_enabled=request.subtitle_box_enabled,
+        subtitle_box_opacity=request.subtitle_box_opacity,
+        subtitle_box_height_percent=request.subtitle_box_height_percent,
+        source_language=request.source_language,
+        ducking_volume_db=-12,
+        output_resolution=request.output_resolution,
+        logo_enabled=request.logo_enabled,
+        logo_width=request.logo_width,
+        logo_x_percent=request.logo_x_percent,
+        logo_y_percent=request.logo_y_percent,
+        cinematic_bars_enabled=request.cinematic_bars_enabled,
+        cinematic_bars_height_percent=request.cinematic_bars_height_percent,
+        blur_box_enabled=request.blur_box_enabled,
+        blur_box_y_percent=request.blur_box_y_percent,
+        blur_box_height_percent=request.blur_box_height_percent,
+        custom_blur_boxes=request.custom_blur_boxes,
+        watermark_file_name=request.watermark_file_name,
+    )
+
+
 async def _process_review_draft_job(job_id: str) -> None:
-    from app.services.ai.content import generate_movie_review_plan
+    from app.services.ai.review_analysis import (
+        build_verified_review_package,
+        replace_failed_decisions_with_alternatives,
+        rescale_edl_voice_timeline,
+        verify_rendered_review,
+    )
     from app.services.ai.voice import get_voice_engine
     from app.services.media.ffmpeg import extract_audio, find_ffmpeg, probe_video_duration
     from app.services.media.review_renderer import render_movie_review_video, write_review_subtitles
-    from app.services.media.scene_alignment import align_review_beats_to_transcript
     from app.models.job import VoiceGender
     from app.services.subtitles.source import get_or_create_subtitles
 
@@ -327,92 +506,102 @@ async def _process_review_draft_job(job_id: str) -> None:
         asr_timeout_seconds = _review_asr_timeout(video_duration)
 
         _update_review_job(job_id, progress=35, stage="Tao transcript va phu de tam")
-        subtitle_file = await get_or_create_subtitles(
-            None,
-            audio_file,
-            work_dir,
-            job.request.source_language,
-            progress,
+        try:
+            subtitle_file = await get_or_create_subtitles(
+                None,
+                audio_file,
+                work_dir,
+                job.request.source_language,
+                progress,
+                source_video,
+                asr_timeout_seconds=asr_timeout_seconds,
+            )
+        except Exception as subtitle_error:
+            # Review analysis is multilingual and can continue from the source
+            # transcript if the contextual translation request temporarily fails.
+            source_candidates = [
+                work_dir / "subtitles.grouped.srt",
+                work_dir / "subtitles.whisper.srt",
+            ]
+            subtitle_file = next((path for path in source_candidates if path.exists() and path.stat().st_size > 0), None)
+            if subtitle_file is None:
+                raise
+            _update_review_job(
+                job_id,
+                progress=50,
+                stage=f"Dịch tạm lỗi; Gemini sẽ phân tích trực tiếp phụ đề nguồn ({subtitle_error})",
+            )
+
+        package = await build_verified_review_package(
             source_video,
-            asr_timeout_seconds=asr_timeout_seconds,
-        )
-
-        _update_review_job(job_id, progress=82, stage="AI viet kich ban review phim")
-        plan = await generate_movie_review_plan(
-            subtitle_file.read_text(encoding="utf-8"),
-            target_minutes=job.request.target_minutes,
-            style=job.request.style,
-            custom_prompt=job.request.notes,
-        )
-        ai_scene_hints = [
-            {
-                "time_hint": beat.time_hint,
-                "start_seconds": beat.start_seconds,
-                "end_seconds": beat.end_seconds,
-                "narration": beat.narration,
-            }
-            for beat in plan.beats
-        ]
-        scene_hints = align_review_beats_to_transcript(
-            plan.beats,
             subtitle_file,
+            work_dir,
             video_duration,
-            work_dir / "review_alignment.json",
-        ) or ai_scene_hints
+            job.request.target_minutes,
+            job.request.style,
+            job.request.notes,
+            lambda stage, percent: _update_review_job(
+                job_id,
+                stage=stage,
+                progress=max(50, min(82, percent)),
+            ),
+        )
 
-        _update_review_job(job_id, progress=84, stage="Tao giong doc review")
+        package.edit_decision_list = _review_decisions_with_urls(job_id, package.edit_decision_list)
+        preliminary_result = _review_result_from_package(job_id, package)
+        if not package.quality_report.passed:
+            _update_review_job(
+                job_id,
+                status="needs_review",
+                progress=82,
+                stage=(
+                    f"QA {package.quality_report.overall_score:.1f}/100: "
+                    "cần duyệt các câu màu đỏ trước khi render"
+                ),
+                result=preliminary_result,
+            )
+            return
+
+        _update_review_job(job_id, progress=84, stage="Tạo giọng đọc từ kịch bản đã kiểm chứng")
         narration_audio = await get_voice_engine().synthesize(
-            plan.narration_script,
+            package.narration_script,
             work_dir / "review_narration.mp3",
             VoiceGender.female,
             lambda stage, percent: _update_review_job(job_id, stage=stage, progress=max(84, min(90, percent))),
         )
-
-        _update_review_job(job_id, progress=90, stage="Cat ghep video review")
-        output_file = work_dir / "review_output.mp4"
-        render_request = DubbingRequest(
-            local_file_path=str(source_video),
-            voice_gender=VoiceGender.female,
-            bgm_mode=BgmMode.none,
-            use_demucs=True,
-            video_speed=1.0,
-            auto_publish=[],
-            clone_voice=False,
-            hard_subtitles=job.request.hard_subtitles,
-            source_has_hard_subtitles=False,
-            subtitle_x_percent=job.request.subtitle_x_percent,
-            subtitle_y_percent=job.request.subtitle_y_percent,
-            subtitle_font_size=job.request.subtitle_font_size,
-            subtitle_box_enabled=job.request.subtitle_box_enabled,
-            subtitle_box_opacity=job.request.subtitle_box_opacity,
-            subtitle_box_height_percent=job.request.subtitle_box_height_percent,
-            source_language=job.request.source_language,
-            ducking_volume_db=-12,
-            output_resolution=job.request.output_resolution,
-            logo_enabled=job.request.logo_enabled,
-            logo_width=job.request.logo_width,
-            logo_x_percent=job.request.logo_x_percent,
-            logo_y_percent=job.request.logo_y_percent,
-            cinematic_bars_enabled=job.request.cinematic_bars_enabled,
-            cinematic_bars_height_percent=job.request.cinematic_bars_height_percent,
-            blur_box_enabled=job.request.blur_box_enabled,
-            blur_box_y_percent=job.request.blur_box_y_percent,
-            blur_box_height_percent=job.request.blur_box_height_percent,
-            custom_blur_boxes=job.request.custom_blur_boxes,
-            watermark_file_name=job.request.watermark_file_name,
+        narration_duration = await probe_video_duration(ffmpeg, narration_audio)
+        if narration_duration <= 0:
+            raise RuntimeError("Không đo được thời lượng giọng đọc review.")
+        package.edit_decision_list = rescale_edl_voice_timeline(
+            package.edit_decision_list,
+            narration_duration,
         )
+        (work_dir / "edit_decision_list.json").write_text(
+            json.dumps(
+                [item.model_dump(mode="json") for item in package.edit_decision_list],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        scene_hints = _review_scene_hints(package.edit_decision_list)
+
+        _update_review_job(job_id, progress=90, stage="Cắt ghép theo EDL và đồng bộ giọng/cảnh")
+        draft_file = work_dir / "review_draft.mp4"
+        render_request = _build_review_render_request(job.request, source_video)
         review_subtitle_file = write_review_subtitles(
-            plan.narration_script,
+            package.narration_script,
             work_dir / "review_subtitles.srt",
             job.request.target_minutes,
             scene_hints,
+            target_seconds=narration_duration,
         )
         await render_movie_review_video(
             ffmpeg,
             source_video,
             narration_audio,
             review_subtitle_file,
-            output_file,
+            draft_file,
             work_dir,
             job.request.target_minutes,
             scene_hints,
@@ -420,26 +609,59 @@ async def _process_review_draft_job(job_id: str) -> None:
             render_request,
         )
 
-        result = ReviewDraftResult(
-            title=plan.title,
-            target_minutes=plan.target_minutes,
-            hook=plan.hook,
-            summary=plan.summary,
-            narration_script=plan.narration_script,
-            beats=[
-                ReviewBeatResponse(
-                    time_hint=beat.time_hint,
-                    start_seconds=scene_hints[index]["start_seconds"] if index < len(scene_hints) else beat.start_seconds,
-                    end_seconds=scene_hints[index]["end_seconds"] if index < len(scene_hints) else beat.end_seconds,
-                    purpose=beat.purpose,
-                    narration=beat.narration,
+        _update_review_job(job_id, progress=98, stage="Gemini kiểm tra lại hình và lời sau render")
+        post_report = await verify_rendered_review(draft_file, package, work_dir)
+        if not post_report.passed:
+            revised_decisions, changed = replace_failed_decisions_with_alternatives(
+                package.edit_decision_list,
+                post_report,
+            )
+            if changed:
+                package.edit_decision_list = revised_decisions
+                scene_hints = _review_scene_hints(package.edit_decision_list)
+                retry_file = work_dir / "review_draft_retry.mp4"
+                _update_review_job(job_id, progress=98, stage="Tự thay cảnh lỗi và render lại lần cuối")
+                await render_movie_review_video(
+                    ffmpeg,
+                    source_video,
+                    narration_audio,
+                    review_subtitle_file,
+                    retry_file,
+                    work_dir,
+                    job.request.target_minutes,
+                    scene_hints,
+                    lambda percent: _update_review_job(job_id, progress=max(98, min(99, percent))),
+                    render_request,
                 )
-                for index, beat in enumerate(plan.beats)
-            ],
-            thumbnail_text=plan.thumbnail_text,
-            tags=plan.tags,
+                post_report = await verify_rendered_review(retry_file, package, work_dir)
+                draft_file = retry_file
+
+        package.quality_report = post_report
+        package.artifact_paths["review_draft"] = str(draft_file)
+        package.artifact_paths["post_render_quality"] = str(work_dir / "quality_report_post_render.json")
+        if not post_report.passed:
+            result = _review_result_from_package(
+                job_id,
+                package,
+                subtitle_file_path=str(review_subtitle_file),
+            )
+            _update_review_job(
+                job_id,
+                status="needs_review",
+                progress=99,
+                stage=f"Post-render QA {post_report.overall_score:.1f}/100: chưa xuất bản final",
+                result=result,
+            )
+            return
+
+        output_file = work_dir / "review_final.mp4"
+        await asyncio.to_thread(shutil.copy2, draft_file, output_file)
+        package.artifact_paths["review_final"] = str(output_file)
+
+        result = _review_result_from_package(
+            job_id,
+            package,
             subtitle_file_path=str(review_subtitle_file),
-            output_video_url=f"/api/review/jobs/{job_id}/download",
             output_file_path=str(output_file),
         )
         _update_review_job(
@@ -457,6 +679,131 @@ async def _process_review_draft_job(job_id: str) -> None:
                 stage="Tao review phim that bai",
                 error=str(exc),
             )
+
+
+async def _render_existing_review_job(job_id: str) -> None:
+    from app.models.job import VoiceGender
+    from app.services.ai.review_analysis import (
+        rescale_edl_voice_timeline,
+        verify_rendered_review,
+    )
+    from app.services.ai.voice import get_voice_engine
+    from app.services.media.ffmpeg import find_ffmpeg, probe_video_duration
+    from app.services.media.review_renderer import render_movie_review_video, write_review_subtitles
+
+    job = review_draft_jobs.get(job_id)
+    if not job or not job.result or not job.result.quality_report:
+        return
+    try:
+        source_video = _resolve_video_path(job.request.video_path)
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            raise RuntimeError("Không tìm thấy FFmpeg.")
+        result = job.result
+        package = VerifiedReviewPackage(
+            title=result.title,
+            target_minutes=result.target_minutes,
+            hook=result.hook,
+            summary=result.summary,
+            narration_script=result.narration_script,
+            thumbnail_text=result.thumbnail_text,
+            tags=result.tags,
+            scenes=result.scenes,
+            events=result.events,
+            narration_segments=result.narration_segments,
+            edit_decision_list=result.edit_decision_list,
+            quality_report=result.quality_report,
+            artifact_paths=result.artifact_paths,
+        )
+        # Segment edits are verified and re-scored by patch_review_segment.
+        # Re-running the multimodal judge for every segment here made an
+        # already-approved job non-deterministic and doubled the AI latency.
+        # Keep the saved pre-render gate, then run independent QA on the actual
+        # rendered frames below.
+        if not package.quality_report.passed:
+            _update_review_job(
+                job_id,
+                status="needs_review",
+                progress=82,
+                stage=f"Pre-render QA {package.quality_report.overall_score:.1f}/100: cần duyệt lại",
+                result=_review_result_from_package(job_id, package),
+            )
+            return
+        work_dir = Path(settings.storage_dir) / "review_jobs" / job_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        _update_review_job(job_id, status="processing", progress=84, stage="Tạo lại giọng đọc sau khi duyệt")
+        narration_audio = await get_voice_engine().synthesize(
+            package.narration_script,
+            work_dir / "review_narration.mp3",
+            VoiceGender.female,
+            lambda stage, percent: _update_review_job(job_id, stage=stage, progress=max(84, min(90, percent))),
+        )
+        duration = await probe_video_duration(ffmpeg, narration_audio)
+        if duration <= 0:
+            raise RuntimeError("Không đo được thời lượng voice review.")
+        package.edit_decision_list = rescale_edl_voice_timeline(package.edit_decision_list, duration)
+        (work_dir / "edit_decision_list.json").write_text(
+            json.dumps(
+                [item.model_dump(mode="json") for item in package.edit_decision_list],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        scene_hints = _review_scene_hints(package.edit_decision_list)
+        subtitle_file = write_review_subtitles(
+            package.narration_script,
+            work_dir / "review_subtitles.srt",
+            job.request.target_minutes,
+            scene_hints,
+            target_seconds=duration,
+        )
+        draft_file = work_dir / "review_draft_manual.mp4"
+        _update_review_job(job_id, progress=90, stage="Render bản đã duyệt theo EDL")
+        await render_movie_review_video(
+            ffmpeg,
+            source_video,
+            narration_audio,
+            subtitle_file,
+            draft_file,
+            work_dir,
+            job.request.target_minutes,
+            scene_hints,
+            lambda percent: _update_review_job(job_id, progress=max(90, min(98, percent))),
+            _build_review_render_request(job.request, source_video),
+        )
+        post_report = await verify_rendered_review(draft_file, package, work_dir)
+        package.quality_report = post_report
+        package.artifact_paths["review_draft"] = str(draft_file)
+        package.artifact_paths["post_render_quality"] = str(work_dir / "quality_report_post_render.json")
+        if not post_report.passed:
+            _update_review_job(
+                job_id,
+                status="needs_review",
+                progress=99,
+                stage=f"Post-render QA {post_report.overall_score:.1f}/100: cần duyệt lại",
+                result=_review_result_from_package(job_id, package, subtitle_file_path=str(subtitle_file)),
+            )
+            return
+        final_file = work_dir / "review_final.mp4"
+        await asyncio.to_thread(shutil.copy2, draft_file, final_file)
+        package.artifact_paths["review_final"] = str(final_file)
+        _update_review_job(
+            job_id,
+            status="completed",
+            progress=100,
+            stage="Hoàn tất video review đã qua QA",
+            error=None,
+            result=_review_result_from_package(
+                job_id,
+                package,
+                subtitle_file_path=str(subtitle_file),
+                output_file_path=str(final_file),
+            ),
+        )
+    except Exception as exc:
+        if job_id in review_draft_jobs:
+            _update_review_job(job_id, status="failed", stage="Render bản review đã duyệt thất bại", error=str(exc))
 
 
 def _review_asr_timeout(video_duration_seconds: float) -> int:
@@ -518,6 +865,229 @@ async def get_review_draft_job(job_id: str) -> ReviewDraftJob:
     return job
 
 
+@router.post("/review/jobs/{job_id}/render", response_model=ReviewDraftJob, tags=["review"])
+async def render_review_draft_job(job_id: str) -> ReviewDraftJob:
+    job = review_draft_jobs.get(job_id)
+    if not job or not job.result:
+        raise HTTPException(status_code=404, detail="Review job not found.")
+    if job.status in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="Review job đang chạy.")
+    if not job.result.quality_report or not job.result.quality_report.passed:
+        raise HTTPException(status_code=409, detail="QA chưa đạt 90/100 hoặc vẫn còn câu dưới 75%.")
+    updated = _update_review_job(job_id, status="processing", progress=83, stage="Đã nhận lệnh render bản duyệt", error=None)
+    asyncio.create_task(_render_existing_review_job(job_id))
+    return updated
+
+
+@router.get("/review/jobs/{job_id}/thumbnails/{file_name}", tags=["review"])
+async def get_review_scene_thumbnail(job_id: str, file_name: str) -> FileResponse:
+    if job_id not in review_draft_jobs:
+        raise HTTPException(status_code=404, detail="Review job not found.")
+    safe_name = Path(file_name).name
+    thumbnail = Path(settings.storage_dir) / "review_jobs" / job_id / "review_scenes" / safe_name
+    if not thumbnail.exists() or thumbnail.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(status_code=404, detail="Scene thumbnail not found.")
+    return FileResponse(thumbnail, media_type="image/jpeg")
+
+
+@router.patch(
+    "/review/jobs/{job_id}/segments/{segment_id}",
+    response_model=ReviewDraftJob,
+    tags=["review"],
+)
+async def patch_review_segment(
+    job_id: str,
+    segment_id: str,
+    request: ReviewSegmentPatchRequest,
+) -> ReviewDraftJob:
+    job = review_draft_jobs.get(job_id)
+    if not job or not job.result:
+        raise HTTPException(status_code=404, detail="Review segment not found.")
+    if job.status in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="Job đang xử lý; hãy đợi render xong rồi mới sửa.")
+    if not any(
+        value is not None
+        for value in (
+            request.narration,
+            request.candidate_id,
+            request.scene_id,
+            request.start_seconds,
+            request.end_seconds,
+        )
+    ):
+        raise HTTPException(status_code=400, detail="Không có thay đổi nào để lưu.")
+
+    result = job.result.model_copy(deep=True)
+    beat = next((item for item in result.beats if item.segment_id == segment_id), None)
+    decision = next((item for item in result.edit_decision_list if item.segment_id == segment_id), None)
+    segment = next((item for item in result.narration_segments if item.segment_id == segment_id), None)
+    if beat is None or decision is None:
+        raise HTTPException(status_code=404, detail="Review segment not found.")
+
+    narration = (request.narration or "").strip() if request.narration is not None else None
+    if request.narration is not None and not narration:
+        raise HTTPException(status_code=400, detail="Lời review không được để trống.")
+    if narration is not None:
+        from app.services.ai.review_analysis import verify_edited_narration
+
+        linked_event = next((item for item in result.events if item.event_id == decision.event_id), None)
+        if linked_event is None:
+            raise HTTPException(status_code=409, detail="Segment không còn event bằng chứng để kiểm chứng.")
+        valid, reason, required_visuals = await verify_edited_narration(
+            narration,
+            linked_event,
+            result.scenes,
+        )
+        if not valid:
+            raise HTTPException(status_code=422, detail=f"Câu sửa không khớp bằng chứng: {reason}")
+        beat.narration = narration
+        decision.narration = narration
+        if segment:
+            segment.narration = narration
+            if required_visuals is not None:
+                # A manual narration edit changes what the selected frame must
+                # prove. Keeping the old requirements causes correct replacement
+                # scenes to be rejected for details that are no longer narrated.
+                segment.required_visuals = required_visuals
+
+    chosen: SceneCandidate | None = None
+    if request.candidate_id or request.scene_id:
+        chosen = next(
+            (
+                item
+                for item in decision.alternatives
+                if (request.candidate_id and item.candidate_id == request.candidate_id)
+                or (request.scene_id and item.scene_id == request.scene_id)
+            ),
+            None,
+        )
+        if chosen is None:
+            raise HTTPException(status_code=400, detail="Cảnh thay thế không thuộc segment này.")
+    elif request.start_seconds is not None or request.end_seconds is not None:
+        chosen = decision.source_clips[0].model_copy(deep=True) if decision.source_clips else None
+    elif narration is not None:
+        # A narration edit changes the visual claim even when the user keeps
+        # the same scene. Re-score that scene now so the saved QA result is the
+        # one the render command can rely on deterministically.
+        chosen = decision.source_clips[0].model_copy(deep=True) if decision.source_clips else None
+
+    if chosen is not None:
+        if request.start_seconds is not None:
+            chosen.start_seconds = request.start_seconds
+        if request.end_seconds is not None:
+            chosen.end_seconds = request.end_seconds
+        if chosen.end_seconds <= chosen.start_seconds:
+            raise HTTPException(status_code=400, detail="Timestamp kết thúc phải lớn hơn bắt đầu.")
+        decision.selected_candidate_id = chosen.candidate_id
+        decision.source_clips = [chosen]
+        beat.selected_candidate_id = chosen.candidate_id
+        beat.scene_id = chosen.scene_id
+        beat.start_seconds = chosen.start_seconds
+        beat.end_seconds = chosen.end_seconds
+        beat.time_hint = _format_review_time_hint(chosen.start_seconds, chosen.end_seconds)
+        beat.match_score = chosen.match_score
+        beat.match_reason = chosen.match_reason
+        beat.thumbnail_url = chosen.thumbnail_url
+
+        if segment is not None:
+            from app.services.ai.review_analysis import _multimodal_rescore_selected_clips
+
+            rescored = await _multimodal_rescore_selected_clips(
+                [segment],
+                result.scenes,
+                [decision],
+            )
+            if rescored and rescored[0].source_clips:
+                decision_index = next(
+                    index
+                    for index, item in enumerate(result.edit_decision_list)
+                    if item.segment_id == segment_id
+                )
+                decision = rescored[0]
+                result.edit_decision_list[decision_index] = decision
+                chosen = decision.source_clips[0]
+                beat.selected_candidate_id = chosen.candidate_id
+                beat.scene_id = chosen.scene_id
+                beat.start_seconds = chosen.start_seconds
+                beat.end_seconds = chosen.end_seconds
+                beat.time_hint = _format_review_time_hint(chosen.start_seconds, chosen.end_seconds)
+                beat.match_score = chosen.match_score
+                beat.match_reason = chosen.match_reason
+                beat.thumbnail_url = chosen.thumbnail_url
+                beat.candidates = decision.alternatives
+
+    result.narration_script = " ".join(item.narration.strip() for item in result.beats if item.narration.strip())
+    result.quality_report = _recalculate_review_quality(result)
+    # Any accepted edit invalidates the previously rendered file. Keep the
+    # file on disk for recovery, but never expose it as the output of the new
+    # script/EDL; the user must render this revision again.
+    result.output_file_path = None
+    result.output_video_url = None
+    for stale_artifact in ("review_final", "review_draft", "post_render_quality"):
+        result.artifact_paths.pop(stale_artifact, None)
+    work_dir = Path(settings.storage_dir) / "review_jobs" / job_id
+    if work_dir.exists():
+        (work_dir / "verified_review_script.json").write_text(
+            json.dumps([item.model_dump(mode="json") for item in result.narration_segments], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (work_dir / "edit_decision_list.json").write_text(
+            json.dumps([item.model_dump(mode="json") for item in result.edit_decision_list], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if result.quality_report:
+            (work_dir / "quality_report.json").write_text(
+                result.quality_report.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+
+    next_status = "ready_to_render" if result.quality_report and result.quality_report.passed else "needs_review"
+    next_stage = "Đã lưu chỉnh sửa; sẵn sàng render" if next_status == "ready_to_render" else "Đã lưu; còn câu cần duyệt"
+    return _update_review_job(
+        job_id,
+        status=next_status,
+        progress=82,
+        stage=next_stage,
+        result=result,
+    )
+
+
+def _recalculate_review_quality(result: ReviewDraftResult) -> ReviewQualityReport:
+    previous = result.quality_report or ReviewQualityReport()
+    scores = [item.match_score for item in result.beats if item.match_score is not None]
+    direct = 100.0 * sum(score >= 0.75 for score in scores) / max(len(result.beats), 1)
+    chronology_score = 100.0
+    overall = (
+        direct * 0.45
+        + chronology_score * 0.25
+        + previous.evidence_score * 0.20
+        + previous.character_consistency_score * 0.10
+    )
+    stale_codes = {"LOW_VISUAL_MATCH", "POST_RENDER_VISUAL_MISMATCH", "VOICE_VIDEO_DRIFT"}
+    retained = [issue for issue in previous.issues if issue.code not in stale_codes]
+    retained.extend(
+        QualityIssue(
+            severity="error",
+            code="LOW_VISUAL_MATCH",
+            message=f"Điểm khớp cảnh {beat.match_score:.2f} dưới 0.75.",
+            segment_id=beat.segment_id,
+        )
+        for beat in result.beats
+        if beat.match_score is not None and beat.match_score < 0.75
+    )
+    passed = overall >= settings.review_quality_threshold and not any(issue.severity == "error" for issue in retained)
+    return previous.model_copy(
+        update={
+            "phase": "pre_render",
+            "overall_score": round(overall, 2),
+            "direct_visual_match_percent": round(direct, 2),
+            "chronology_score": chronology_score,
+            "passed": passed,
+            "issues": retained,
+        }
+    )
+
+
 @router.get("/review/jobs/{job_id}/download", tags=["review"])
 async def download_review_output(job_id: str) -> FileResponse:
     job = review_draft_jobs.get(job_id)
@@ -572,6 +1142,74 @@ async def get_job(job_id: str) -> JobProgress:
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     return job
+
+
+@router.post("/jobs/{job_id}/retry", response_model=JobCreateResponse, tags=["jobs"])
+async def retry_job(
+    job_id: str,
+    auto_detect_blur: bool = False,
+    blur_box_y_percent: int | None = None,
+    blur_box_height_percent: int | None = None,
+    subtitle_y_percent: int | None = None,
+) -> JobCreateResponse:
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.status in {JobStatus.queued, JobStatus.processing}:
+        raise HTTPException(status_code=409, detail="Job is already running.")
+
+    request_updates = {
+        key: value
+        for key, value in {
+            "blur_box_y_percent": blur_box_y_percent,
+            "blur_box_height_percent": blur_box_height_percent,
+            "subtitle_y_percent": subtitle_y_percent,
+        }.items()
+        if value is not None
+    }
+    if auto_detect_blur:
+        from app.services.ai.detect_regions import auto_detect_blur_regions_ai, review_and_build_blur_config
+
+        source_path = Path(job.request.local_file_path or "")
+        if not source_path.exists():
+            source_path = Path(settings.storage_dir) / "jobs" / job_id / "source.mp4"
+        if not source_path.exists():
+            raise HTTPException(status_code=404, detail="Không tìm thấy video nguồn để AI nhận diện lại vùng mờ.")
+        regions = await auto_detect_blur_regions_ai(str(source_path), detect_sub=True, detect_logo=True)
+        if not regions:
+            raise HTTPException(status_code=502, detail="Gemini không trả về vùng mờ hợp lệ; chưa chạy lại job.")
+        checked = review_and_build_blur_config(regions)
+        blur_config = checked["config"]
+        safe_custom_boxes = [
+            box
+            for box in blur_config["custom_blur_boxes"]
+            if box.get("y_percent", 100) <= 15
+            or box.get("y_percent", 0) + box.get("height_percent", 0) >= 85
+        ]
+        request_updates.update(
+            {
+                "blur_box_enabled": blur_config["blur_box_enabled"],
+                "blur_box_y_percent": blur_config["blur_box_y_percent"],
+                "blur_box_height_percent": blur_config["blur_box_height_percent"],
+                "custom_blur_boxes": safe_custom_boxes,
+                "subtitle_y_percent": blur_config["subtitle_y_percent"],
+            }
+        )
+    request = DubbingRequest.model_validate({**job.request.model_dump(), **request_updates})
+    job = job_store.update(
+        job_id,
+        request=request,
+        status=JobStatus.queued,
+        stage="Đang chạy lại từ dữ liệu đã xử lý",
+        error=None,
+        output_video_url=None,
+        output_file_path=None,
+        completed_at=None,
+    )
+    import asyncio
+    task = asyncio.create_task(process_job(job_id))
+    task_manager.register_task(job_id, task)
+    return JobCreateResponse(job_id=job_id, status=job.status)
 
 
 @router.post("/jobs/{job_id}/metadata", response_model=JobProgress, tags=["jobs"])
@@ -713,6 +1351,8 @@ async def detect_blur_regions(req: DetectRegionsRequest):
     video_path = str(path_obj.resolve())
 
     try:
+        engine_used = "local"
+        ai_error: str | None = None
         # Tự động chèn logo kênh sang bên trái từ thư mục người dùng
         logo_dir = Path(r"C:\Users\kirit\Pictures\logo")
         auto_logo_data = None
@@ -753,8 +1393,14 @@ async def detect_blur_regions(req: DetectRegionsRequest):
                 )
             except Exception as e:
                 print(f"AI detect failed, falling back to local detection: {e}")
+                ai_error = str(e).strip() or type(e).__name__
                 regions = []
-            if not regions:
+            if regions:
+                engine_used = "ai"
+            else:
+                if ai_error is None:
+                    ai_error = "Gemini did not return any valid detection regions."
+                engine_used = "local_fallback"
                 loop = asyncio.get_event_loop()
                 regions = await loop.run_in_executor(
                     None,
@@ -779,6 +1425,10 @@ async def detect_blur_regions(req: DetectRegionsRequest):
         return {
             "regions": checked["regions"],
             "count": len(checked["regions"]),
+            "engine_requested": req.engine,
+            "engine_used": engine_used,
+            "ai_model": settings.ai_model if req.engine == "ai" else None,
+            "ai_error": ai_error,
             "auto_logo": auto_logo_data,
             "config": checked["config"],
             "review": checked["review"],

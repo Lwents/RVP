@@ -1,8 +1,8 @@
 import React, { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Check, Clapperboard, Copy, Download, FileImage, Loader2, Plus, Sparkles, Trash2, Upload, Video, Wand2 } from "lucide-react";
-import { clearReviewDraftJobs, createReviewDraftJob, detectBlurRegions, getReviewDraftJob, listReviewDraftJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "../lib/api";
+import { AlertTriangle, Check, Clapperboard, Clock3, Copy, Download, FileImage, ImageOff, Loader2, Play, Plus, Save, Sparkles, Trash2, Upload, Video, Wand2 } from "lucide-react";
+import { clearReviewDraftJobs, createReviewDraftJob, detectBlurRegions, getReviewDraftJob, listReviewDraftJobs, renderReviewDraftJob, toAbsoluteApiUrl, updateReviewDraftSegment, uploadVideo, uploadWatermark } from "../lib/api";
 import type { UploadProgress } from "../lib/api";
-import type { CustomBlurBox, ReviewBeat, ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
+import type { CustomBlurBox, ReviewBeat, ReviewBeatCandidate, ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
 import { LivePreview } from "./LivePreview";
 
 const reviewStyles: Array<{ label: string; value: ReviewDraftRequest["style"] }> = [
@@ -45,10 +45,10 @@ type ReviewRenderOptions = Pick<
 const defaultReviewRenderOptions: ReviewRenderOptions = {
   hard_subtitles: true,
   subtitle_x_percent: 50,
-  subtitle_y_percent: 84,
-  subtitle_font_size: 38,
-  subtitle_box_enabled: true,
-  subtitle_box_opacity: 45,
+  subtitle_y_percent: 92,
+  subtitle_font_size: 64,
+  subtitle_box_enabled: false,
+  subtitle_box_opacity: 0,
   subtitle_box_height_percent: 18,
   logo_enabled: true,
   logo_width: 86,
@@ -58,7 +58,7 @@ const defaultReviewRenderOptions: ReviewRenderOptions = {
   cinematic_bars_height_percent: 10,
   blur_box_enabled: false,
   blur_box_y_percent: 80,
-  blur_box_height_percent: 15,
+  blur_box_height_percent: 13,
   custom_blur_boxes: [],
   watermark_file_name: null,
   output_resolution: "original",
@@ -93,6 +93,7 @@ export const MovieReview = React.memo(function MovieReview() {
   const [isLogoUploading, setLogoUploading] = useState(false);
   const [isDetectingAI, setDetectingAI] = useState(false);
   const [isCreating, setCreating] = useState(false);
+  const [isRenderingReview, setRenderingReview] = useState(false);
   const [isClearingHistory, setClearingHistory] = useState(false);
   const [job, setJob] = useState<ReviewDraftJob | null>(null);
   const [reviewJobs, setReviewJobs] = useState<ReviewDraftJob[]>([]);
@@ -100,6 +101,8 @@ export const MovieReview = React.memo(function MovieReview() {
   const [watermarkName, setWatermarkName] = useState("Chưa có logo được tải lên");
   const [previewMode, setPreviewMode] = useState<"source" | "output">("source");
   const [selectedBeatIndex, setSelectedBeatIndex] = useState(0);
+  const [narrationDrafts, setNarrationDrafts] = useState<Record<string, string>>({});
+  const [savingSegmentId, setSavingSegmentId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
   const refreshReviewJobs = useCallback(async () => {
@@ -120,7 +123,10 @@ export const MovieReview = React.memo(function MovieReview() {
     setRenderOptions(renderOptionsFromRequest(item.request));
     setWatermarkName(item.request.watermark_file_name ? "Logo đã lưu trong job" : "Chưa có logo được tải lên");
     setPreviewMode(item.result?.output_video_url ? "output" : "source");
-    if (resetBeat) setSelectedBeatIndex(0);
+    if (resetBeat) {
+      setSelectedBeatIndex(0);
+      setNarrationDrafts({});
+    }
     window.localStorage.setItem(ACTIVE_REVIEW_JOB_STORAGE_KEY, item.job_id);
   }, []);
 
@@ -144,7 +150,7 @@ export const MovieReview = React.memo(function MovieReview() {
   }, [applyReviewJob, refreshReviewJobs]);
 
   useEffect(() => {
-    if (!job || job.status === "completed" || job.status === "failed") return;
+    if (!job || !isRunningReviewJob(job)) return;
 
     let cancelled = false;
     const timer = window.setInterval(async () => {
@@ -250,9 +256,7 @@ export const MovieReview = React.memo(function MovieReview() {
           blur_box_y_percent: result.config?.blur_box_y_percent ?? current.blur_box_y_percent,
           blur_box_height_percent: result.config?.blur_box_height_percent ?? current.blur_box_height_percent,
           custom_blur_boxes: result.config?.custom_blur_boxes ?? current.custom_blur_boxes,
-          subtitle_y_percent: typeof result.config?.subtitle_y_percent === "number"
-            ? Math.max(8, Math.min(94, Math.round(result.config.subtitle_y_percent)))
-            : current.subtitle_y_percent,
+          subtitle_y_percent: 92,
         }));
       }
       if (result.auto_logo) {
@@ -331,6 +335,8 @@ export const MovieReview = React.memo(function MovieReview() {
   }, [applyReviewJob]);
 
   const result = job?.result ?? null;
+  const qualityReport = result?.quality_report ?? null;
+  const reviewIsBusy = Boolean(job && isRunningReviewJob(job));
   const outputVideoUrl = result?.output_video_url ? toAbsoluteApiUrl(result.output_video_url) : null;
   const activePreviewUrl = previewMode === "output" ? outputVideoUrl : sourceVideoUrl;
   const selectedBeat = result?.beats[selectedBeatIndex] ?? null;
@@ -354,6 +360,75 @@ export const MovieReview = React.memo(function MovieReview() {
       previewRef.current.play().catch(() => undefined);
     }
   }, [previewMode, result]);
+
+  const previewCandidate = useCallback((index: number, candidate: ReviewBeatCandidate) => {
+    setSelectedBeatIndex(index);
+    const seek = () => {
+      if (!previewRef.current) return;
+      previewRef.current.currentTime = Math.max(0, candidate.start_seconds);
+      previewRef.current.play().catch(() => undefined);
+    };
+    if (previewMode !== "source") {
+      setPreviewMode("source");
+      window.setTimeout(seek, 80);
+      return;
+    }
+    seek();
+  }, [previewMode]);
+
+  const persistSegmentEdit = useCallback(async (
+    beat: ReviewBeat,
+    index: number,
+    candidate?: ReviewBeatCandidate,
+  ) => {
+    if (!job || !beat.segment_id) {
+      setMessage("Job cũ chưa có mã segment nên chỉ có thể xem, chưa thể chỉnh từng câu.");
+      return;
+    }
+
+    const draftKey = reviewBeatKey(beat, index);
+    const narration = narrationDrafts[draftKey] ?? beat.narration;
+    setSavingSegmentId(beat.segment_id);
+    setMessage(null);
+    try {
+      const nextJob = await updateReviewDraftSegment(job.job_id, beat.segment_id, {
+        narration,
+        ...(candidate ? {
+          candidate_id: candidate.candidate_id,
+          scene_id: candidate.scene_id,
+          start_seconds: candidate.start_seconds,
+          end_seconds: candidate.end_seconds,
+        } : {}),
+      });
+      setJob(nextJob);
+      setReviewJobs((items) => items.map((item) => item.job_id === nextJob.job_id ? nextJob : item));
+      setNarrationDrafts((current) => ({ ...current, [draftKey]: narration }));
+      setSelectedBeatIndex(index);
+      setMessage(candidate ? "Đã đổi cảnh nguồn cho câu này." : "Đã lưu lời dẫn của segment.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Không thể lưu thay đổi cho segment.");
+    } finally {
+      setSavingSegmentId(null);
+    }
+  }, [job, narrationDrafts]);
+
+  const renderApprovedReview = useCallback(async () => {
+    if (!job || !job.result?.quality_report?.passed || isRunningReviewJob(job)) return;
+
+    setRenderingReview(true);
+    setMessage(null);
+    try {
+      const nextJob = await renderReviewDraftJob(job.job_id);
+      setJob(nextJob);
+      setReviewJobs((items) => items.map((item) => item.job_id === nextJob.job_id ? nextJob : item));
+      setPreviewMode("source");
+      setMessage("Đã nhận lệnh render video từ bản review đã duyệt.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Không thể bắt đầu render video đã duyệt.");
+    } finally {
+      setRenderingReview(false);
+    }
+  }, [job]);
 
   const clearReviewHistory = useCallback(async () => {
     const confirmed = window.confirm("Đưa toàn bộ file review job vào Thùng rác và xóa lịch sử review?");
@@ -387,8 +462,8 @@ export const MovieReview = React.memo(function MovieReview() {
           <h1>Tạo review phim</h1>
           <p>Nạp phim dài, AI tạo kịch bản kể chuyện và danh sách cảnh gợi ý để dựng review.</p>
         </div>
-        <button className="ios-button" type="button" onClick={createDraft} disabled={isUploading || isCreating || !videoPath}>
-          {isCreating || (job && job.status !== "completed" && job.status !== "failed") ? <Loader2 className="spin" size={18} /> : <Sparkles size={18} />}
+        <button className="ios-button" type="button" onClick={createDraft} disabled={isUploading || isCreating || reviewIsBusy || !videoPath}>
+          {isCreating || reviewIsBusy ? <Loader2 className="spin" size={18} /> : <Sparkles size={18} />}
           Tạo bản review
         </button>
       </header>
@@ -565,6 +640,44 @@ export const MovieReview = React.memo(function MovieReview() {
 
           {result && (
             <div className="review-result">
+              {qualityReport && (
+                <section className={`review-qa-panel ${qualityReport.passed ? "passed" : "needs-review"}`}>
+                  <div className="review-qa-head">
+                    <div>
+                      <span>Kiểm tra chất lượng {qualityReport.phase === "post_render" ? "sau render" : "trước render"}</span>
+                      <strong>{qualityReport.passed ? "Đạt QA — sẵn sàng render" : "Cần duyệt lại trước khi render"}</strong>
+                    </div>
+                    <span className="review-qa-score">{formatQaScore(qualityReport.overall_score)}<small>/100</small></span>
+                  </div>
+                  <div className="review-qa-metrics">
+                    <ReviewQaMetric label="Hình khớp lời" value={qualityReport.direct_visual_match_percent} />
+                    <ReviewQaMetric label="Đúng trình tự" value={qualityReport.chronology_score} />
+                    <ReviewQaMetric label="Đủ bằng chứng" value={qualityReport.evidence_score} />
+                    <ReviewQaMetric label="Nhất quán nhân vật" value={qualityReport.character_consistency_score} />
+                  </div>
+                  {qualityReport.issues.length > 0 && (
+                    <div className="review-qa-issues">
+                      {qualityReport.issues.slice(0, 3).map((issue, issueIndex) => (
+                        <span key={`${issue.code}-${issue.segment_id || issueIndex}`}>
+                          <AlertTriangle size={14} />
+                          {issue.segment_id ? `${issue.segment_id}: ` : ""}{issue.message}
+                        </span>
+                      ))}
+                      {qualityReport.issues.length > 3 && <small>+{qualityReport.issues.length - 3} lỗi khác cần kiểm tra</small>}
+                    </div>
+                  )}
+                </section>
+              )}
+              <button
+                className="ios-button review-render-approved"
+                type="button"
+                onClick={renderApprovedReview}
+                disabled={!qualityReport?.passed || reviewIsBusy || isRenderingReview}
+                title={qualityReport?.passed ? "Render video từ kịch bản và cảnh đã duyệt" : "QA phải đạt trước khi render"}
+              >
+                {reviewIsBusy || isRenderingReview ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+                {reviewIsBusy ? "Đang xử lý / render video..." : "Render video đã duyệt"}
+              </button>
               {result.output_video_url && (
                 <a className="ios-button review-download" href={toAbsoluteApiUrl(result.output_video_url)} target="_blank" rel="noreferrer">
                   <Download size={17} />
@@ -580,13 +693,122 @@ export const MovieReview = React.memo(function MovieReview() {
                   <h3>Danh sách cảnh gợi ý</h3>
                 </div>
                 <div className="review-beats">
-                  {result.beats.map((beat, index) => (
-                    <button key={`${beat.time_hint}-${index}`} type="button" className={`review-beat ${index === selectedBeatIndex ? "active" : ""}`} onClick={() => jumpToBeat(index)}>
-                      <strong>{beat.time_hint}</strong>
-                      <span>{beat.purpose}</span>
-                      <p>{beat.narration}</p>
-                    </button>
-                  ))}
+                  {result.beats.map((beat, index) => {
+                    const draftKey = reviewBeatKey(beat, index);
+                    const score = normalizedMatchScore(beat.match_score);
+                    const isLowConfidence = score != null && score < 0.75;
+                    const candidates = (beat.candidates ?? []).slice(0, 3);
+                    const narrationDraft = narrationDrafts[draftKey] ?? beat.narration;
+                    const isSaving = Boolean(beat.segment_id && savingSegmentId === beat.segment_id);
+                    const thumbnailUrl = beat.thumbnail_url ?? candidates[0]?.thumbnail_url ?? null;
+
+                    return (
+                      <article
+                        key={beat.segment_id || `${beat.time_hint}-${index}`}
+                        className={`review-inspector-card ${index === selectedBeatIndex ? "active" : ""} ${isLowConfidence ? "low-confidence" : ""}`}
+                      >
+                        <button className="review-inspector-select" type="button" onClick={() => jumpToBeat(index)}>
+                          <span className="review-scene-thumbnail">
+                            {thumbnailUrl ? (
+                              <img src={toAbsoluteApiUrl(thumbnailUrl)} alt={`Khung hình nguồn ${beat.scene_id || index + 1}`} loading="lazy" />
+                            ) : (
+                              <span className="review-thumbnail-empty"><ImageOff size={22} />Chưa có ảnh</span>
+                            )}
+                          </span>
+                          <span className="review-inspector-summary">
+                            <span className="review-inspector-title-row">
+                              <strong>{beat.segment_id || `Câu ${index + 1}`}</strong>
+                              {score != null && (
+                                <span className={`review-match-score ${isLowConfidence ? "low" : ""}`}>
+                                  {Math.round(score * 100)}% khớp
+                                </span>
+                              )}
+                            </span>
+                            <span className="review-source-time"><Clock3 size={14} />Nguồn {formatReviewRange(beat.start_seconds, beat.end_seconds, beat.time_hint)}</span>
+                            {(beat.voice_start ?? beat.voice_start_seconds) != null && (
+                              <span className="review-voice-time">
+                                Voice {formatReviewRange(
+                                  beat.voice_start ?? beat.voice_start_seconds,
+                                  beat.voice_end ?? beat.voice_end_seconds,
+                                )}
+                              </span>
+                            )}
+                            <span className="review-purpose">{beat.event_id ? `${beat.event_id} • ` : ""}{beat.purpose}</span>
+                            {beat.match_reason && <span className="review-match-reason">{beat.match_reason}</span>}
+                          </span>
+                        </button>
+
+                        {isLowConfidence && (
+                          <div className="review-match-warning">
+                            <AlertTriangle size={16} />
+                            Điểm khớp dưới 75% — nên xem lại cảnh nguồn hoặc chọn phương án khác.
+                          </div>
+                        )}
+
+                        <label className="review-narration-editor">
+                          <span>Lời dẫn cho câu này</span>
+                          <textarea
+                            className="ios-input"
+                            value={narrationDraft}
+                            onChange={(event) => setNarrationDrafts((current) => ({ ...current, [draftKey]: event.target.value }))}
+                            rows={3}
+                          />
+                        </label>
+                        <button
+                          className="ios-button review-segment-save"
+                          type="button"
+                          disabled={!beat.segment_id || isSaving || narrationDraft.trim().length === 0}
+                          onClick={() => persistSegmentEdit(beat, index)}
+                          title={beat.segment_id ? "Lưu lời dẫn" : "Job cũ chưa hỗ trợ chỉnh từng segment"}
+                        >
+                          {isSaving ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+                          Lưu lời dẫn
+                        </button>
+
+                        {candidates.length > 0 && (
+                          <div className="review-candidates">
+                            <span className="review-candidates-label">Cảnh thay thế tốt nhất</span>
+                            <div className="review-candidate-grid">
+                              {candidates.map((candidate, candidateIndex) => {
+                                const candidateScore = normalizedMatchScore(candidate.match_score);
+                                return (
+                                  <div className="review-candidate" key={candidate.candidate_id || `${candidate.scene_id}-${candidateIndex}`}>
+                                    <button
+                                      type="button"
+                                      className="review-candidate-preview"
+                                      onClick={() => previewCandidate(index, candidate)}
+                                      title="Xem cảnh này trong phim gốc"
+                                    >
+                                      {candidate.thumbnail_url ? (
+                                        <img src={toAbsoluteApiUrl(candidate.thumbnail_url)} alt={`Phương án ${candidateIndex + 1}: ${candidate.scene_id}`} loading="lazy" />
+                                      ) : (
+                                        <span className="review-thumbnail-empty"><ImageOff size={18} />Xem cảnh</span>
+                                      )}
+                                    </button>
+                                    <div className="review-candidate-meta">
+                                      <strong>#{candidateIndex + 1} {candidate.scene_id}</strong>
+                                      <span>{formatReviewRange(candidate.start_seconds, candidate.end_seconds)}</span>
+                                      {candidateScore != null && <span>{Math.round(candidateScore * 100)}% khớp</span>}
+                                      {candidate.match_reason && <p>{candidate.match_reason}</p>}
+                                    </div>
+                                    <button
+                                      type="button"
+                                      className="ios-button ios-button-secondary review-candidate-choose"
+                                      disabled={!beat.segment_id || isSaving}
+                                      onClick={() => persistSegmentEdit(beat, index, candidate)}
+                                    >
+                                      {isSaving ? <Loader2 className="spin" size={14} /> : <Check size={14} />}
+                                      Dùng cảnh này
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
                 </div>
               </div>
               <ReviewBlock title="Text thumbnail" value={result.thumbnail_text} onCopy={copyText} />
@@ -660,7 +882,7 @@ function ReviewDisplayControls({
       <div className="editor-grid review-editor-grid">
         <ReviewRangeField label="Sub ngang" value={options.subtitle_x_percent} min={0} max={100} suffix="%" onChange={(value) => onFieldChange("subtitle_x_percent", value)} />
         <ReviewRangeField label="Sub dọc" value={options.subtitle_y_percent} min={8} max={94} suffix="%" onChange={(value) => onFieldChange("subtitle_y_percent", value)} />
-        <ReviewRangeField label="Cỡ sub" value={options.subtitle_font_size} min={16} max={72} suffix="px" onChange={(value) => onFieldChange("subtitle_font_size", value)} />
+        <ReviewRangeField label="Cỡ sub" value={options.subtitle_font_size} min={16} max={120} suffix="px" onChange={(value) => onFieldChange("subtitle_font_size", value)} />
         <ReviewRangeField label="Cao nền sub" value={options.subtitle_box_height_percent} min={8} max={45} suffix="%" onChange={(value) => onFieldChange("subtitle_box_height_percent", value)} />
         <ReviewRangeField label="Độ mờ nền" value={options.subtitle_box_opacity} min={0} max={100} suffix="%" onChange={(value) => onFieldChange("subtitle_box_opacity", value)} />
       </div>
@@ -817,6 +1039,50 @@ function ReviewBlock({ title, value, onCopy, large = false }: { title: string; v
       <p className={large ? "review-script" : undefined}>{value}</p>
     </div>
   );
+}
+
+function ReviewQaMetric({ label, value }: { label: string; value: number }) {
+  const safeValue = formatQaScore(value);
+  return (
+    <div className="review-qa-metric">
+      <span>{label}<strong>{safeValue}%</strong></span>
+      <div><i style={{ width: `${safeValue}%` }} /></div>
+    </div>
+  );
+}
+
+function formatQaScore(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function reviewBeatKey(beat: ReviewBeat, index: number): string {
+  return beat.segment_id || `legacy-${index}`;
+}
+
+function normalizedMatchScore(value: number | null | undefined): number | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  const normalized = value > 1 ? value / 100 : value;
+  return Math.max(0, Math.min(1, normalized));
+}
+
+function formatReviewRange(
+  start: number | null | undefined,
+  end: number | null | undefined,
+  fallback = "Chưa có mốc",
+): string {
+  if (start == null || !Number.isFinite(start)) return fallback;
+  if (end == null || !Number.isFinite(end)) return formatReviewTimestamp(start);
+  return `${formatReviewTimestamp(start)} – ${formatReviewTimestamp(end)}`;
+}
+
+function formatReviewTimestamp(value: number): string {
+  const safeValue = Math.max(0, Math.floor(value));
+  const hours = Math.floor(safeValue / 3600);
+  const minutes = Math.floor((safeValue % 3600) / 60);
+  const seconds = safeValue % 60;
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 function formatBytes(bytes: number): string {

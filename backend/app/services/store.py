@@ -39,7 +39,11 @@ class JobStore:
 
     def list(self) -> list[JobProgress]:
         with self._lock:
-            return sorted(self._jobs.values(), key=lambda item: item.created_at, reverse=True)
+            return sorted(
+                self._jobs.values(),
+                key=lambda item: item.completed_at or item.updated_at,
+                reverse=True,
+            )
 
     def clear(self) -> list[str]:
         with self._lock:
@@ -65,7 +69,14 @@ class JobStore:
         try:
             data = json.loads(self._index_file.read_text(encoding="utf-8"))
             self._jobs = {
-                item["job_id"]: JobProgress.model_validate(item)
+                item["job_id"]: JobProgress.model_validate(
+                    {
+                        **item,
+                        "completed_at": item.get("completed_at") or (
+                            item.get("updated_at") if item.get("status") == JobStatus.completed.value else None
+                        ),
+                    }
+                )
                 for item in data
                 if isinstance(item, dict) and item.get("job_id")
             }

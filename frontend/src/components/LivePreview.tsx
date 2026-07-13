@@ -1,4 +1,4 @@
-import React, { useRef, PointerEvent, useEffect } from "react";
+import React, { useRef, PointerEvent, useEffect, useState } from "react";
 import { Check } from "lucide-react";
 import { toAbsoluteApiUrl } from "../lib/api";
 
@@ -7,6 +7,8 @@ interface CustomBlurBox {
   y_percent: number;
   width_percent: number;
   height_percent: number;
+  start_seconds?: number | null;
+  end_seconds?: number | null;
 }
 
 interface LivePreviewProps {
@@ -58,9 +60,6 @@ export const LivePreview = React.memo(function LivePreview({
   subtitle_x_percent,
   subtitle_y_percent,
   subtitle_font_size,
-  subtitle_box_enabled,
-  subtitle_box_opacity,
-  subtitle_box_height_percent,
   hard_subtitles,
   previewVideoUrl,
   logo_enabled,
@@ -77,6 +76,7 @@ export const LivePreview = React.memo(function LivePreview({
   setField,
   videoRef,
 }: LivePreviewProps) {
+  const [previewTime, setPreviewTime] = useState(0);
   const frameRef = useRef<HTMLDivElement | null>(null);
   const dragStartRef = useRef<DragState | null>(null);
 
@@ -86,7 +86,9 @@ export const LivePreview = React.memo(function LivePreview({
   const blurBoxNodeRef = useRef<HTMLDivElement | null>(null);
   const customBoxNodeRefs = useRef<{ [key: number]: HTMLDivElement | null }>({});
 
-  const boxTop = clamp(subtitle_y_percent - subtitle_box_height_percent / 2, 0, 100 - subtitle_box_height_percent);
+  useEffect(() => {
+    setPreviewTime(0);
+  }, [previewVideoUrl]);
 
   // Reset positions if props change outside (e.g. from sliders)
   useEffect(() => {
@@ -376,6 +378,8 @@ export const LivePreview = React.memo(function LivePreview({
             onLoadStart={(e) => {
               (e.target as HTMLVideoElement).style.display = "block";
             }}
+            onTimeUpdate={(e) => setPreviewTime(e.currentTarget.currentTime)}
+            onSeeked={(e) => setPreviewTime(e.currentTarget.currentTime)}
           />
         ) : (
           <div className="sample-scene">
@@ -407,8 +411,14 @@ export const LivePreview = React.memo(function LivePreview({
           />
         )}
 
-        {custom_blur_boxes?.map((box, index) => (
-          <div
+        {custom_blur_boxes?.map((box, index) => {
+          const hasTimeRange = typeof box.start_seconds === "number" && typeof box.end_seconds === "number";
+          if (hasTimeRange && (previewTime < box.start_seconds! || previewTime > box.end_seconds!)) {
+            customBoxNodeRefs.current[index] = null;
+            return null;
+          }
+          return (
+            <div
             key={index}
             ref={(el) => {
               customBoxNodeRefs.current[index] = el;
@@ -450,8 +460,9 @@ export const LivePreview = React.memo(function LivePreview({
               onPointerUp={(e) => handleCustomBoxResizeUp(e, index)}
               onPointerCancel={(e) => handleCustomBoxResizeUp(e, index)}
             />
-          </div>
-        ))}
+            </div>
+          );
+        })}
 
         {logo_enabled && watermark_file_name && (
           <div
@@ -490,17 +501,6 @@ export const LivePreview = React.memo(function LivePreview({
           </div>
         )}
 
-        {hard_subtitles && subtitle_box_enabled && (
-          <div
-            className="blur-band"
-            style={{
-              top: `${boxTop}%`,
-              height: `${subtitle_box_height_percent}%`,
-              opacity: subtitle_box_opacity / 100,
-            }}
-          />
-        )}
-
         {hard_subtitles && (
           <div
             ref={subtitleNodeRef}
@@ -508,14 +508,14 @@ export const LivePreview = React.memo(function LivePreview({
             style={{
               left: `${subtitle_x_percent}%`,
               top: `${subtitle_y_percent}%`,
-              fontSize: `${Math.max(16, subtitle_font_size * 0.72)}px`,
+              fontSize: `${Math.max(3.2, subtitle_font_size / 10.8)}cqh`,
             }}
             onPointerDown={beginSubtitleDrag}
             onPointerMove={handleSubtitleMove}
             onPointerUp={handleSubtitleUp}
             onPointerCancel={handleSubtitleUp}
           >
-            <span>Phụ đề sẽ nằm ở đây sau khi render</span>
+            <span>PHỤ ĐỀ TIẾNG VIỆT SAU KHI RENDER</span>
           </div>
         )}
       </div>

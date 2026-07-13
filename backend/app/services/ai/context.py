@@ -37,7 +37,7 @@ async def analyze_video_context(
         "- Liệt kê nhân vật/biệt danh/tên Hán Việt nếu nhận ra, vai trò và quan hệ với nhau.\n"
         "- Đưa quy tắc xưng hô tiếng Việt hợp bối cảnh: vua-thần, cha-con, huynh-đệ, sư đồ, nam-nữ.\n"
         "- Sửa các OCR/ASR tiếng Trung dễ sai thành glossary nguồn -> nghĩa Việt.\n"
-        "- Không tự nâng quan hệ thành vợ/chồng/kết hôn/cưới trước yêu sau nếu transcript không có từ như 老婆, 妻子, 丈夫, 结婚, 婚约.\n"
+        "- Chỉ kết luận quan hệ khi transcript hoặc hình ảnh có bằng chứng trực tiếp; hiểu cả từ đồng nghĩa và cách gọi đa ngôn ngữ, không phụ thuộc một danh sách từ khóa cố định.\n"
         "- Với quan hệ chưa rõ, ghi trung tính: người phụ nữ, người đàn ông, cô ấy, hắn ta, người tình một đêm, nam chính/nữ chính.\n"
         "- Không bịa quá mức. Nếu không chắc, ghi confidence thấp và dùng ghi chú thận trọng.\n\n"
         "Trả về đúng JSON object với key:\n"
@@ -46,7 +46,7 @@ async def analyze_video_context(
 
     content: list[dict] = [
         {"type": "text", "text": prompt},
-        {"type": "text", "text": f"Transcript ASR thô:\n{transcript[:9000]}"},
+        {"type": "text", "text": f"Transcript ASR thô (mẫu xuyên suốt video):\n{transcript[:24000]}"},
     ]
     for image_b64 in frames:
         content.append(
@@ -78,7 +78,7 @@ async def _create_context_completion_with_retries(client: AsyncOpenAI, content: 
     for attempt in range(1, retries + 1):
         try:
             return await client.chat.completions.create(
-                model="ag/gemini-3.5-flash-low",
+                model=settings.ai_model,
                 messages=[{"role": "user", "content": content}],
                 response_format={"type": "json_object"},
                 temperature=0.2,
@@ -124,12 +124,27 @@ def _sample_video_frames(video_file: Path, count: int = 4) -> list[str]:
     return frames
 
 
-def _compact_transcript(events: list[SubtitleEvent]) -> str:
+def _compact_transcript(events: list[SubtitleEvent], max_events: int = 240) -> str:
+    """Sample coherent windows across the whole video, not only its opening."""
+    if not events:
+        return ""
+    if len(events) <= max_events:
+        selected = list(range(len(events)))
+    else:
+        window_count = 12
+        per_window = max(4, max_events // window_count)
+        selected_set: set[int] = set()
+        for window in range(window_count):
+            center = round(window * (len(events) - 1) / max(window_count - 1, 1))
+            start = max(0, min(len(events) - per_window, center - per_window // 2))
+            selected_set.update(range(start, min(len(events), start + per_window)))
+        selected = sorted(selected_set)[:max_events]
+
     lines: list[str] = []
-    for event in events[:180]:
-        text = re.sub(r"\s+", " ", event.text).strip()
+    for index in selected:
+        text = re.sub(r"\s+", " ", events[index].text).strip()
         if text:
-            lines.append(text)
+            lines.append(f"#{index + 1}: {text}")
     return "\n".join(lines)
 
 
@@ -141,13 +156,6 @@ def _loads_json_object(content: str) -> dict:
         if not match:
             raise
         return json.loads(match.group(0))
-
-
-_MARRIAGE_SOURCE_RE = re.compile(r"(老婆|妻子|夫人|丈夫|老公|结婚|婚姻|婚约|未婚妻|未婚夫|新娘|新郎|成亲|拜堂|夫妻|太太)")
-_UNSUPPORTED_MARRIAGE_VI_RE = re.compile(
-    r"(cưới trước yêu sau|vợ|chồng|kết hôn|hôn nhân|hôn ước|vị hôn|phu nhân|phu quân)",
-    re.IGNORECASE,
-)
 
 
 def _sanitize_context(data: object, transcript: str = "") -> dict:
@@ -164,13 +172,4 @@ def _sanitize_context(data: object, transcript: str = "") -> dict:
         "translation_notes",
         "confidence",
     }
-    result = {key: data.get(key) for key in allowed if data.get(key) not in (None, "", [], {})}
-    if not _MARRIAGE_SOURCE_RE.search(transcript):
-        for key in ("genre", "relationships", "translation_notes", "setting"):
-            if isinstance(result.get(key), str):
-                result[key] = _UNSUPPORTED_MARRIAGE_VI_RE.sub("", result[key])
-        result["relationship_constraints"] = (
-            "Transcript chưa có dấu hiệu hôn nhân rõ ràng. Không dùng vợ/chồng/kết hôn/cưới trước yêu sau; "
-            "hãy dùng người phụ nữ, người đàn ông, cô ấy, hắn ta, người tình một đêm nếu cần."
-        )
-    return result
+    return {key: data.get(key) for key in allowed if data.get(key) not in (None, "", [], {})}

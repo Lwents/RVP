@@ -1,4 +1,4 @@
-import type { DubbingRequest, JobProgress, ReviewDraftJob, ReviewDraftRequest, UploadResponse } from "../types/api";
+import type { DubbingRequest, JobProgress, ReviewDraftJob, ReviewDraftRequest, ReviewSegmentPatch, UploadResponse } from "../types/api";
 
 const ENV_API_URL = import.meta.env.VITE_API_URL?.trim();
 
@@ -158,7 +158,8 @@ export async function clearJobs(): Promise<{ message?: string; warnings?: string
 }
 
 export function toAbsoluteApiUrl(path: string): string {
-  return `${API_URL}${path}`;
+  if (/^https?:\/\//i.test(path)) return path;
+  return `${API_URL}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 export async function fetchUrlPreview(url: string): Promise<UploadResponse> {
@@ -240,6 +241,10 @@ export async function detectBlurRegions(
 ): Promise<{ 
   regions: DetectedBlurRegion[]; 
   count: number; 
+  engine_requested: string;
+  engine_used: "ai" | "local" | "local_fallback";
+  ai_model?: string | null;
+  ai_error?: string | null;
   config?: CheckedBlurConfig;
   review?: {
     ok: boolean;
@@ -277,6 +282,23 @@ export async function listReviewDraftJobs(): Promise<ReviewDraftJob[]> {
 
 export async function getReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
   return request(`/api/review/jobs/${jobId}`);
+}
+
+export async function renderReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
+  return request(`/api/review/jobs/${encodeURIComponent(jobId)}/render`, {
+    method: "POST",
+  });
+}
+
+export async function updateReviewDraftSegment(
+  jobId: string,
+  segmentId: string,
+  payload: ReviewSegmentPatch,
+): Promise<ReviewDraftJob> {
+  return request(`/api/review/jobs/${encodeURIComponent(jobId)}/segments/${encodeURIComponent(segmentId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function clearReviewDraftJobs(): Promise<{ message?: string; warnings?: string }> {

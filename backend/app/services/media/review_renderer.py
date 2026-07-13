@@ -8,7 +8,9 @@ from typing import Callable, TypedDict
 from app.core import settings
 from app.models.job import DubbingRequest
 from app.services.media.ffmpeg import probe_video_duration, run_command, run_command_with_progress
-from app.services.subtitles.ass import srt_to_positioned_ass, write_srt
+from app.services.media.renderer import _append_soft_box_blur, _gaussian_blur_sigma
+from app.services.media.subtitle_mask import SubtitleMaskAssets, build_subtitle_mask_video
+from app.services.subtitles.ass import srt_to_positioned_ass, subtitle_font_dir, write_srt
 from app.services.subtitles.timing import SubtitleEvent
 
 
@@ -17,6 +19,9 @@ class ReviewSceneHint(TypedDict, total=False):
     start_seconds: float | None
     end_seconds: float | None
     narration: str | None
+    voice_start: float | None
+    voice_end: float | None
+    duration_seconds: float | None
 
 
 def build_review_starts(source_duration: float, target_seconds: float, clip_count: int) -> list[float]:
@@ -45,10 +50,28 @@ def build_review_scenes(
         clip_seconds = target_seconds / max(len(starts), 1)
         return [(start, clip_seconds) for start in starts]
 
-    durations = _allocate_weighted_durations(
-        [_narration_weight(hint.get("narration")) for hint in hints],
-        target_seconds,
-    )
+    durations: list[float] = []
+    for hint in hints:
+        voice_start = _coerce_seconds(hint.get("voice_start"))
+        voice_end = _coerce_seconds(hint.get("voice_end"))
+        explicit_duration = _coerce_seconds(hint.get("duration_seconds"))
+        source_start = _coerce_seconds(hint.get("start_seconds"))
+        source_end = _coerce_seconds(hint.get("end_seconds"))
+        if explicit_duration is not None and explicit_duration > 0:
+            duration = explicit_duration
+        elif voice_start is not None and voice_end is not None and voice_end > voice_start:
+            duration = voice_end - voice_start
+        elif source_start is not None and source_end is not None and source_end > source_start:
+            duration = source_end - source_start
+        else:
+            duration = 3.0
+        durations.append(max(0.8, duration))
+
+    # EDL durations are authoritative. Only compensate tiny probe/rounding drift;
+    # never stretch each scene by narration character count.
+    total_duration = sum(durations)
+    if durations and target_seconds > 0 and abs(total_duration - target_seconds) <= max(0.5, target_seconds * 0.03):
+        durations[-1] = max(0.8, durations[-1] + target_seconds - total_duration)
     fallback_starts = build_review_starts(source_duration, target_seconds, len(hints))
 
     scenes: list[tuple[float, float]] = []
@@ -64,11 +87,23 @@ def build_review_scenes(
         start = fallback_start if start is None else start
         end = start + durations[index] if end is None else end
         start = max(0.0, min(start, max(0.0, source_duration - 1.0)))
-        end = max(start + 3.0, min(end, source_duration))
-        duration = max(3.0, durations[index])
-        if start + duration > source_duration:
-            start = max(0.0, source_duration - duration)
-        scenes.append((start, duration))
+        end = max(start + 0.8, min(end, source_duration))
+        duration = max(0.8, durations[index])
+        available = max(0.4, end - start)
+        if duration <= available + 0.02:
+            scenes.append((start, duration))
+            continue
+
+        # Never let a long voice sentence run beyond its verified scene into an
+        # unrelated shot. Reuse short slices inside the same evidence window.
+        repeat_count = max(2, math.ceil(duration / available))
+        chunk_duration = duration / repeat_count
+        travel = max(0.0, available - chunk_duration)
+        for repeat_index in range(repeat_count):
+            ratio = 0.0 if repeat_count == 1 else repeat_index / (repeat_count - 1)
+            chunk_start = min(end - chunk_duration, start + travel * ratio)
+            chunk_start = max(0.0, min(chunk_start, max(0.0, source_duration - chunk_duration)))
+            scenes.append((chunk_start, chunk_duration))
     return scenes
 
 
@@ -84,7 +119,8 @@ async def render_movie_review_video(
     on_progress: Callable[[int], None],
     render_request: DubbingRequest | None = None,
 ) -> Path:
-    target_seconds = max(60.0, float(target_minutes) * 60.0)
+    narration_duration = await probe_video_duration(ffmpeg, narration_audio)
+    target_seconds = narration_duration if narration_duration > 0 else max(1.0, float(target_minutes) * 60.0)
     source_duration = await probe_video_duration(ffmpeg, source_video)
     scenes = build_review_scenes(source_duration, target_seconds, scene_hints)
 
@@ -98,11 +134,9 @@ async def render_movie_review_video(
         percent = 84 + int(((index - 1) / max(len(scenes), 1)) * 8)
         on_progress(percent)
         segment = segment_dir / f"segment_{index:04d}.mp4"
-        fade_out_start = max(0.0, clip_seconds - 0.22)
         video_filter = (
             "scale=1280:720:force_original_aspect_ratio=decrease,"
-            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,"
-            f"fade=t=in:st=0:d=0.18,fade=t=out:st={fade_out_start:.3f}:d=0.18"
+            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
         )
         command = [
             ffmpeg,
@@ -153,6 +187,14 @@ async def render_movie_review_video(
 
     on_progress(93)
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    subtitle_mask: SubtitleMaskAssets | None = None
+    if render_request and render_request.blur_box_enabled:
+        subtitle_mask = await build_subtitle_mask_video(
+            silent_video,
+            work_dir / "review_subtitle_blur_mask.mp4",
+            render_request.blur_box_y_percent,
+            render_request.blur_box_height_percent,
+        )
     command = _build_review_output_command(
         ffmpeg,
         silent_video,
@@ -162,6 +204,7 @@ async def render_movie_review_video(
         work_dir,
         target_seconds,
         render_request,
+        subtitle_mask,
     )
     await run_command_with_progress(
         command,
@@ -183,6 +226,7 @@ def _build_review_output_command(
     work_dir: Path,
     target_seconds: float,
     request: DubbingRequest | None,
+    subtitle_mask: SubtitleMaskAssets | None = None,
 ) -> list[str]:
     command = [ffmpeg, "-y", "-i", str(silent_video), "-i", str(narration_audio)]
     filter_parts: list[str] = []
@@ -192,47 +236,64 @@ def _build_review_output_command(
     width, height = 1280, 720
 
     if request:
-        if request.blur_box_enabled:
-            blur_y_percent, blur_height_percent = _render_blur_band(
-                request.blur_box_y_percent,
-                request.blur_box_height_percent,
-            )
-            blur_h = max(2, round(height * blur_height_percent / 100))
-            blur_y = round(height * blur_y_percent / 100)
-            blur_y = max(0, min(height - blur_h, blur_y))
-            blur_radius = _boxblur_radius(width, blur_h)
-            small_w, small_h = _mosaic_size(width, blur_h)
-            filter_parts.append(f"{video_label}split=2[vblur_base][vblur_crop]")
+        if subtitle_mask is not None:
+            command.extend(["-i", str(subtitle_mask.mask_file)])
+            mask_index = next_input_index
+            next_input_index += 1
+            command.extend(["-i", str(subtitle_mask.cleaned_video_file)])
+            cleaned_index = next_input_index
+            next_input_index += 1
+            blur_sigma = _gaussian_blur_sigma(width, height)
             filter_parts.append(
-                f"[vblur_crop]crop=iw:{blur_h}:0:{blur_y},"
-                f"scale={small_w}:{small_h}:flags=bilinear,"
-                f"scale={width}:{blur_h}:flags=neighbor,"
-                f"boxblur={blur_radius}:10[blurred]"
+                f"[{cleaned_index}:v]scale={width}:{height}:flags=bilinear,"
+                f"setpts=PTS-STARTPTS,gblur=sigma={blur_sigma}:steps=2[reviewmask_blurred]"
             )
-            filter_parts.append(f"[vblur_base][blurred]overlay=0:{blur_y}[vblur]")
-            video_label = "[vblur]"
-
-        for index, custom_blur in enumerate(request.custom_blur_boxes):
-            cb_w = max(2, round(width * custom_blur.width_percent / 100))
-            cb_h = max(2, round(height * custom_blur.height_percent / 100))
-            cb_x = max(0, min(width - 2, round(width * custom_blur.x_percent / 100)))
-            cb_y = max(0, min(height - 2, round(height * custom_blur.y_percent / 100)))
-            cb_w = min(cb_w, width - cb_x)
-            cb_h = min(cb_h, height - cb_y)
-            if cb_w < 2 or cb_h < 2:
-                continue
-
-            blur_radius = _boxblur_radius(cb_w, cb_h)
-            small_w, small_h = _mosaic_size(cb_w, cb_h)
-            filter_parts.append(f"{video_label}split=2[vcb_base_{index}][vcb_crop_{index}]")
             filter_parts.append(
-                f"[vcb_crop_{index}]crop={cb_w}:{cb_h}:{cb_x}:{cb_y},"
-                f"scale={small_w}:{small_h}:flags=bilinear,"
-                f"scale={cb_w}:{cb_h}:flags=neighbor,"
-                f"boxblur={blur_radius}:10[cblur_{index}]"
+                f"[{mask_index}:v]format=gray,scale={width}:{height}:flags=bilinear,"
+                "lut=y='min(255\\,val*1.25)',setpts=PTS-STARTPTS[reviewmask_alpha]"
             )
-            filter_parts.append(f"[vcb_base_{index}][cblur_{index}]overlay={cb_x}:{cb_y}[vcb_{index}]")
-            video_label = f"[vcb_{index}]"
+            filter_parts.append(
+                f"{video_label}[reviewmask_blurred][reviewmask_alpha]"
+                "maskedmerge=planes=15[reviewmask_out]"
+            )
+            video_label = "[reviewmask_out]"
+        elif request.blur_box_enabled:
+            video_label = _append_soft_box_blur(
+                filter_parts,
+                video_label,
+                width,
+                height,
+                [(
+                    5.0,
+                    float(request.blur_box_y_percent),
+                    90.0,
+                    float(request.blur_box_height_percent),
+                    None,
+                    None,
+                )],
+                "reviewfallback",
+                pad_boxes=False,
+            )
+
+        if request.custom_blur_boxes:
+            video_label = _append_soft_box_blur(
+                filter_parts,
+                video_label,
+                width,
+                height,
+                [
+                    (
+                        box.x_percent,
+                        box.y_percent,
+                        box.width_percent,
+                        box.height_percent,
+                        box.start_seconds,
+                        box.end_seconds,
+                    )
+                    for box in request.custom_blur_boxes
+                ],
+                "reviewcustom",
+            )
 
         subtitle_filters: list[str] = []
         if request.cinematic_bars_enabled:
@@ -243,13 +304,10 @@ def _build_review_output_command(
 
         if request.hard_subtitles:
             ass_file = srt_to_positioned_ass(subtitle_file, work_dir / "review_subtitles.positioned.ass", width, height, request)
-            if request.subtitle_box_enabled and request.subtitle_box_opacity > 0:
-                box_height = max(24, round(height * request.subtitle_box_height_percent / 100))
-                box_y = round((height * request.subtitle_y_percent / 100) - (box_height / 2))
-                box_y = max(0, min(height - box_height, box_y))
-                alpha = round(request.subtitle_box_opacity / 100, 2)
-                subtitle_filters.append(f"drawbox=x=0:y={box_y}:w=iw:h={box_height}:color=black@{alpha}:t=fill")
-            subtitle_filters.append(f"subtitles='{_filter_path(ass_file)}'")
+            subtitle_filters.append(
+                f"subtitles='{_filter_path(ass_file)}':"
+                f"fontsdir='{_filter_path(subtitle_font_dir())}':wrap_unicode=1"
+            )
 
         if subtitle_filters:
             filter_parts.append(f"{video_label}{','.join(subtitle_filters)}[vsub]")
@@ -269,9 +327,11 @@ def _build_review_output_command(
     else:
         filter_parts.append(
             f"[0:v]subtitles='{_filter_path(subtitle_file)}':"
-            "force_style='FontName=Arial,FontSize=24,"
-            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-            "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=34'[v]"
+            f"fontsdir='{_filter_path(subtitle_font_dir())}':wrap_unicode=1:"
+            "force_style='FontName=Be Vietnam Pro ExtraBold,FontSize=40,"
+            "PrimaryColour=&H0000F2FF,OutlineColour=&H00000000,"
+            "Bold=-1,Italic=-1,ScaleX=93,BorderStyle=1,Outline=4,"
+            "Shadow=2,Alignment=2,MarginV=58'[v]"
         )
         video_label = "[v]"
 
@@ -308,11 +368,34 @@ def write_review_subtitles(
     output_file: Path,
     target_minutes: int,
     scene_hints: list[ReviewSceneHint] | None = None,
+    target_seconds: float | None = None,
 ) -> Path:
-    target_seconds = max(60.0, float(target_minutes) * 60.0)
+    target_seconds = target_seconds if target_seconds and target_seconds > 0 else max(1.0, float(target_minutes) * 60.0)
     chunks = _split_review_subtitle_chunks(narration_script)
     if not chunks:
         chunks = ["Video review phim."]
+
+    if scene_hints and all(
+        _coerce_seconds(hint.get("voice_start")) is not None
+        and _coerce_seconds(hint.get("voice_end")) is not None
+        for hint in scene_hints
+    ):
+        events: list[SubtitleEvent] = []
+        for hint in scene_hints:
+            narration = " ".join(str(hint.get("narration") or "").split())
+            if not narration:
+                continue
+            start = float(hint.get("voice_start") or 0.0)
+            end = float(hint.get("voice_end") or start + 0.8)
+            beat_chunks = _split_review_subtitle_chunks(narration)
+            if not beat_chunks:
+                continue
+            chunk_duration = max(0.15, (end - start) / len(beat_chunks))
+            for index, chunk in enumerate(beat_chunks):
+                chunk_start = start + index * chunk_duration
+                chunk_end = min(end, start + (index + 1) * chunk_duration)
+                events.append(SubtitleEvent(start=chunk_start, end=chunk_end, text=chunk))
+        return write_srt(events, output_file)
 
     if scene_hints:
         durations = _allocate_weighted_durations(
@@ -385,21 +468,6 @@ def _concat_path(path: Path) -> str:
 
 def _filter_path(path: Path) -> str:
     return path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-
-
-def _boxblur_radius(width: int, height: int) -> int:
-    return max(1, min(20, min(width, height) // 4 - 1))
-
-
-def _mosaic_size(width: int, height: int) -> tuple[int, int]:
-    return max(8, width // 80), max(4, height // 80)
-
-
-def _render_blur_band(y_percent: int, height_percent: int) -> tuple[int, int]:
-    if y_percent >= 65:
-        y_percent = min(y_percent, 76)
-        height_percent = max(height_percent, 100 - y_percent)
-    return y_percent, min(40, max(2, height_percent))
 
 
 def _narration_weight(text: str | None) -> float:

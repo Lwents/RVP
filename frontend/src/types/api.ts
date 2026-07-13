@@ -2,6 +2,7 @@ export type VoiceGender = "female" | "male";
 export type BgmMode = "demucs" | "ducking" | "none";
 export type PublishTarget = "youtube" | "facebook";
 export type JobStatus = "queued" | "processing" | "completed" | "failed";
+export type ReviewJobStatus = JobStatus | "needs_review" | "ready_to_render";
 export type SourceLanguage = "auto" | "en" | "zh" | "vi";
 
 export interface CustomBlurBox {
@@ -9,6 +10,8 @@ export interface CustomBlurBox {
   y_percent: number;
   width_percent: number;
   height_percent: number;
+  start_seconds?: number | null;
+  end_seconds?: number | null;
 }
 
 export interface DubbingRequest {
@@ -54,6 +57,7 @@ export interface JobProgress {
   request: DubbingRequest;
   created_at: string;
   updated_at: string;
+  completed_at?: string | null;
   output_video_url?: string | null;
   seo_title?: string | null;
   seo_description?: string | null;
@@ -96,12 +100,60 @@ export interface ReviewDraftRequest {
   output_resolution: string;
 }
 
+export interface ReviewBeatCandidate {
+  candidate_id: string;
+  scene_id: string;
+  start_seconds: number;
+  end_seconds: number;
+  thumbnail_url?: string | null;
+  match_score?: number | null;
+  match_reason?: string | null;
+}
+
 export interface ReviewBeat {
   time_hint: string;
   start_seconds?: number | null;
   end_seconds?: number | null;
   purpose: string;
   narration: string;
+  segment_id?: string | null;
+  event_id?: string | null;
+  scene_id?: string | null;
+  voice_start?: number | null;
+  voice_end?: number | null;
+  voice_start_seconds?: number | null;
+  voice_end_seconds?: number | null;
+  match_score?: number | null;
+  match_reason?: string | null;
+  selected_candidate_id?: string | null;
+  thumbnail_url?: string | null;
+  candidates?: ReviewBeatCandidate[];
+}
+
+export interface ReviewSegmentPatch {
+  narration?: string;
+  candidate_id?: string | null;
+  scene_id?: string | null;
+  start_seconds?: number | null;
+  end_seconds?: number | null;
+}
+
+export interface ReviewQualityIssue {
+  severity: string;
+  code: string;
+  message: string;
+  segment_id?: string | null;
+}
+
+export interface ReviewQualityReport {
+  phase: string;
+  overall_score: number;
+  direct_visual_match_percent: number;
+  chronology_score: number;
+  evidence_score: number;
+  character_consistency_score: number;
+  passed: boolean;
+  issues: ReviewQualityIssue[];
 }
 
 export interface ReviewDraftResult {
@@ -116,11 +168,12 @@ export interface ReviewDraftResult {
   subtitle_file_path?: string | null;
   output_video_url?: string | null;
   output_file_path?: string | null;
+  quality_report?: ReviewQualityReport | null;
 }
 
 export interface ReviewDraftJob {
   job_id: string;
-  status: JobStatus;
+  status: ReviewJobStatus;
   progress: number;
   stage: string;
   request: ReviewDraftRequest;
