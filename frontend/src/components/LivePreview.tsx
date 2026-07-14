@@ -1,4 +1,4 @@
-import React, { useRef, PointerEvent, useEffect } from "react";
+import React, { useRef, PointerEvent, useEffect, useState } from "react";
 import { Check } from "lucide-react";
 import { toAbsoluteApiUrl } from "../lib/api";
 
@@ -7,6 +7,8 @@ interface CustomBlurBox {
   y_percent: number;
   width_percent: number;
   height_percent: number;
+  start_seconds?: number | null;
+  end_seconds?: number | null;
 }
 
 interface LivePreviewProps {
@@ -35,6 +37,7 @@ interface LivePreviewProps {
   cinematic_bars_height_percent: number;
 
   setField: (key: any, value: any) => void;
+  videoRef?: React.Ref<HTMLVideoElement>;
 }
 
 interface DragState {
@@ -57,9 +60,6 @@ export const LivePreview = React.memo(function LivePreview({
   subtitle_x_percent,
   subtitle_y_percent,
   subtitle_font_size,
-  subtitle_box_enabled,
-  subtitle_box_opacity,
-  subtitle_box_height_percent,
   hard_subtitles,
   previewVideoUrl,
   logo_enabled,
@@ -74,17 +74,21 @@ export const LivePreview = React.memo(function LivePreview({
   cinematic_bars_enabled,
   cinematic_bars_height_percent,
   setField,
+  videoRef,
 }: LivePreviewProps) {
+  const [previewTime, setPreviewTime] = useState(0);
   const frameRef = useRef<HTMLDivElement | null>(null);
   const dragStartRef = useRef<DragState | null>(null);
 
   // References to draggable elements to apply high performance direct style mutations
   const subtitleNodeRef = useRef<HTMLDivElement | null>(null);
-  const logoNodeRef = useRef<HTMLImageElement | null>(null);
+  const logoNodeRef = useRef<HTMLDivElement | null>(null);
   const blurBoxNodeRef = useRef<HTMLDivElement | null>(null);
   const customBoxNodeRefs = useRef<{ [key: number]: HTMLDivElement | null }>({});
 
-  const boxTop = clamp(subtitle_y_percent - subtitle_box_height_percent / 2, 0, 100 - subtitle_box_height_percent);
+  useEffect(() => {
+    setPreviewTime(0);
+  }, [previewVideoUrl]);
 
   // Reset positions if props change outside (e.g. from sliders)
   useEffect(() => {
@@ -164,7 +168,7 @@ export const LivePreview = React.memo(function LivePreview({
   };
 
   // Pointer Handlers: Logo Watermark
-  const beginLogoDrag = (e: PointerEvent<HTMLImageElement>) => {
+  const beginLogoDrag = (e: PointerEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
     el.setPointerCapture(e.pointerId);
     const frame = frameRef.current;
@@ -179,7 +183,7 @@ export const LivePreview = React.memo(function LivePreview({
     };
   };
 
-  const handleLogoMove = (e: PointerEvent<HTMLImageElement>) => {
+  const handleLogoMove = (e: PointerEvent<HTMLDivElement>) => {
     const drag = dragStartRef.current;
     if (!drag || drag.type !== "logo") return;
     const deltaX = e.clientX - drag.startX;
@@ -192,7 +196,7 @@ export const LivePreview = React.memo(function LivePreview({
     e.currentTarget.style.transform = `translate(-${newX}%, -${newY}%)`;
   };
 
-  const handleLogoUp = (e: PointerEvent<HTMLImageElement>) => {
+  const handleLogoUp = (e: PointerEvent<HTMLDivElement>) => {
     const drag = dragStartRef.current;
     if (!drag || drag.type !== "logo") return;
     const deltaX = e.clientX - drag.startX;
@@ -204,6 +208,12 @@ export const LivePreview = React.memo(function LivePreview({
     dragStartRef.current = null;
     setField("logo_x_percent", newX);
     setField("logo_y_percent", newY);
+  };
+
+  const removeLogo = () => {
+    dragStartRef.current = null;
+    setField("watermark_file_name", null);
+    setField("logo_enabled", false);
   };
 
   // Pointer Handlers: original Subtitle Blur Box
@@ -354,6 +364,7 @@ export const LivePreview = React.memo(function LivePreview({
       <div className="video-frame" ref={frameRef}>
         {previewVideoUrl ? (
           <video
+            ref={videoRef}
             className="preview-video-element"
             src={previewVideoUrl}
             controls
@@ -367,6 +378,8 @@ export const LivePreview = React.memo(function LivePreview({
             onLoadStart={(e) => {
               (e.target as HTMLVideoElement).style.display = "block";
             }}
+            onTimeUpdate={(e) => setPreviewTime(e.currentTarget.currentTime)}
+            onSeeked={(e) => setPreviewTime(e.currentTarget.currentTime)}
           />
         ) : (
           <div className="sample-scene">
@@ -398,8 +411,14 @@ export const LivePreview = React.memo(function LivePreview({
           />
         )}
 
-        {custom_blur_boxes?.map((box, index) => (
-          <div
+        {custom_blur_boxes?.map((box, index) => {
+          const hasTimeRange = typeof box.start_seconds === "number" && typeof box.end_seconds === "number";
+          if (hasTimeRange && (previewTime < box.start_seconds! || previewTime > box.end_seconds!)) {
+            customBoxNodeRefs.current[index] = null;
+            return null;
+          }
+          return (
+            <div
             key={index}
             ref={(el) => {
               customBoxNodeRefs.current[index] = el;
@@ -441,38 +460,45 @@ export const LivePreview = React.memo(function LivePreview({
               onPointerUp={(e) => handleCustomBoxResizeUp(e, index)}
               onPointerCancel={(e) => handleCustomBoxResizeUp(e, index)}
             />
-          </div>
-        ))}
+            </div>
+          );
+        })}
 
         {logo_enabled && watermark_file_name && (
-          <img
+          <div
             ref={logoNodeRef}
-            src={toAbsoluteApiUrl(`/api/uploads/watermark/${watermark_file_name}`)}
-            className="watermark-logo-layer"
+            className="watermark-logo-wrapper"
             style={{
               left: `${logo_x_percent}%`,
               top: `${logo_y_percent}%`,
-              width: `${Math.max(32, logo_width * 0.6)}px`,
               transform: `translate(-${logo_x_percent}%, -${logo_y_percent}%)`,
             }}
-            alt="Logo"
-            draggable={false}
             onPointerDown={beginLogoDrag}
             onPointerMove={handleLogoMove}
             onPointerUp={handleLogoUp}
             onPointerCancel={handleLogoUp}
-          />
-        )}
-
-        {hard_subtitles && subtitle_box_enabled && (
-          <div
-            className="blur-band"
-            style={{
-              top: `${boxTop}%`,
-              height: `${subtitle_box_height_percent}%`,
-              opacity: subtitle_box_opacity / 100,
-            }}
-          />
+          >
+            <button
+              type="button"
+              className="custom-blur-delete-btn watermark-delete-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                removeLogo();
+              }}
+              title="Xoa logo"
+            >
+              ×
+            </button>
+            <img
+              src={toAbsoluteApiUrl(`/api/uploads/watermark/${watermark_file_name}`)}
+              className="watermark-logo-layer"
+              style={{
+                width: `${Math.max(32, logo_width * 0.6)}px`,
+              }}
+              alt="Logo"
+              draggable={false}
+            />
+          </div>
         )}
 
         {hard_subtitles && (
@@ -482,14 +508,14 @@ export const LivePreview = React.memo(function LivePreview({
             style={{
               left: `${subtitle_x_percent}%`,
               top: `${subtitle_y_percent}%`,
-              fontSize: `${Math.max(16, subtitle_font_size * 0.72)}px`,
+              fontSize: `${Math.max(3.2, subtitle_font_size / 10.8)}cqh`,
             }}
             onPointerDown={beginSubtitleDrag}
             onPointerMove={handleSubtitleMove}
             onPointerUp={handleSubtitleUp}
             onPointerCancel={handleSubtitleUp}
           >
-            <span>Phụ đề sẽ nằm ở đây sau khi render</span>
+            <span>PHỤ ĐỀ TIẾNG VIỆT SAU KHI RENDER</span>
           </div>
         )}
       </div>
@@ -516,6 +542,7 @@ export const LivePreview = React.memo(function LivePreview({
     prev.blur_box_height_percent === next.blur_box_height_percent &&
     prev.cinematic_bars_enabled === next.cinematic_bars_enabled &&
     prev.cinematic_bars_height_percent === next.cinematic_bars_height_percent &&
+    prev.videoRef === next.videoRef &&
     prev.custom_blur_boxes === next.custom_blur_boxes // reference check is sufficient since we replace array reference on change
   );
 });

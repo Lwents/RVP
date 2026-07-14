@@ -5,7 +5,7 @@ from typing import Callable
 
 from app.core import settings
 from app.models.job import VoiceGender
-from app.services.media.ffmpeg import find_ffmpeg
+from app.services.media.ffmpeg import find_ffmpeg, probe_video_duration
 from app.services.subtitles.timing import SubtitleEvent, normalize_events, parse_srt
 
 
@@ -119,7 +119,11 @@ class EdgeTtsVoiceEngine(VoiceEngine):
         except ImportError as exc:
             raise VoiceError("Thiếu edge-tts. Chạy pip install -r requirements.txt trong backend.") from exc
 
-        events = _group_events(normalize_events(parse_srt(subtitle_file)))
+        # Keep voice generation aligned with the exact subtitle events burned into the output.
+        raw_events = _group_events(normalize_events(parse_srt(subtitle_file)))
+
+        events = _clamp_events_to_duration(raw_events, duration)
+
         if not events:
             raise VoiceError("Không có phụ đề hợp lệ để tạo giọng đọc theo thời gian.")
 
@@ -136,33 +140,53 @@ class EdgeTtsVoiceEngine(VoiceEngine):
         for old_file in aligned_dir.glob("*"):
             old_file.unlink()
 
-        voice = self.get_voice(voice_gender)
-        timeline_files: list[Path] = []
         cursor = 0.0
         total = len(events)
-
+        event_specs: list[tuple[int, SubtitleEvent, float, float]] = []
         for index, event in enumerate(events, start=1):
-            if progress:
-                percent = 70 + int(((index - 1) / max(total, 1)) * 8)
-                progress(f"Tạo giọng đọc khớp phụ đề ({index}/{total})", percent)
-
-            if event.start > cursor + 0.03:
-                silence_file = aligned_dir / f"{index:04d}_silence.wav"
-                await _create_silence(ffmpeg, event.start - cursor, silence_file)
-                timeline_files.append(silence_file)
-                cursor = event.start
-
-            raw_file = aligned_dir / f"{index:04d}_raw.mp3"
-            speech_file = aligned_dir / f"{index:04d}_speech.wav"
-            await self._save_chunk(edge_tts, event.text, raw_file, self.get_voice_for_text(event.text, voice_gender))
-
-            raw_duration = await _probe_audio_duration(raw_file)
             next_start = events[index].start if index < total else duration
             available = max(0.4, min(event.end, next_start - 0.05, duration) - event.start)
-            speed = max(1.0, raw_duration / available) if raw_duration > 0 else 1.0
-            await _convert_speech(ffmpeg, raw_file, speech_file, speed=speed, max_duration=available)
-            timeline_files.append(speech_file)
-            cursor = event.start + min(await _probe_audio_duration(speech_file), available)
+            gap = max(0.0, event.start - cursor)
+            event_specs.append((index, event, available, gap))
+            cursor = event.start + available
+
+        semaphore = asyncio.Semaphore(4)
+        completed_count = 0
+
+        async def render_event(spec: tuple[int, SubtitleEvent, float, float]) -> list[Path]:
+            nonlocal completed_count
+            index, event, available, gap = spec
+            async with semaphore:
+                files: list[Path] = []
+                if gap > 0.03:
+                    silence_file = aligned_dir / f"{index:04d}_silence.wav"
+                    await _create_silence(ffmpeg, gap, silence_file)
+                    files.append(silence_file)
+
+                speech_file = aligned_dir / f"{index:04d}_speech.wav"
+                if not _has_speakable_content(event.text):
+                    await _create_silence(ffmpeg, available, speech_file)
+                else:
+                    raw_file = aligned_dir / f"{index:04d}_raw.mp3"
+                    await self._save_chunk(
+                        edge_tts,
+                        event.text,
+                        raw_file,
+                        self.get_voice_for_text(event.text, voice_gender),
+                    )
+                    raw_duration = await _probe_audio_duration(raw_file)
+                    speed = max(1.0, raw_duration / available) if raw_duration > 0 else 1.0
+                    await _convert_speech(ffmpeg, raw_file, speech_file, speed=speed, max_duration=available)
+                files.append(speech_file)
+
+                completed_count += 1
+                if progress:
+                    percent = 70 + int((completed_count / max(total, 1)) * 8)
+                    progress(f"Tạo giọng đọc khớp phụ đề ({completed_count}/{total})", percent)
+                return files
+
+        rendered_groups = await asyncio.gather(*(render_event(spec) for spec in event_specs))
+        timeline_files = [path for group in rendered_groups for path in group]
 
         if duration > cursor + 0.03:
             tail_file = aligned_dir / "9999_tail.wav"
@@ -219,9 +243,28 @@ def get_voice_engine() -> VoiceEngine:
     return DisabledVoiceEngine()
 
 
+def _clamp_events_to_duration(
+    events: list[SubtitleEvent],
+    duration: float,
+) -> list[SubtitleEvent]:
+    """Return timeline-safe copies without mutating frozen SubtitleEvent objects."""
+    return [
+        SubtitleEvent(event.start, min(event.end, duration), event.text)
+        for event in events
+        if event.start < duration - 0.1
+    ]
+
+
 def _normalize_tts_text(text: str) -> str:
     lines = [line.strip() for line in text.replace("\\N", "\n").splitlines()]
     return "\n".join(line for line in lines if line)
+
+
+def _has_speakable_content(text: str) -> bool:
+    normalized = _normalize_tts_text(text)
+    if not normalized:
+        return False
+    return any(char.isalnum() or ("\u4e00" <= char <= "\u9fff") for char in normalized)
 
 
 def _cjk_ratio(text: str) -> float:
@@ -277,9 +320,9 @@ def _group_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
         should_flush = (
             current_start is not None
             and (
-                event.start - current_end > 0.6
-                or len(joined) > 220
-                or (current_text and _ends_sentence(current_text[-1]))
+                event.start - current_end > 1.2
+                or len(joined) > 600
+                or event.end - current_start > 25
             )
         )
         if should_flush and current_start is not None:
@@ -354,6 +397,7 @@ async def _convert_speech(ffmpeg: str, input_file: Path, output_file: Path, spee
     filters = []
     if speed > 1.01:
         filters.append(_atempo_filter(speed))
+    filters.append(f"apad=pad_dur={max_duration:.3f}")
     filters.append(f"atrim=0:{max_duration:.3f}")
     filters.append("asetpts=N/SR/TB")
     command = [
@@ -378,32 +422,7 @@ async def _probe_audio_duration(path: Path) -> float:
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         return 0.0
-    ffprobe = Path(ffmpeg).with_name("ffprobe.exe")
-    if not ffprobe.exists():
-        return 0.0
-
-    def run() -> float:
-        completed = subprocess.run(
-            [
-                str(ffprobe),
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(path),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        try:
-            return float(completed.stdout.strip())
-        except ValueError:
-            return 0.0
-
-    return await asyncio.to_thread(run)
+    return await probe_video_duration(ffmpeg, path)
 
 
 async def _run_audio_command(command: list[str], error_message: str) -> None:

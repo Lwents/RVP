@@ -9,6 +9,134 @@ class VideoDetails(BaseModel):
     description: str = Field(description="Mô tả YouTube chuyên nghiệp, có hook, tóm tắt, CTA và hashtag.")
     tags: list[str] = Field(description="Danh sách tag SEO không có dấu #, ví dụ: ['reviewphim', 'tomtatphim'].")
 
+
+class ReviewBeat(BaseModel):
+    time_hint: str = Field(description="Moc thoi gian uoc luong, vi du 00:12:30-00:13:20.")
+    start_seconds: float | None = Field(default=None, description="Thoi diem bat dau canh nen cat, tinh bang giay.")
+    end_seconds: float | None = Field(default=None, description="Thoi diem ket thuc canh nen cat, tinh bang giay.")
+    purpose: str = Field(description="Vai tro cua canh trong video review.")
+    narration: str = Field(description="Loi dan ngan gan voi canh nay.")
+
+
+class MovieReviewPlan(BaseModel):
+    title: str
+    target_minutes: int
+    hook: str
+    summary: str
+    narration_script: str
+    beats: list[ReviewBeat]
+    thumbnail_text: str
+    tags: list[str]
+
+
+async def generate_movie_review_plan(
+    transcript: str,
+    target_minutes: int = 8,
+    style: str = "story",
+    custom_prompt: str | None = None,
+) -> MovieReviewPlan:
+    clean_transcript = _plain_transcript(transcript)
+    client = AsyncOpenAI(
+        api_key=settings.ninerouter_api_key,
+        base_url=settings.ninerouter_api_url,
+    )
+
+    style_map = {
+        "story": (
+            "ke chuyen dien anh, mo dau co hook, dan mach nhan vat va bien co ro rang, "
+            "chon canh theo tien trinh cau chuyen"
+        ),
+        "fast": (
+            "nhanh, gon, nhieu hook, cat canh nhieu hon, uu tien cao trao/hanh dong/twist, "
+            "loi dan ngan va day nhip"
+        ),
+        "emotional": (
+            "cam xuc, nhan vao tinh ban, hy sinh, mat mat, lua chon kho khan, "
+            "chon nhung canh co bieu cam va cao trao tinh cam"
+        ),
+        "funny": (
+            "duyen hai, nhe nhang, uu tien canh gay cuoi/phan ung nhan vat, "
+            "nhung khong pha nat noi dung chinh"
+        ),
+    }
+    style_text = style_map.get(style, style_map["story"])
+    beat_target = max(10, min(24, target_minutes * 2 + 4))
+    prompt = (
+        "Ban la bien tap vien kenh review phim tieng Viet. Hay bien transcript phim dai thanh mot ban review co the dung de dung video.\n"
+        f"Muc tieu do dai: {target_minutes} phut. Phong cach: {style_text}.\n"
+        "Yeu cau:\n"
+        "- Khong bia dat ngoai noi dung transcript.\n"
+        "- Viet loi dan tieng Viet tu nhien, giong nguoi review phim.\n"
+        "- Khong tu chen phan cham diem, uu nhuoc diem, hay danh gia phim; chi them neu ghi chu nguoi dung yeu cau ro rang chen vao video.\n"
+        "- Chia thanh cac beat/canh de editor cat ghep minh hoa.\n"
+        f"- Tao khoang {beat_target} beats, du de cat video co nhip dep theo thoi luong muc tieu.\n"
+        "- Moi beat can co time_hint, start_seconds, end_seconds, purpose va narration.\n"
+        "- Moi beat.narration phai la loi doc that su cho dung canh do, khong chi la mo ta ngan.\n"
+        "- narration_script phai di theo dung thu tu beats; khong viet mot bai rieng lech voi beat.\n"
+        "- start_seconds/end_seconds phai la so giay trong phim goc, dua tren timestamp transcript; chon canh that su lien quan toi narration.\n"
+        "- Canh cat nen dai 8-45 giay trong phim goc, uu tien khoanh khac co hinh anh/hanh dong/bieu cam ro.\n"
+        "- Sap xep beats theo dung mach review, mo dau manh, giua phim day cao trao, cuoi bang cai ket/cau chot/cau goi binh luan.\n"
+        "- narration_script phai doc lien mach duoc, khong chi la dan y.\n"
+        "- Tra ve dung JSON voi key: title, target_minutes, hook, summary, narration_script, beats, thumbnail_text, tags.\n"
+    )
+    if custom_prompt:
+        prompt += f"\nYeu cau rieng: {custom_prompt}\n"
+
+    try:
+        response = await client.chat.completions.create(
+            model=settings.ai_model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"Transcript phim:\n{clean_transcript[:18000]}"},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.75,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("Empty response from AI")
+        data = _loads_json_object(content)
+        beats = data.get("beats", [])
+        if not isinstance(beats, list):
+            beats = []
+        cleaned_tags = _clean_tags(data.get("tags", [])) or _default_tags()
+        return MovieReviewPlan(
+            title=_polish_title(str(data.get("title") or _fallback_title(clean_transcript))),
+            target_minutes=max(1, min(30, int(data.get("target_minutes") or target_minutes))),
+            hook=str(data.get("hook") or "Mot cau chuyen bat dau bang bien co khien moi thu dao lon."),
+            summary=str(data.get("summary") or clean_transcript[:500]),
+            narration_script=str(data.get("narration_script") or _fallback_description(clean_transcript)),
+            beats=[
+                ReviewBeat(
+                    time_hint=str(item.get("time_hint") or "auto"),
+                    start_seconds=_optional_float(item.get("start_seconds")),
+                    end_seconds=_optional_float(item.get("end_seconds")),
+                    purpose=str(item.get("purpose") or "Canh minh hoa noi dung chinh."),
+                    narration=str(item.get("narration") or ""),
+                )
+                for item in beats[:24]
+                if isinstance(item, dict)
+            ],
+            thumbnail_text=str(data.get("thumbnail_text") or "Cai ket khong ai ngo"),
+            tags=cleaned_tags,
+        )
+    except Exception as exc:
+        print(f"Error generating movie review plan with AI: {exc}")
+        return MovieReviewPlan(
+            title=_fallback_title(clean_transcript),
+            target_minutes=target_minutes,
+            hook="Mot cau chuyen bat dau bang bien co lon, day nhan vat vao lua chon kho khan.",
+            summary=clean_transcript[:700] or "Chua co transcript du de tom tat.",
+            narration_script=_fallback_description(clean_transcript),
+            beats=[
+                ReviewBeat(time_hint="00:00:00-00:01:00", start_seconds=0, end_seconds=60, purpose="Mo dau va dat van de", narration="Mo dau cau chuyen va gioi thieu xung dot chinh."),
+                ReviewBeat(time_hint="auto", start_seconds=None, end_seconds=None, purpose="Cao trao", narration="Chon cac canh co bien co lon de day nhip review."),
+                ReviewBeat(time_hint="auto", start_seconds=None, end_seconds=None, purpose="Ket", narration="Tom lai cai ket va dat cau hoi keo binh luan."),
+            ],
+            thumbnail_text="Cai ket khong ai ngo",
+            tags=_default_tags(),
+        )
+
 async def generate_video_details(transcript: str, custom_prompt: str | None = None) -> VideoDetails:
     """
     Sử dụng AI qua 9router để tạo chi tiết video (tiêu đề, mô tả, tags).
@@ -45,7 +173,7 @@ async def generate_video_details(transcript: str, custom_prompt: str | None = No
 
     try:
         response = await client.chat.completions.create(
-            model="ag/gemini-3.5-flash-low",
+            model=settings.ai_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Transcript của video:\n{clean_transcript[:8000]}"}
@@ -88,6 +216,16 @@ def _loads_json_object(content: str) -> dict:
         if not match:
             raise
         return json.loads(match.group(0))
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def _plain_transcript(transcript: str) -> str:

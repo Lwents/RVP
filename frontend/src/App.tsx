@@ -15,9 +15,12 @@ import {
   Youtube,
 } from "lucide-react";
 import { cancelJob, clearJobs, createJob, detectBlurRegions, fetchUrlPreview, generateJobMetadata, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
+import type { UploadProgress } from "./lib/api";
 import type { BgmMode, DubbingRequest, JobProgress, VoiceGender } from "./types/api";
 import { YoutubeStats } from "./components/YoutubeStats";
 import { LivePreview } from "./components/LivePreview";
+import { MovieReview } from "./components/MovieReview";
+import { ProcessingModeSelector } from "./components/ProcessingModeSelector";
 
 const languages = [
   { value: "auto", label: "Tự nhận diện" },
@@ -26,9 +29,38 @@ const languages = [
   { value: "vi", label: "Tiếng Việt" },
 ] as const;
 
+type AppTab = "workspace" | "youtube" | "review";
+
+const APP_TAB_STORAGE_KEY = "auto-translate-ai.activeTab";
+const ACTIVE_WORKSPACE_JOB_STORAGE_KEY = "auto-translate-ai.activeWorkspaceJobId";
+const appTabs: AppTab[] = ["workspace", "youtube", "review"];
+
+function isAppTab(value: string | null): value is AppTab {
+  return Boolean(value && appTabs.includes(value as AppTab));
+}
+
+function tabFromHash(hash: string): AppTab | null {
+  const value = hash.replace(/^#\/?/, "").trim();
+  return isAppTab(value) ? value : null;
+}
+
+function readInitialTab(): AppTab {
+  if (typeof window === "undefined") return "workspace";
+  const hashTab = tabFromHash(window.location.hash);
+  if (hashTab) return hashTab;
+  const storedTab = window.localStorage.getItem(APP_TAB_STORAGE_KEY);
+  return isAppTab(storedTab) ? storedTab : "workspace";
+}
+
+function readInitialActiveJobId(): string | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(ACTIVE_WORKSPACE_JOB_STORAGE_KEY);
+}
+
 const defaultForm: DubbingRequest = {
   source_url: "",
   local_file_path: "",
+  processing_mode: "balanced",
   voice_gender: "female",
   bgm_mode: "demucs",
   use_demucs: true,
@@ -38,32 +70,52 @@ const defaultForm: DubbingRequest = {
   hard_subtitles: true,
   source_has_hard_subtitles: false,
   subtitle_x_percent: 50,
-  subtitle_y_percent: 78,
-  subtitle_font_size: 48,
-  subtitle_box_enabled: true,
-  subtitle_box_opacity: 55,
+  subtitle_y_percent: 92,
+  subtitle_font_size: 64,
+  subtitle_box_enabled: false,
+  subtitle_box_opacity: 0,
   subtitle_box_height_percent: 20,
   source_language: "auto",
   ducking_volume_db: -12,
   output_resolution: "original",
   logo_enabled: true,
-  logo_width: 150,
-  logo_x_percent: 90,
-  logo_y_percent: 10,
+  logo_width: 96,
+  logo_x_percent: 94,
+  logo_y_percent: 6,
   cinematic_bars_enabled: false,
   cinematic_bars_height_percent: 10,
   blur_box_enabled: false,
   blur_box_y_percent: 80,
-  blur_box_height_percent: 15,
+  blur_box_height_percent: 13,
   custom_blur_boxes: [],
   watermark_file_name: null,
 };
+
+function normalizeBlurBand(yPercent: number, heightPercent: number) {
+  const height = Math.max(6, Math.min(14, Math.round(heightPercent)));
+  const y = Math.max(72, Math.min(92, Math.round(yPercent)));
+  const safeY = Math.min(y, 97 - height);
+  return {
+    y: safeY,
+    height,
+    subtitleY: 92,
+  };
+}
+
+function suggestSubtitleFontSize(blurHeightPercent: number) {
+  void blurHeightPercent;
+  return 64;
+}
 
 function needsYoutubeMetadata(job: JobProgress): boolean {
   if (job.status !== "completed") return false;
   const title = job.seo_title?.trim();
   const tags = job.seo_tags ?? [];
   return !title || title === "Video đã được xử lý" || tags.length === 0;
+}
+
+function isRunningJob(job: JobProgress): boolean {
+  return job.status === "queued" || job.status === "processing";
 }
 
 interface DebouncedInputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, "onChange"> {
@@ -94,20 +146,52 @@ function DebouncedInput({ value, onChange, debounceMs = 300, ...props }: Debounc
 
 export function App() {
   const [form, setForm] = useState<DubbingRequest>(defaultForm);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [activeJobId, setActiveJobId] = useState<string | null>(() => readInitialActiveJobId());
   const [activeJob, setActiveJob] = useState<JobProgress | null>(null);
   const [jobs, setJobs] = useState<JobProgress[]>([]);
   const [isSubmitting, setSubmitting] = useState(false);
   const [isUploading, setUploading] = useState(false);
   const [isVideoUploading, setVideoUploading] = useState(false);
+  const [videoUploadProgress, setVideoUploadProgress] = useState<UploadProgress | null>(null);
+  const [isClearingJobs, setClearingJobs] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [watermarkName, setWatermarkName] = useState("Chưa có logo được tải lên");
   const [videoName, setVideoName] = useState("Chưa có video được import");
   const [previewVideoUrl, setPreviewVideoUrl] = useState<string | null>(null);
   const [isPreviewLoading, setPreviewLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState<"workspace" | "youtube">("workspace");
+  const [activeTab, setActiveTab] = useState<AppTab>(() => readInitialTab());
 
   const videoInputRef = useRef<HTMLInputElement | null>(null);
+
+  const trackActiveJobId = useCallback((jobId: string | null) => {
+    setActiveJobId(jobId);
+    if (jobId) {
+      window.localStorage.setItem(ACTIVE_WORKSPACE_JOB_STORAGE_KEY, jobId);
+    } else {
+      window.localStorage.removeItem(ACTIVE_WORKSPACE_JOB_STORAGE_KEY);
+    }
+  }, []);
+
+  const goToTab = useCallback((tab: AppTab) => {
+    setActiveTab(tab);
+    window.localStorage.setItem(APP_TAB_STORAGE_KEY, tab);
+    const nextHash = `#${tab}`;
+    if (window.location.hash !== nextHash) {
+      window.history.pushState(null, "", nextHash);
+    }
+  }, []);
+
+  useEffect(() => {
+    const syncTabFromHash = () => {
+      const nextTab = tabFromHash(window.location.hash);
+      if (!nextTab) return;
+      setActiveTab(nextTab);
+      window.localStorage.setItem(APP_TAB_STORAGE_KEY, nextTab);
+    };
+
+    window.addEventListener("hashchange", syncTabFromHash);
+    return () => window.removeEventListener("hashchange", syncTabFromHash);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -121,12 +205,41 @@ export function App() {
     return Boolean(form.source_url?.trim() || form.local_file_path?.trim()) && !isSubmitting;
   }, [form.local_file_path, form.source_url, isSubmitting]);
 
-  useEffect(() => {
-    listJobs().then(setJobs).catch(() => undefined);
+  const refreshJobs = useCallback(async () => {
+    const nextJobs = (await listJobs()).sort(
+      (a, b) => new Date(b.completed_at || b.updated_at).getTime() - new Date(a.completed_at || a.updated_at).getTime(),
+    );
+    setJobs(nextJobs);
+    return nextJobs;
   }, []);
 
+  const hasRunningJobs = useMemo(() => jobs.some(isRunningJob), [jobs]);
+  const activeJobFinished = Boolean(activeJobId && activeJob?.job_id === activeJobId && !isRunningJob(activeJob));
+
   useEffect(() => {
-    if (!activeJobId) return;
+    let cancelled = false;
+    refreshJobs().then((nextJobs) => {
+      if (cancelled || nextJobs.length === 0) return;
+
+      const storedJob = activeJobId ? nextJobs.find((item) => item.job_id === activeJobId) : null;
+      const runningJob = nextJobs.find(isRunningJob);
+      const nextActiveJob = storedJob ?? runningJob ?? nextJobs[0];
+
+      setActiveJob(nextActiveJob);
+      if (!storedJob && runningJob) {
+        trackActiveJobId(runningJob.job_id);
+      } else if (activeJobId && !storedJob && !runningJob) {
+        trackActiveJobId(null);
+      }
+    }).catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeJobId, refreshJobs, trackActiveJobId]);
+
+  useEffect(() => {
+    if (!activeJobId || activeJobFinished) return;
 
     let cancelled = false;
     const poll = async () => {
@@ -137,7 +250,15 @@ export function App() {
         }
         if (cancelled) return;
         setActiveJob(job);
-        setJobs((previous) => [job, ...previous.filter((item) => item.job_id !== job.job_id)].slice(0, 8));
+        setJobs((previous) =>
+          [job, ...previous.filter((item) => item.job_id !== job.job_id)]
+            .sort((a, b) => {
+              const aTime = new Date(a.completed_at || a.updated_at).getTime();
+              const bTime = new Date(b.completed_at || b.updated_at).getTime();
+              return bTime - aTime;
+            })
+            .slice(0, 8),
+        );
       } catch (error) {
         if (!cancelled) setMessage(error instanceof Error ? error.message : "Không thể lấy trạng thái job.");
       }
@@ -149,7 +270,39 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeJobId]);
+  }, [activeJobFinished, activeJobId]);
+
+  useEffect(() => {
+    if (!hasRunningJobs) return;
+
+    let cancelled = false;
+    const refreshRunningHistory = async () => {
+      try {
+        const nextJobs = await refreshJobs();
+        if (cancelled) return;
+
+        const selectedJob = activeJobId ? nextJobs.find((item) => item.job_id === activeJobId) : null;
+        if (selectedJob) {
+          setActiveJob(selectedJob);
+          return;
+        }
+
+        const runningJob = nextJobs.find(isRunningJob);
+        if (runningJob) {
+          setActiveJob(runningJob);
+          trackActiveJobId(runningJob.job_id);
+        }
+      } catch {
+        // History refresh is best-effort; the active job poll still reports hard errors.
+      }
+    };
+
+    const timer = window.setInterval(refreshRunningHistory, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeJobId, hasRunningJobs, refreshJobs, trackActiveJobId]);
 
   const setField = useCallback(<K extends keyof DubbingRequest>(key: K, value: DubbingRequest[K]) => {
     setForm((current) => ({ ...current, [key]: value }));
@@ -177,9 +330,17 @@ export function App() {
     if (!file) return;
 
     setVideoUploading(true);
+    setVideoUploadProgress({
+      loaded: 0,
+      total: file.size || null,
+      percent: 0,
+      bytesPerSecond: null,
+    });
     setMessage(null);
     try {
-      const uploaded = await uploadVideo(file);
+      const uploaded = await uploadVideo(file, (progress) => {
+        setVideoUploadProgress(progress);
+      });
       if (!uploaded.local_file_path) {
         throw new Error("Backend không trả về đường dẫn video đã import.");
       }
@@ -191,6 +352,7 @@ export function App() {
       setVideoName(file.name);
       setPreviewVideoUrl(URL.createObjectURL(file));
     } catch (error) {
+      setVideoUploadProgress(null);
       setMessage(error instanceof Error ? error.message : "Import video thất bại.");
     } finally {
       setVideoUploading(false);
@@ -213,14 +375,15 @@ export function App() {
       source_url: form.source_url?.trim() || null,
       local_file_path: form.local_file_path?.trim() || null,
     };
-    if (payload.blur_box_enabled && payload.blur_box_y_percent >= 65) {
-      payload.blur_box_y_percent = Math.min(payload.blur_box_y_percent, 76);
-      payload.blur_box_height_percent = Math.max(payload.blur_box_height_percent, 100 - payload.blur_box_y_percent);
+    if (payload.blur_box_enabled) {
+      const normalized = normalizeBlurBand(payload.blur_box_y_percent, payload.blur_box_height_percent);
+      payload.blur_box_y_percent = normalized.y;
+      payload.blur_box_height_percent = normalized.height;
     }
 
     try {
       const response = await createJob(payload);
-      setActiveJobId(response.job_id);
+      trackActiveJobId(response.job_id);
       setMessage("Đã gửi job. Backend sẽ render đúng vị trí phụ đề trong live view.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Không thể tạo job.");
@@ -233,21 +396,25 @@ export function App() {
     const confirmed = window.confirm("Đưa toàn bộ file job và video đã render vào Thùng rác, đồng thời xoá lịch sử job?");
     if (!confirmed) return;
 
+    setClearingJobs(true);
     setMessage(null);
     try {
-      await clearJobs();
+      const result = await clearJobs();
       setJobs([]);
       setActiveJob(null);
-      setActiveJobId(null);
-      setMessage("Đã xoá lịch sử job.");
+      trackActiveJobId(null);
+      await refreshJobs();
+      setMessage(result.message || "Đã xoá lịch sử job và đưa file vào Thùng rác.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Không thể xoá lịch sử job.");
+    } finally {
+      setClearingJobs(false);
     }
-  }, []);
+  }, [refreshJobs, trackActiveJobId]);
 
   const handleSelectJob = useCallback((id: string) => {
-    setActiveJobId(id);
-  }, []);
+    trackActiveJobId(id);
+  }, [trackActiveJobId]);
 
   const handleAddBlurBox = useCallback(() => {
     const boxes = [...form.custom_blur_boxes];
@@ -281,7 +448,8 @@ export function App() {
         setField("output_resolution", "original");
         setField("cinematic_bars_enabled", false);
         setField("subtitle_x_percent", 50);
-        setField("subtitle_font_size", 48);
+        setField("subtitle_y_percent", 92);
+        setField("subtitle_font_size", 64);
         setField("subtitle_box_enabled", false);
         setField("subtitle_box_opacity", 0);
         setField("subtitle_box_height_percent", 22);
@@ -289,23 +457,26 @@ export function App() {
 
         // 1. Cập nhật các vùng làm mờ mới
         if (result.config) {
-          const blurY = Math.min(result.config.blur_box_y_percent, 76);
-          const blurHeight = Math.max(result.config.blur_box_height_percent, 100 - blurY);
+          const normalized = normalizeBlurBand(
+            result.config.blur_box_y_percent,
+            result.config.blur_box_height_percent,
+          );
+          const subtitleFontSize = suggestSubtitleFontSize(normalized.height);
           setField("blur_box_enabled", true);
-          setField("blur_box_y_percent", blurY);
-          setField("blur_box_height_percent", Math.min(35, blurHeight));
+          setField("blur_box_y_percent", normalized.y);
+          setField("blur_box_height_percent", normalized.height);
           setField("custom_blur_boxes", result.config.custom_blur_boxes);
+          setField("subtitle_font_size", subtitleFontSize);
 
-          if (typeof result.config.subtitle_y_percent === "number") {
-            setField("subtitle_y_percent", Math.max(86, Math.min(92, result.config.subtitle_y_percent)));
-          } else {
-            setField("subtitle_y_percent", 90);
-          }
+          setField("subtitle_y_percent", 92);
         } else {
+          const normalized = normalizeBlurBand(82, 12);
+          const subtitleFontSize = suggestSubtitleFontSize(normalized.height);
           setField("blur_box_enabled", true);
-          setField("blur_box_y_percent", 76);
-          setField("blur_box_height_percent", 24);
-          setField("subtitle_y_percent", 90);
+          setField("blur_box_y_percent", normalized.y);
+          setField("blur_box_height_percent", normalized.height);
+          setField("subtitle_y_percent", 92);
+          setField("subtitle_font_size", subtitleFontSize);
           setField("custom_blur_boxes", result.regions.map(r => ({
             x_percent: r.x_percent,
             y_percent: r.y_percent,
@@ -317,14 +488,13 @@ export function App() {
         // 2. Tự động dịch chuyển phụ đề mới đè lên vùng mờ chữ Trung dưới đáy
         const subRegion = result.config ? undefined : result.regions.find(r => r.label?.toLowerCase().includes("sub"));
         if (subRegion) {
-          // Tính tâm dọc của vùng mờ để đặt chữ phụ đề đè lên
-          const targetY = Math.max(86, Math.min(92, Math.round(subRegion.y_percent + subRegion.height_percent / 2)));
-          setField("subtitle_y_percent", targetY);
+          setField("subtitle_y_percent", 92);
         }
 
         // 3. Tự động chèn logo kênh sang góc trái (nếu tìm thấy logo trong thư mục Pictures)
         if (result.auto_logo) {
           setField("watermark_file_name", result.auto_logo.watermark_file_name);
+          setField("logo_width", result.auto_logo.logo_width);
           setField("logo_x_percent", result.auto_logo.logo_x_percent);
           setField("logo_y_percent", result.auto_logo.logo_y_percent);
           setField("logo_enabled", result.auto_logo.logo_enabled);
@@ -332,7 +502,10 @@ export function App() {
         }
 
         const notes = result.review?.notes?.length ? ` ${result.review.notes.join(" ")}` : "";
-        setMessage(`AI đã tự cấu hình đầy đủ: phụ đề, giọng đọc, Demucs, thanh mờ chữ gốc, logo và metadata YouTube. ${result.count} vùng hợp lý.${notes}`);
+        const engineMessage = result.engine_used === "ai"
+          ? `Gemini (${result.ai_model}) đã phân tích trực tiếp video.`
+          : `Gemini không trả về kết quả hợp lệ; đã dùng nhận diện local.${result.ai_error ? ` Chi tiết: ${result.ai_error}` : ""}`;
+        setMessage(`${engineMessage} Đã tự cấu hình đầy đủ: phụ đề, giọng đọc, Demucs, thanh mờ chữ gốc, logo và metadata YouTube. ${result.count} vùng hợp lý.${notes}`);
       }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "AI phân tích thất bại.");
@@ -351,25 +524,29 @@ export function App() {
           <span>Auto-Translate AI</span>
         </a>
         <div className="nav-links">
-          <span className="health-pill" style={{ fontSize: '0.85rem', fontWeight: 600, color: '#047857', background: 'rgba(236, 253, 245, 0.7)', padding: '6px 12px', borderRadius: '999px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <span className="health-pill">
             <BadgeCheck size={16} />
             Backend đang chạy
           </span>
-          <button 
-            className={`ios-button ios-button-secondary ${activeTab === 'youtube' ? 'active' : ''}`} 
-            onClick={() => setActiveTab('youtube')}
-            style={{ padding: '8px 16px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.9rem' }}
+          <button
+            className={`nav-tab ios-button ios-button-secondary ${activeTab === 'youtube' ? 'active' : ''}`}
+            onClick={() => goToTab('youtube')}
           >
             <Youtube size={16} /> YouTube Stats
           </button>
-          <button 
-            className={`ios-button ios-button-secondary ${activeTab === 'workspace' ? 'active' : ''}`} 
-            onClick={() => setActiveTab('workspace')}
-            style={{ padding: '8px 16px', fontSize: '0.9rem' }}
+          <button
+            className={`nav-tab ios-button ios-button-secondary ${activeTab === 'review' ? 'active' : ''}`}
+            onClick={() => goToTab('review')}
+          >
+            Review phim
+          </button>
+          <button
+            className={`nav-tab ios-button ios-button-secondary ${activeTab === 'workspace' ? 'active' : ''}`}
+            onClick={() => goToTab('workspace')}
           >
             Workspace
           </button>
-          <a className="ios-button ios-button-secondary" href="http://127.0.0.1:8000/docs" target="_blank" rel="noreferrer" style={{ textDecoration: 'none', padding: '8px 16px', fontSize: '0.9rem' }}>
+          <a className="nav-tab nav-doc-link ios-button ios-button-secondary" href="http://127.0.0.1:8000/docs" target="_blank" rel="noreferrer">
             Tài liệu API
             <ChevronRight size={16} />
           </a>
@@ -380,6 +557,8 @@ export function App() {
         <div key="youtube" className="ios-view-transition">
           <YoutubeStats />
         </div>
+      ) : activeTab === 'review' ? (
+        <MovieReview />
       ) : (
         <div key="workspace" className="ios-view-transition">
           <header className="page-heading">
@@ -399,7 +578,7 @@ export function App() {
                 <SectionTitle index="01" title="Nguồn video" />
                 <label className="field">
                   <span>URL video</span>
-                  <div style={{ display: "flex", gap: "10px" }}>
+                  <div className="url-preview-row">
                     <DebouncedInput
                       className="ios-input"
                       value={form.source_url ?? ""}
@@ -416,8 +595,7 @@ export function App() {
                     {form.source_url && !form.source_url.toLowerCase().endsWith(".mp4") && (
                       <button
                         type="button"
-                        className="ios-button ios-button-secondary"
-                        style={{ width: "auto", padding: "0 14px", fontWeight: 600, whiteSpace: "nowrap" }}
+                        className="preview-load-button ios-button ios-button-secondary"
                         disabled={isPreviewLoading}
                         onClick={async () => {
                           setPreviewLoading(true);
@@ -456,6 +634,30 @@ export function App() {
                       {videoName}
                     </span>
                   </div>
+                  {videoUploadProgress && (
+                    <div className="upload-progress">
+                      <div className="upload-progress-meta">
+                        <strong>
+                          {isVideoUploading
+                            ? videoUploadProgress.percent === 100
+                              ? "Da gui xong, dang cho backend xac nhan..."
+                              : `Dang import ${videoUploadProgress.percent ?? 0}%`
+                            : "Import hoan tat"}
+                        </strong>
+                        <span>
+                          {formatBytes(videoUploadProgress.loaded)}
+                          {videoUploadProgress.total ? ` / ${formatBytes(videoUploadProgress.total)}` : ""}
+                          {videoUploadProgress.bytesPerSecond ? ` • ${formatUploadSpeed(videoUploadProgress.bytesPerSecond)}` : ""}
+                        </span>
+                      </div>
+                      <div className="upload-progress-track">
+                        <div
+                          className="upload-progress-bar"
+                          style={{ width: `${videoUploadProgress.percent ?? 0}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="two-fields">
@@ -481,6 +683,11 @@ export function App() {
                     />
                   </label>
                 </div>
+
+                <ProcessingModeSelector
+                  value={form.processing_mode}
+                  onChange={(value) => setField("processing_mode", value)}
+                />
               </section>
 
               <section className="ios-card">
@@ -505,7 +712,7 @@ export function App() {
                   onChange={(value) => setField("bgm_mode", value)}
                 />
                 {form.bgm_mode !== "none" && (
-                  <div style={{ marginTop: 12, marginBottom: 12 }}>
+                  <div className="demucs-toggle">
                     <CheckBox 
                       checked={form.use_demucs} 
                       label="Dùng AI Demucs để tách sạch âm thanh (Render chậm hơn)" 
@@ -517,7 +724,7 @@ export function App() {
 
               <section className="ios-card">
                 <SectionTitle index="03" title="Tuỳ chọn Video & Hình ảnh" />
-                <div className="two-fields" style={{ marginBottom: 14 }}>
+                <div className="two-fields video-options-grid">
                   <label className="field">
                     <span>Độ phân giải xuất</span>
                     <select className="ios-input" value={form.output_resolution} onChange={(event) => setField("output_resolution", event.target.value)}>
@@ -548,7 +755,7 @@ export function App() {
                     onChange={() => setField("source_has_hard_subtitles", !form.source_has_hard_subtitles)}
                   />
                   <CheckBox checked={form.cinematic_bars_enabled} label="Dải đen viền video (Cinematic bars)" onChange={() => setField("cinematic_bars_enabled", !form.cinematic_bars_enabled)} />
-                  <CheckBox checked={form.blur_box_enabled} label="Thanh làm mờ chữ gốc" onChange={() => setField("blur_box_enabled", !form.blur_box_enabled)} />
+                  <CheckBox checked={form.blur_box_enabled} label="Thanh làm mờ chữ gốc (cố định suốt video)" onChange={() => setField("blur_box_enabled", !form.blur_box_enabled)} />
                   <CheckBox 
                     checked={form.logo_enabled} 
                     label="Đóng dấu Logo Watermark" 
@@ -564,13 +771,13 @@ export function App() {
                   />
                 </div>
 
-                <div style={{ marginTop: 14 }}>
+                <div className="ai-tools">
                   {/* Phân tích tự động bằng trí tuệ nhân tạo (AI) */}
-                  <div style={{ background: 'rgba(0,122,255,0.05)', border: '1px solid rgba(0,122,255,0.15)', borderRadius: '16px', padding: '16px', marginBottom: '12px' }}>
-                    <div style={{ fontWeight: 600, fontSize: '0.9rem', color: '#007aff', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <div className="ai-assist-card">
+                    <div className="ai-assist-title">
                       <span>🤖</span> Tự động bằng Trí tuệ nhân tạo (AI)
                     </div>
-                    <p style={{ fontSize: '0.82rem', color: '#86868b', lineHeight: 1.4, margin: '0 0 12px 0', fontWeight: 500 }}>
+                    <p>
                       AI sẽ tự phân tích khung hình video để xác định các vùng cần làm mờ và tự động cấu hình phù hợp.
                     </p>
                     <button
@@ -578,7 +785,6 @@ export function App() {
                       className="ios-button"
                       onClick={handleAIDetect}
                       disabled={isDetectingAI || !form.local_file_path}
-                      style={{ width: '100%', justifyContent: 'center', gap: '8px', height: '36px' }}
                     >
                       {isDetectingAI ? <Loader2 className="spin" size={16} /> : <span>🤖</span>}
                       {isDetectingAI ? 'Đang phân tích...' : 'Tự động sửa cấu hình bằng AI'}
@@ -592,7 +798,7 @@ export function App() {
                   >
                     + Thêm vùng làm mờ tuỳ chỉnh
                   </button>
-                  <p className="hint-text" style={{ marginTop: 8 }}>
+                  <p className="hint-text blur-hint">
                     Kéo thả trực tiếp vùng làm mờ trên màn hình Live View bên cạnh. Có thể kéo góc để phóng to/thu nhỏ. Nháy đúp chuột để xoá.
                   </p>
                 </div>
@@ -609,7 +815,7 @@ export function App() {
                 )}
 
                 {form.blur_box_enabled && (
-                  <div className="two-fields" style={{ marginTop: 14 }}>
+                  <div className="two-fields blur-options-grid">
                     <RangeField
                       label="Vị trí dọc thanh mờ"
                       value={form.blur_box_y_percent}
@@ -630,14 +836,14 @@ export function App() {
                 )}
 
                 {form.logo_enabled && (
-                  <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid rgba(0,0,0,0.05)" }}>
+                  <div className="logo-config">
                     <SectionTitle index="04" title="Cấu hình Logo" />
                     <div className="upload-row">
                       <button type="button" className="ios-button" onClick={() => document.getElementById('watermark-input')?.click()}>
                         {isUploading ? <Loader2 className="spin" size={17} /> : <Upload size={17} />}
                         <span>Chọn logo</span>
                       </button>
-                      <input id="watermark-input" type="file" accept="image/*" onChange={handleWatermark} style={{ display: 'none' }} />
+                      <input id="watermark-input" className="file-input-hidden" type="file" accept="image/*" onChange={handleWatermark} />
                       <span className="upload-name">
                         <FileImage size={17} />
                         {watermarkName}
@@ -672,7 +878,7 @@ export function App() {
                   </div>
                 )}
 
-                {message && <div style={{ color: "#d32f2f", background: "#fdecec", padding: "12px", borderRadius: "12px", marginTop: "16px", fontWeight: 600 }}>{message}</div>}
+                {message && <div className="form-message">{message}</div>}
               </section>
             </div>
 
@@ -732,7 +938,7 @@ export function App() {
 
               <aside className="side-stack">
                 <StatusPanel job={activeJob} />
-                <HistoryPanel jobs={jobs} onSelect={handleSelectJob} onClear={handleClearJobs} />
+                <HistoryPanel jobs={jobs} onSelect={handleSelectJob} onClear={handleClearJobs} isClearing={isClearingJobs} />
               </aside>
             </div>
           </form>
@@ -740,6 +946,20 @@ export function App() {
       )}
     </main>
   );
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** exponent;
+  const digits = exponent === 0 ? 0 : value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[exponent]}`;
+}
+
+function formatUploadSpeed(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return "0 B/s";
+  return `${formatBytes(bytesPerSecond)}/s`;
 }
 
 const SectionTitle = React.memo(function SectionTitle({ index, title }: { index: string; title: string }) {
@@ -1018,9 +1238,10 @@ interface HistoryPanelProps {
   jobs: JobProgress[];
   onSelect: (id: string) => void;
   onClear: () => void;
+  isClearing: boolean;
 }
 
-const HistoryPanel = React.memo(function HistoryPanel({ jobs, onSelect, onClear }: HistoryPanelProps) {
+const HistoryPanel = React.memo(function HistoryPanel({ jobs, onSelect, onClear, isClearing }: HistoryPanelProps) {
   return (
     <section className="ios-card">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
@@ -1033,10 +1254,11 @@ const HistoryPanel = React.memo(function HistoryPanel({ jobs, onSelect, onClear 
             className="ios-button ios-button-secondary"
             type="button"
             onClick={onClear}
+            disabled={isClearing}
             title="Đưa file job và video đã render vào Thùng rác"
             style={{ padding: "6px 12px", fontSize: "0.85rem", color: "#d32f2f" }}
           >
-            <Trash2 size={17} />
+            {isClearing ? <Loader2 className="spin" size={17} /> : <Trash2 size={17} />}
             <span>Xoá tất cả</span>
           </button>
         )}
@@ -1077,16 +1299,19 @@ const HistoryPanel = React.memo(function HistoryPanel({ jobs, onSelect, onClear 
                 <strong style={{ fontSize: "0.95rem" }}>{job.stage}</strong>
                 <span style={{ fontSize: "0.85rem", color: "#86868b" }}>
                   {job.progress}% - {languageLabel(job.request.source_language)}
-                  {job.status === "completed" && job.created_at && job.updated_at && (
-                    <>
-                      {" • "}
-                      {(() => {
-                        const diffSecs = Math.floor((new Date(job.updated_at).getTime() - new Date(job.created_at).getTime()) / 1000);
-                        return diffSecs > 60 ? `${Math.floor(diffSecs / 60)} phút ${diffSecs % 60} giây` : `${diffSecs} giây`;
-                      })()}
-                    </>
-                  )}
                 </span>
+                {job.status === "completed" && (job.completed_at || job.updated_at) && (
+                  <span style={{ fontSize: "0.78rem", color: "#a1a1a6" }}>
+                    Hoàn tất: {new Date(job.completed_at || job.updated_at).toLocaleString("vi-VN", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      second: "2-digit",
+                      day: "2-digit",
+                      month: "2-digit",
+                      year: "numeric",
+                    })}
+                  </span>
+                )}
               </div>
             </button>
           ))}

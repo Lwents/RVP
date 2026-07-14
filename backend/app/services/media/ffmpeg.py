@@ -26,6 +26,17 @@ def find_ffmpeg() -> str | None:
     if path_match:
         return path_match
 
+    # imageio-ffmpeg ships a portable binary on supported platforms. Using it
+    # keeps local development working without a machine-wide FFmpeg install.
+    try:
+        import imageio_ffmpeg
+
+        bundled = Path(imageio_ffmpeg.get_ffmpeg_exe())
+        if bundled.exists():
+            return str(bundled)
+    except (ImportError, RuntimeError):
+        pass
+
     for root in [
         Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages",
         Path("C:/Program Files"),
@@ -46,26 +57,29 @@ def find_ffprobe(ffmpeg: str) -> str | None:
 
 
 async def run_command(command: list[str], error_message: str) -> None:
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    try:
-        stdout, _ = await process.communicate()
-        if process.returncode != 0:
-            detail = stdout.decode(errors="ignore").strip() if stdout else ""
-            raise MediaError(f"{error_message} {detail}")
-    except asyncio.CancelledError:
-        try:
-            process.terminate()
-            await asyncio.wait_for(process.wait(), timeout=3.0)
-        except (asyncio.TimeoutError, ProcessLookupError):
-            try:
-                process.kill()
-            except Exception:
-                pass
-        raise
+    def execute() -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+
+    completed = await asyncio.to_thread(execute)
+    if completed.returncode != 0:
+        detail = completed.stdout.decode(errors="ignore").strip() if completed.stdout else ""
+        raise MediaError(f"{error_message} {detail}".strip())
+
+
+async def run_command_with_progress(
+    command: list[str],
+    error_message: str,
+    duration: float,
+    progress_start: int,
+    progress_end: int,
+    on_progress: ProgressCallback,
+) -> None:
+    await run_ffmpeg_with_progress(command, error_message, duration, progress_start, progress_end, on_progress)
 
 
 async def extract_audio(ffmpeg: str, source_video: Path, audio_file: Path) -> None:
@@ -92,7 +106,20 @@ async def copy_mp4(ffmpeg: str, source_video: Path, output_file: Path) -> None:
 async def probe_video_size(ffmpeg: str, source_video: Path) -> tuple[int, int]:
     ffprobe = find_ffprobe(ffmpeg)
     if not ffprobe:
-        return (1280, 720)
+        def probe_with_ffmpeg() -> tuple[int, int]:
+            completed = subprocess.run(
+                [ffmpeg, "-hide_banner", "-i", str(source_video)],
+                capture_output=True,
+                check=False,
+            )
+            output = b"\n".join([completed.stdout, completed.stderr]).decode(errors="ignore")
+            video_line = next((line for line in output.splitlines() if "Video:" in line), "")
+            match = re.search(r"(?<![\d.])(\d{2,5})x(\d{2,5})(?![\d.])", video_line)
+            if not match:
+                return (1280, 720)
+            return (int(match.group(1)), int(match.group(2)))
+
+        return await asyncio.to_thread(probe_with_ffmpeg)
 
     def probe() -> tuple[int, int]:
         completed = subprocess.run(
@@ -125,7 +152,19 @@ async def probe_video_size(ffmpeg: str, source_video: Path) -> tuple[int, int]:
 async def probe_video_duration(ffmpeg: str, source_video: Path) -> float:
     ffprobe = find_ffprobe(ffmpeg)
     if not ffprobe:
-        return 0
+        def probe_with_ffmpeg() -> float:
+            completed = subprocess.run(
+                [ffmpeg, "-hide_banner", "-i", str(source_video)],
+                capture_output=True,
+                check=False,
+            )
+            output = b"\n".join([completed.stdout, completed.stderr]).decode(errors="ignore")
+            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
+            if not match:
+                return 0
+            return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+        return await asyncio.to_thread(probe_with_ffmpeg)
 
     def probe() -> float:
         completed = subprocess.run(
@@ -163,21 +202,16 @@ async def run_ffmpeg_with_progress(
 ) -> None:
     progress_command = command[:1] + ["-nostats", "-progress", "pipe:1"] + command[1:]
 
-    process = await asyncio.create_subprocess_exec(
-        *progress_command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    
-    output_lines: list[str] = []
-    last_update = 0.0
-
-    try:
+    def execute() -> None:
+        process = subprocess.Popen(
+            progress_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        output_lines: list[str] = []
+        last_update = 0.0
         assert process.stdout is not None
-        while True:
-            line_bytes = await process.stdout.readline()
-            if not line_bytes:
-                break
+        for line_bytes in iter(process.stdout.readline, b""):
             line = line_bytes.decode(errors="ignore").strip()
             if line:
                 output_lines.append(line)
@@ -193,21 +227,13 @@ async def run_ffmpeg_with_progress(
             on_progress(max(progress_start, min(progress_end, percent)))
             last_update = now
 
-        return_code = await process.wait()
+        return_code = process.wait()
         if return_code != 0:
             detail = "\n".join(output_lines[-40:]).strip()
-            raise MediaError(f"{error_message} {detail}")
+            raise MediaError(f"{error_message} {detail}".strip())
         on_progress(progress_end)
-    except asyncio.CancelledError:
-        try:
-            process.terminate()
-            await asyncio.wait_for(process.wait(), timeout=3.0)
-        except (asyncio.TimeoutError, ProcessLookupError):
-            try:
-                process.kill()
-            except Exception:
-                pass
-        raise
+
+    await asyncio.to_thread(execute)
 
 
 def _ffmpeg_progress_seconds(line: str) -> float | None:

@@ -3,8 +3,7 @@ from pathlib import Path
 from app.core import settings
 from app.models.job import BgmMode, DubbingRequest
 from app.services.media.ffmpeg import copy_mp4, probe_video_duration, probe_video_size, run_ffmpeg_with_progress
-from app.services.subtitles.ass import srt_to_positioned_ass
-
+from app.services.subtitles.ass import srt_to_positioned_ass, subtitle_font_dir
 
 async def render_video(
     ffmpeg: str,
@@ -26,56 +25,49 @@ async def render_video(
     width, height = await probe_video_size(ffmpeg, source_video)
     command = [ffmpeg, "-y", "-i", str(source_video)]
     next_input_index = 1
-    video_label = "[0:v]"
-    filter_parts: list[str] = []
+    video_label = "[vbase]"
+    filter_parts: list[str] = ["[0:v]setpts=PTS-STARTPTS[vbase]"]
 
     if request.blur_box_enabled:
-        blur_y_percent, blur_height_percent = _render_blur_band(
-            request.blur_box_y_percent,
-            request.blur_box_height_percent,
+        # The subtitle band is intentionally static for the whole video. FFmpeg
+        # applies one feathered Gaussian-blur mask in the final encode, avoiding
+        # the expensive OpenCV OCR/inpaint pass and temporal mask flicker.
+        video_label = _append_soft_box_blur(
+            filter_parts,
+            video_label,
+            width,
+            height,
+            [(
+                5.0,
+                float(request.blur_box_y_percent),
+                90.0,
+                float(request.blur_box_height_percent),
+                None,
+                None,
+            )],
+            "substatic",
+            pad_boxes=False,
         )
-        blur_h = max(2, round(height * blur_height_percent / 100))
-        blur_y = round(height * blur_y_percent / 100)
-        blur_y = max(0, min(height - blur_h, blur_y))
-        blur_radius = _boxblur_radius(width, blur_h)
-        small_w, small_h = _mosaic_size(width, blur_h)
-        filter_parts.append(
-            f"{video_label}split=2[vblur_base][vblur_crop]"
-        )
-        filter_parts.append(
-            f"[vblur_crop]crop=iw:{blur_h}:0:{blur_y},"
-            f"scale={small_w}:{small_h}:flags=bilinear,"
-            f"scale={width}:{blur_h}:flags=neighbor,"
-            f"boxblur={blur_radius}:10[blurred]"
-        )
-        filter_parts.append(f"[vblur_base][blurred]overlay=0:{blur_y}[vblur]")
-        video_label = "[vblur]"
 
-    for i, custom_blur in enumerate(request.custom_blur_boxes):
-        cb_w = max(2, round(width * custom_blur.width_percent / 100))
-        cb_h = max(2, round(height * custom_blur.height_percent / 100))
-        cb_x = round(width * custom_blur.x_percent / 100)
-        cb_y = round(height * custom_blur.y_percent / 100)
-        
-        # Ensure dimensions and coordinates don't exceed video boundaries
-        cb_x = max(0, min(width - 2, cb_x))
-        cb_y = max(0, min(height - 2, cb_y))
-        cb_w = min(cb_w, width - cb_x)
-        cb_h = min(cb_h, height - cb_y)
-        if cb_w < 2 or cb_h < 2:
-            continue
-        
-        blur_radius = _boxblur_radius(cb_w, cb_h)
-        small_w, small_h = _mosaic_size(cb_w, cb_h)
-        filter_parts.append(f"{video_label}split=2[vcb_base_{i}][vcb_crop_{i}]")
-        filter_parts.append(
-            f"[vcb_crop_{i}]crop={cb_w}:{cb_h}:{cb_x}:{cb_y},"
-            f"scale={small_w}:{small_h}:flags=bilinear,"
-            f"scale={cb_w}:{cb_h}:flags=neighbor,"
-            f"boxblur={blur_radius}:10[cblur_{i}]"
+    if request.custom_blur_boxes:
+        video_label = _append_soft_box_blur(
+            filter_parts,
+            video_label,
+            width,
+            height,
+            [
+                (
+                    box.x_percent,
+                    box.y_percent,
+                    box.width_percent,
+                    box.height_percent,
+                    box.start_seconds,
+                    box.end_seconds,
+                )
+                for box in request.custom_blur_boxes
+            ],
+            "customsoft",
         )
-        filter_parts.append(f"[vcb_base_{i}][cblur_{i}]overlay={cb_x}:{cb_y}[vcb_{i}]")
-        video_label = f"[vcb_{i}]"
 
 
 
@@ -101,14 +93,10 @@ async def render_video(
     if subtitle_file:
         ass_file = srt_to_positioned_ass(subtitle_file, work_dir / "subtitles.positioned.ass", width, height, request)
 
-        if request.subtitle_box_enabled and request.subtitle_box_opacity > 0:
-            box_height = max(24, round(height * request.subtitle_box_height_percent / 100))
-            box_y = round((height * request.subtitle_y_percent / 100) - (box_height / 2))
-            box_y = max(0, min(height - box_height, box_y))
-            alpha = round(request.subtitle_box_opacity / 100, 2)
-            subtitle_filters.append(f"drawbox=x=0:y={box_y}:w=iw:h={box_height}:color=black@{alpha}:t=fill")
-
-        subtitle_filters.append(f"subtitles='{_subtitle_filter_path(ass_file)}'")
+        subtitle_filters.append(
+            f"subtitles='{_subtitle_filter_path(ass_file)}':"
+            f"fontsdir='{_subtitle_filter_path(subtitle_font_dir())}':wrap_unicode=1"
+        )
     
     if subtitle_filters:
         filter_parts.append(f"{video_label}{','.join(subtitle_filters)}[vfinal]")
@@ -211,21 +199,69 @@ def _can_stream_copy(request: DubbingRequest, subtitle_file: Path | None, narrat
     return subtitle_file is None and narration_audio is None and bgm_audio is None and not (request.watermark_file_name and request.logo_enabled) and not request.blur_box_enabled and not request.cinematic_bars_enabled and request.output_resolution == "original" and request.bgm_mode == BgmMode.demucs and request.video_speed == 1.0
 
 
-def _boxblur_radius(width: int, height: int) -> int:
-    # FFmpeg also applies the radius to chroma planes; for yuv420p those planes
-    # are about half-size, so small logo boxes need a smaller blur radius.
-    return max(1, min(20, min(width, height) // 4 - 1))
+def _gaussian_blur_sigma(width: int, height: int) -> int:
+    """Scale a strong content blur from 18px up to 25px."""
+    return 25
 
 
-def _mosaic_size(width: int, height: int) -> tuple[int, int]:
-    return max(8, width // 80), max(4, height // 80)
+def _append_soft_box_blur(
+    filter_parts: list[str],
+    video_label: str,
+    width: int,
+    height: int,
+    boxes: list[tuple[float, float, float, float, float | None, float | None]],
+    prefix: str,
+    pad_boxes: bool = True,
+) -> str:
+    scale = min(width / 1920, height / 1080)
+    padding = max(8, min(30, round(25 * max(scale, 0.35)))) if pad_boxes else 0
+    feather = max(6, min(25, round(20 * max(scale, 0.35))))
+    mask_sigma = max(2, round(feather / 3))
+    expressions: list[str] = []
+    for x_percent, y_percent, width_percent, height_percent, start, end in boxes:
+        x0 = max(0, round(width * x_percent / 100) - padding)
+        y0 = max(0, round(height * y_percent / 100) - padding)
+        x1 = min(width - 1, round(width * (x_percent + width_percent) / 100) + padding)
+        y1 = min(height - 1, round(height * (y_percent + height_percent) / 100) + padding)
+        spatial = f"between(X\\,{x0}\\,{x1})*between(Y\\,{y0}\\,{y1})"
+        if start is not None and end is not None and end > start:
+            fade = max(0.04, min(0.12, (end - start) / 3))
+            gate = (
+                f"clip((T-{start:.3f})/{fade:.3f}\\,0\\,1)*"
+                f"clip(({end:.3f}-T)/{fade:.3f}\\,0\\,1)"
+            )
+            expressions.append(f"({spatial})*({gate})")
+        else:
+            expressions.append(spatial)
+
+    if not expressions:
+        return video_label
+    combined = expressions[0]
+    for expression in expressions[1:]:
+        combined = f"max({combined}\\,{expression})"
+    blur_sigma = _gaussian_blur_sigma(width, height)
+    filter_parts.append(
+        f"{video_label}split=3[{prefix}_base][{prefix}_blur_source][{prefix}_mask_source]"
+    )
+    filter_parts.append(
+        f"[{prefix}_blur_source]gblur=sigma={blur_sigma}:steps=2[{prefix}_blurred]"
+    )
+    filter_parts.append(
+        f"[{prefix}_mask_source]format=gray,"
+        f"geq=lum='255*clip({combined}\\,0\\,1)',"
+        f"gblur=sigma={mask_sigma}:steps=2[{prefix}_mask]"
+    )
+    filter_parts.append(
+        f"[{prefix}_base][{prefix}_blurred][{prefix}_mask]"
+        f"maskedmerge=planes=15[{prefix}_out]"
+    )
+    return f"[{prefix}_out]"
 
 
 def _render_blur_band(y_percent: int, height_percent: int) -> tuple[int, int]:
-    if y_percent >= 65:
-        y_percent = min(y_percent, 76)
-        height_percent = max(height_percent, 100 - y_percent)
-    return y_percent, min(40, max(2, height_percent))
+    height_percent = min(40, max(2, height_percent))
+    y_percent = max(0, min(100 - height_percent, y_percent))
+    return y_percent, height_percent
 
 
 def _audio_output_args(request: DubbingRequest, has_narration: bool) -> list[str]:

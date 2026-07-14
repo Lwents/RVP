@@ -1,20 +1,25 @@
-"""
-Translation engine với proper noun protection tự động và Vietnamese post-processing.
+"""Contextual subtitle translation through the project's configured AI model.
 
-Các cải tiến chính:
-- Phát hiện proper nouns toàn cục bằng thống kê (không chỉ whitelist cứng)
-- Bảo vệ interjections (Oh, Wow, Hey, ...) khỏi bị dịch
-- Post-processing sửa lỗi Google Translate thường gặp khi dịch sang tiếng Việt
-- Context-aware: truyền 1 câu trước/sau vào batch để tránh mất ngữ cảnh
-- Giữ nguyên từ cảm thán tiếng Anh vốn dĩ không cần dịch
+The active engine translates ordered batches directly, preserving timestamps,
+Unicode NFC, character identity, relationships, glossary terms, and a rolling
+memory across long videos. Legacy Google helpers remain isolated for backwards
+compatibility tests but are never selected by ``get_translation_engine``.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
+import time
+import unicodedata
 from collections import Counter
+from collections.abc import Callable
+from pathlib import Path
 
 from app.core import settings
+from app.models.job import ProcessingMode
+from app.services.presets import ProcessingProfile, get_processing_profile
 from app.services.subtitles.timing import SubtitleEvent
 
 
@@ -30,6 +35,11 @@ class TranslationEngine:
         events: list[SubtitleEvent],
         source_language: str,
         target_language: str,
+        context: dict | None = None,
+        *,
+        processing_mode: ProcessingMode | str | None = None,
+        checkpoint_file: Path | None = None,
+        on_batch_progress: Callable[[int, int], None] | None = None,
     ) -> list[SubtitleEvent]:
         raise NotImplementedError
 
@@ -40,8 +50,169 @@ class PassthroughTranslation(TranslationEngine):
         events: list[SubtitleEvent],
         source_language: str,
         target_language: str,
+        context: dict | None = None,
+        *,
+        processing_mode: ProcessingMode | str | None = None,
+        checkpoint_file: Path | None = None,
+        on_batch_progress: Callable[[int, int], None] | None = None,
     ) -> list[SubtitleEvent]:
         return events
+
+
+class GeminiTranslation(TranslationEngine):
+    """Translate directly with the configured contextual AI model.
+
+    Batches are intentionally processed in order. Each request receives the
+    global character bible, a small overlap around the current batch, and
+    memory returned by the preceding batches. This keeps names, relationships,
+    gendered pronouns, and forms of address stable across a long video.
+    """
+
+    async def translate_events(
+        self,
+        events: list[SubtitleEvent],
+        source_language: str,
+        target_language: str,
+        context: dict | None = None,
+        *,
+        processing_mode: ProcessingMode | str | None = None,
+        checkpoint_file: Path | None = None,
+        on_batch_progress: Callable[[int, int], None] | None = None,
+    ) -> list[SubtitleEvent]:
+        if not events:
+            return []
+        if source_language != "auto" and source_language.lower() == target_language.lower():
+            return events
+        if not settings.ninerouter_api_key:
+            raise TranslationError(
+                "Chưa cấu hình API key 9router nên AI không thể dịch phụ đề."
+            )
+
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise TranslationError("Thiếu thư viện openai để gọi AI dịch phụ đề.") from exc
+
+        client = AsyncOpenAI(
+            api_key=settings.ninerouter_api_key,
+            base_url=settings.ninerouter_api_url,
+            # Retry is controlled below so one failing batch cannot silently
+            # multiply the SDK retries by the pipeline retries.
+            max_retries=0,
+        )
+        profile = get_processing_profile(processing_mode)
+        source_texts = [
+            unicodedata.normalize("NFC", _normalize_source_text(event.text.strip()))
+            for event in events
+        ]
+        ranges = _ai_translation_batch_ranges(
+            source_texts,
+            max_items=profile.translation_batch_items,
+            max_chars=profile.translation_batch_chars,
+        )
+        fingerprint = _translation_fingerprint(
+            source_texts,
+            source_language,
+            target_language,
+            context,
+            profile,
+        )
+        translated_texts, memory = _load_translation_checkpoint(
+            checkpoint_file,
+            fingerprint,
+            context,
+            ranges,
+        )
+        completed_batches = sum(end <= len(translated_texts) for _, end in ranges)
+        if on_batch_progress:
+            on_batch_progress(completed_batches, len(ranges))
+
+        started_at = time.monotonic()
+        total_budget = max(
+            profile.translation_request_timeout_seconds,
+            len(ranges) * profile.translation_batch_budget_seconds,
+        )
+
+        for batch_index, (start, end) in enumerate(ranges, start=1):
+            if end <= len(translated_texts):
+                continue
+            if start != len(translated_texts):
+                raise TranslationError(
+                    "Checkpoint dịch không nằm đúng ranh giới batch; hãy xóa checkpoint và chạy lại."
+                )
+            elapsed = time.monotonic() - started_at
+            if elapsed >= total_budget:
+                raise TranslationError(
+                    f"Dịch vượt quá ngân sách {int(total_budget)} giây; "
+                    f"đã lưu checkpoint {completed_batches}/{len(ranges)} batch để chạy tiếp."
+                )
+            batch = [
+                {"id": index + 1, "source": source_texts[index]}
+                for index in range(start, end)
+            ]
+            previous_context = [
+                {
+                    "id": index + 1,
+                    "source": source_texts[index],
+                    "translated": translated_texts[index],
+                }
+                for index in range(max(0, start - 8), start)
+            ]
+            next_context = [
+                {"id": index + 1, "source": source_texts[index]}
+                for index in range(end, min(len(source_texts), end + 4))
+            ]
+            batch_texts, memory_updates = await _translate_gemini_batch_with_retries(
+                client,
+                batch,
+                source_language,
+                target_language,
+                context,
+                memory,
+                previous_context,
+                next_context,
+                retries=profile.translation_retries,
+                request_timeout_seconds=profile.translation_request_timeout_seconds,
+            )
+
+            for item, translated in zip(batch, batch_texts):
+                source = str(item["source"])
+                cleaned = _clean_polished_subtitle(translated, "")
+                cleaned = unicodedata.normalize("NFC", cleaned)
+                if not cleaned or (
+                    target_language.lower() == "vi" and _looks_chinese(cleaned)
+                ):
+                    raise TranslationError(
+                        f"AI còn sót nội dung chưa dịch ở mục {item['id']}: {source[:120]}"
+                    )
+                translated_texts.append(cleaned)
+
+            _merge_translation_memory(memory, memory_updates)
+            memory["recent_translations"] = previous_context[-4:] + [
+                {
+                    "id": item["id"],
+                    "source": item["source"],
+                    "translated": translated,
+                }
+                for item, translated in zip(batch[-8:], batch_texts[-8:])
+            ]
+            completed_batches = batch_index
+            _write_translation_checkpoint(
+                checkpoint_file,
+                fingerprint,
+                translated_texts,
+                memory,
+                len(source_texts),
+            )
+            if on_batch_progress:
+                on_batch_progress(completed_batches, len(ranges))
+
+        if len(translated_texts) != len(events):
+            raise TranslationError("AI trả về thiếu câu dịch so với phụ đề nguồn.")
+        return [
+            SubtitleEvent(event.start, event.end, translated_texts[index])
+            for index, event in enumerate(events)
+        ]
 
 
 class GoogleTranslation(TranslationEngine):
@@ -50,6 +221,11 @@ class GoogleTranslation(TranslationEngine):
         events: list[SubtitleEvent],
         source_language: str,
         target_language: str,
+        context: dict | None = None,
+        *,
+        processing_mode: ProcessingMode | str | None = None,
+        checkpoint_file: Path | None = None,
+        on_batch_progress: Callable[[int, int], None] | None = None,
     ) -> list[SubtitleEvent]:
         if not events:
             return []
@@ -99,13 +275,518 @@ class GoogleTranslation(TranslationEngine):
                 for i, event in enumerate(events)
             ]
 
-        return await asyncio.to_thread(translate)
+        translated_events = await asyncio.to_thread(translate)
+        if target_language.lower() == "vi":
+            translated_events = await _polish_vietnamese_events_with_ai(
+                events,
+                translated_events,
+                source_language,
+                context,
+            )
+        return translated_events
 
 
 def get_translation_engine() -> TranslationEngine:
-    if settings.translation_engine.lower() == "google":
-        return GoogleTranslation()
-    return PassthroughTranslation()
+    if settings.translation_engine.lower() == "passthrough":
+        return PassthroughTranslation()
+    # "google" is accepted as a backwards-compatible configuration value so
+    # existing .env files immediately stop using the rate-limited unofficial
+    # Google endpoint. All real translation now goes directly through AI.
+    return GeminiTranslation()
+
+
+def _ai_translation_batch_ranges(
+    texts: list[str],
+    max_items: int = 20,
+    max_chars: int = 4600,
+) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    current_chars = 0
+    for index, text in enumerate(texts):
+        item_chars = len(text) + 60
+        if index > start and (
+            index - start >= max_items or current_chars + item_chars > max_chars
+        ):
+            ranges.append((start, index))
+            start = index
+            current_chars = 0
+        current_chars += item_chars
+    if start < len(texts):
+        ranges.append((start, len(texts)))
+    return ranges
+
+
+def _translation_fingerprint(
+    source_texts: list[str],
+    source_language: str,
+    target_language: str,
+    context: dict | None,
+    profile: ProcessingProfile,
+) -> str:
+    payload = {
+        "source_texts": source_texts,
+        "source_language": source_language,
+        "target_language": target_language,
+        "context": context or {},
+        "model": settings.ai_model,
+        "processing_mode": profile.name,
+        "batch_items": profile.translation_batch_items,
+        "batch_chars": profile.translation_batch_chars,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_translation_checkpoint(
+    checkpoint_file: Path | None,
+    fingerprint: str,
+    context: dict | None,
+    ranges: list[tuple[int, int]],
+) -> tuple[list[str], dict]:
+    fallback = ([], _initial_translation_memory(context))
+    if checkpoint_file is None or not checkpoint_file.is_file():
+        return fallback
+    try:
+        data = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+    if not isinstance(data, dict) or data.get("fingerprint") != fingerprint:
+        return fallback
+    translated = data.get("translated_texts")
+    memory = data.get("memory")
+    if not isinstance(translated, list) or not all(isinstance(item, str) for item in translated):
+        return fallback
+    if not isinstance(memory, dict):
+        return fallback
+    valid_offsets = {0, *(end for _, end in ranges)}
+    if len(translated) not in valid_offsets:
+        return fallback
+    return list(translated), memory
+
+
+def _write_translation_checkpoint(
+    checkpoint_file: Path | None,
+    fingerprint: str,
+    translated_texts: list[str],
+    memory: dict,
+    total_items: int,
+) -> None:
+    if checkpoint_file is None:
+        return
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "fingerprint": fingerprint,
+        "model": settings.ai_model,
+        "translated_items": len(translated_texts),
+        "total_items": total_items,
+        "completed": len(translated_texts) == total_items,
+        "translated_texts": translated_texts,
+        "memory": memory,
+    }
+    temporary = checkpoint_file.with_suffix(f"{checkpoint_file.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(checkpoint_file)
+
+
+def _initial_translation_memory(context: dict | None) -> dict:
+    return {
+        "character_bible": _compact_context(context),
+        "characters": [],
+        "relationships": [],
+        "glossary": {},
+        "addressing_rules": [],
+        "recent_translations": [],
+    }
+
+
+def _merge_translation_memory(memory: dict, updates: object) -> None:
+    if not isinstance(updates, dict):
+        return
+    for key in ("characters", "relationships", "addressing_rules"):
+        incoming = updates.get(key)
+        if not isinstance(incoming, list):
+            continue
+        existing = memory.setdefault(key, [])
+        if not isinstance(existing, list):
+            existing = []
+            memory[key] = existing
+        seen = {json.dumps(item, ensure_ascii=False, sort_keys=True) for item in existing}
+        for item in incoming[:30]:
+            encoded = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if encoded not in seen:
+                existing.append(item)
+                seen.add(encoded)
+        del existing[80:]
+
+    incoming_glossary = updates.get("glossary")
+    if isinstance(incoming_glossary, dict):
+        glossary = memory.setdefault("glossary", {})
+        if not isinstance(glossary, dict):
+            glossary = {}
+            memory["glossary"] = glossary
+        for source, translated in list(incoming_glossary.items())[:50]:
+            source_text = str(source).strip()
+            translated_text = str(translated).strip()
+            if source_text and translated_text:
+                glossary[source_text] = translated_text
+        if len(glossary) > 120:
+            for key in list(glossary)[:-120]:
+                glossary.pop(key, None)
+
+
+async def _translate_gemini_batch(
+    client,
+    batch: list[dict[str, object]],
+    source_language: str,
+    target_language: str,
+    context: dict | None,
+    memory: dict,
+    previous_context: list[dict[str, object]],
+    next_context: list[dict[str, object]],
+    request_timeout_seconds: float = 150,
+) -> tuple[list[str], dict]:
+    system_prompt = (
+        "Bạn là biên dịch viên phụ đề phim nhiều tập, chuyên giữ nhất quán nhân vật và ngữ cảnh. "
+        "Hãy dịch TRỰC TIẾP từ ngôn ngữ nguồn sang tiếng Việt tự nhiên; không dùng bản dịch máy trung gian.\n\n"
+        "Quy tắc bắt buộc:\n"
+        "- Trả đúng JSON object gồm items và memory_updates.\n"
+        "- items phải giữ nguyên đủ id, đúng thứ tự và số lượng của CURRENT_ITEMS; không gộp/tách/thêm câu.\n"
+        "- Mỗi item có dạng {\"id\":1,\"text\":\"...\"}; text chỉ chứa bản dịch, không giải thích.\n"
+        "- Giữ nguyên ý, không bịa tình tiết, không thêm tên người nói nếu câu nguồn không có.\n"
+        "- Dùng CHARACTER_BIBLE và MEMORY làm sự thật ưu tiên cho tên, biệt danh, giới tính, quan hệ và xưng hô.\n"
+        "- Một nhân vật phải giữ cùng tên Hán Việt/Việt hóa trong toàn bộ video. Không đổi tên giữa các batch.\n"
+        "- Chỉ xác định giới tính, vai vế hoặc quan hệ khi câu nguồn/ngữ cảnh có bằng chứng; chưa chắc thì dùng cách gọi trung tính.\n"
+        "- PREVIOUS_CONTEXT và NEXT_CONTEXT chỉ giúp hiểu đại từ/người nói; tuyệt đối không dịch chúng vào items.\n"
+        "- Câu ngắn, tự nhiên, phù hợp thời lượng phụ đề/lồng tiếng; không để sót chữ Trung, pinyin hoặc chú thích.\n"
+        "- memory_updates chỉ ghi thông tin nhân vật mới được CURRENT_ITEMS xác nhận, gồm characters, relationships, glossary, addressing_rules.\n"
+    )
+    payload = {
+        "source_language": source_language,
+        "target_language": target_language,
+        "character_bible": _compact_context(context),
+        "memory": memory,
+        "previous_context": previous_context,
+        "current_items": batch,
+        "next_context": next_context,
+    }
+    response = await client.chat.completions.create(
+        model=settings.ai_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.15,
+        timeout=request_timeout_seconds,
+    )
+    content = response.choices[0].message.content or ""
+    data = _loads_json_object(content)
+    items = data.get("items")
+    if not isinstance(items, list):
+        raise TranslationError("AI không trả về danh sách items.")
+
+    expected_ids = [int(item["id"]) for item in batch]
+    by_id: dict[int, str] = {}
+    duplicate_ids: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if item_id in by_id:
+            duplicate_ids.add(item_id)
+        text = unicodedata.normalize("NFC", str(item.get("text") or "").strip())
+        if text:
+            by_id[item_id] = text
+    missing = [item_id for item_id in expected_ids if item_id not in by_id]
+    unexpected = [item_id for item_id in by_id if item_id not in expected_ids]
+    if missing or unexpected or duplicate_ids or len(items) != len(batch):
+        raise TranslationError(
+            "AI trả sai cấu trúc batch "
+            f"(thiếu={missing}, thừa={unexpected}, trùng={sorted(duplicate_ids)})."
+        )
+    translated = [by_id[item_id] for item_id in expected_ids]
+    if target_language.lower() == "vi" and any(_looks_chinese(text) for text in translated):
+        raise TranslationError("AI còn để sót chữ Trung trong batch dịch.")
+    updates = data.get("memory_updates")
+    return translated, updates if isinstance(updates, dict) else {}
+
+
+async def _translate_gemini_batch_with_retries(
+    client,
+    batch: list[dict[str, object]],
+    source_language: str,
+    target_language: str,
+    context: dict | None,
+    memory: dict,
+    previous_context: list[dict[str, object]],
+    next_context: list[dict[str, object]],
+    retries: int = 3,
+    request_timeout_seconds: float = 150,
+) -> tuple[list[str], dict]:
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await asyncio.wait_for(
+                _translate_gemini_batch(
+                    client,
+                    batch,
+                    source_language,
+                    target_language,
+                    context,
+                    memory,
+                    previous_context,
+                    next_context,
+                    request_timeout_seconds=request_timeout_seconds,
+                ),
+                timeout=request_timeout_seconds + 5,
+            )
+        except TimeoutError as exc:
+            last_error = TranslationError(
+                f"9router không phản hồi trong {int(request_timeout_seconds)} giây"
+            )
+        except Exception as exc:
+            last_error = exc
+        if attempt < retries:
+            await asyncio.sleep(min(2 * attempt, 6))
+    assert last_error is not None
+    first_id = batch[0]["id"] if batch else "?"
+    last_id = batch[-1]["id"] if batch else "?"
+    raise TranslationError(
+        f"AI {settings.ai_model} không dịch được batch {first_id}-{last_id}: {last_error}"
+    ) from last_error
+
+
+# ─── AI Vietnamese subtitle editor ───────────────────────────────────────────
+
+async def _polish_vietnamese_events_with_ai(
+    source_events: list[SubtitleEvent],
+    draft_events: list[SubtitleEvent],
+    source_language: str,
+    context: dict | None = None,
+) -> list[SubtitleEvent]:
+    if not draft_events or not settings.ninerouter_api_key:
+        return draft_events
+
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        return draft_events
+
+    polished: list[SubtitleEvent] = []
+    failed_batches = 0
+    client = AsyncOpenAI(
+        api_key=settings.ninerouter_api_key,
+        base_url=settings.ninerouter_api_url,
+    )
+
+    for batch in _ai_polish_batches(source_events, draft_events):
+        try:
+            edited = await _polish_vietnamese_batch_with_retries(client, batch, source_language, context)
+        except Exception as exc:
+            print(f"AI subtitle polish fallback: {exc}")
+            failed_batches += 1
+            edited = [item["draft"] for item in batch]
+
+        for item, text in zip(batch, edited):
+            cleaned = _clean_polished_subtitle(text, item["draft"])
+            polished.append(
+                SubtitleEvent(
+                    item["start"],
+                    item["end"],
+                    _fix_character_names(cleaned),
+                )
+            )
+
+    if len(polished) != len(draft_events):
+        return draft_events
+    if failed_batches and _source_requires_ai_polish(source_events):
+        raise TranslationError(
+            "AI biên tập phụ đề không chạy được nên không dùng bản dịch thô. "
+            "Hãy bật 9router/AI ở localhost:20128 rồi chạy lại."
+        )
+    return polished
+
+
+def _ai_polish_batches(
+    source_events: list[SubtitleEvent],
+    draft_events: list[SubtitleEvent],
+    max_items: int = 18,
+    max_chars: int = 5200,
+) -> list[list[dict[str, object]]]:
+    batches: list[list[dict[str, object]]] = []
+    current: list[dict[str, object]] = []
+    current_chars = 0
+
+    for index, (source, draft) in enumerate(zip(source_events, draft_events), start=1):
+        source_text = _normalize_source_text(source.text.strip())
+        draft_text = draft.text.strip()
+        item = {
+            "id": index,
+            "start": draft.start,
+            "end": draft.end,
+            "source": source_text,
+            "draft": draft_text,
+        }
+        item_chars = len(source_text) + len(draft_text) + 80
+        if current and (len(current) >= max_items or current_chars + item_chars > max_chars):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(item)
+        current_chars += item_chars
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def _polish_vietnamese_batch(
+    client,
+    batch: list[dict[str, object]],
+    source_language: str,
+    context: dict | None,
+) -> list[str]:
+    system_prompt = (
+        "Bạn là biên tập viên phụ đề/lồng tiếng Việt chuyên review phim cổ trang Trung Quốc, donghua. "
+        "Nhiệm vụ: sửa bản dịch nháp để câu thoại tự nhiên, đúng xưng hô và dễ đọc khi lồng tiếng.\n\n"
+        "Quy tắc bắt buộc:\n"
+        "- Trả về đúng JSON object: {\"items\":[{\"id\":1,\"text\":\"...\"}]}.\n"
+        "- Giữ nguyên số lượng item và id. Không thêm, xoá, gộp, tách dòng.\n"
+        "- Không thêm sự kiện mới, không bịa nội dung ngoài câu gốc.\n"
+        "- Câu ngắn, hợp phụ đề và giọng đọc; ưu tiên 1-2 câu mỗi item.\n"
+        "- Dùng xưng hô cổ trang hợp ngữ cảnh: bệ hạ, thần, phụ hoàng, phụ thân, huynh, tỷ, công tử, đại nhân.\n"
+        "- Nếu là vua/hoàng đế nói với quần thần dùng 'trẫm/khanh'; thần tử nói với vua dùng 'thần/bệ hạ'.\n"
+        "- Không đổi quan hệ. Tuyệt đối không dịch thành vợ/chồng/kết hôn nếu câu gốc không có 老婆, 妻子, 丈夫, 结婚, 婚约 hoặc nghĩa hôn nhân rõ ràng.\n"
+        "- Nếu quan hệ chưa rõ, dùng trung tính: người phụ nữ, người đàn ông, cô ấy, hắn ta, người tình một đêm, nam chính/nữ chính.\n"
+        "- Giữ tên riêng nhất quán theo Hán Việt nếu nhận ra: Chu Nguyên Chương, Chu Kỳ Ngọc, Hồng Vũ, Vĩnh Lạc, Mặc Nguyệt, Tần ca, Long tỷ.\n"
+        "- Các cụm bị ASR/OCR sai phải sửa theo nghĩa: 照办 = làm theo, 照常 = như thường, 父亲 = phụ thân.\n"
+        "- Nếu gặp 海繁的动物/还能翻得动不 hoặc 翻得动: hiểu là 'còn nhào lộn nổi không', tuyệt đối không dịch thành động vật/biển.\n"
+        "- Nếu phần CONTEXT có tên phim, nhân vật, quan hệ, vai vế hoặc glossary thì ưu tiên dùng để sửa tên và xưng hô.\n"
+        "- Không để sót tiếng Trung, pinyin thô hoặc tên sai kiểu Zhaoban/Zhan Xiang/Qixia/Mo Yue nếu có thể sửa.\n"
+    )
+    user_prompt = {
+        "source_language": source_language,
+        "context": _compact_context(context),
+        "items": [
+            {
+                "id": item["id"],
+                "source": item["source"],
+                "draft_vi": item["draft"],
+            }
+            for item in batch
+        ],
+    }
+    response = await client.chat.completions.create(
+        model=settings.ai_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.25,
+        timeout=90,
+    )
+    content = response.choices[0].message.content or ""
+    data = _loads_json_object(content)
+    items = data.get("items")
+    if not isinstance(items, list):
+        raise TranslationError("AI polish không trả về items.")
+
+    by_id: dict[int, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_id = int(item.get("id"))
+        except Exception:
+            continue
+        text = str(item.get("text") or "").strip()
+        if text:
+            by_id[item_id] = text
+
+    result: list[str] = []
+    for item in batch:
+        item_id = int(item["id"])
+        result.append(by_id.get(item_id, str(item["draft"])))
+    return result
+
+
+async def _polish_vietnamese_batch_with_retries(
+    client,
+    batch: list[dict[str, object]],
+    source_language: str,
+    context: dict | None,
+    retries: int = 3,
+) -> list[str]:
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await _polish_vietnamese_batch(client, batch, source_language, context)
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                await asyncio.sleep(min(2 * attempt, 6))
+    assert last_error is not None
+    raise last_error
+
+
+def _source_requires_ai_polish(events: list[SubtitleEvent]) -> bool:
+    joined = " ".join(event.text for event in events[:80])
+    return _looks_chinese(joined)
+
+
+def _compact_context(context: dict | None) -> dict:
+    if not isinstance(context, dict):
+        return {}
+    allowed = {
+        "film_title",
+        "genre",
+        "setting",
+        "characters",
+        "relationships",
+        "glossary",
+        "honorific_rules",
+        "translation_notes",
+        "relationship_constraints",
+    }
+    compact = {key: context.get(key) for key in allowed if context.get(key)}
+    return compact
+
+
+def _loads_json_object(content: str) -> dict:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", content, flags=re.S)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def _clean_polished_subtitle(text: str, fallback: str) -> str:
+    cleaned = _clean_translation(text)
+    cleaned = cleaned.replace("\\N", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n\"'")
+    cleaned = re.sub(r"\.{4,}", "...", cleaned)
+    cleaned = re.sub(r"\s+([.,!?:;])", r"\1", cleaned)
+    cleaned = re.sub(r",([^\s])", r", \1", cleaned)
+    if not cleaned or _looks_chinese(cleaned):
+        return fallback
+    return cleaned
 
 
 # ─── Google Translate API ─────────────────────────────────────────────────────
@@ -224,7 +905,12 @@ _SOURCE_TEXT_FIXES: list[tuple[re.Pattern, str]] = [
     (re.compile("战相"), "照常"),
     (re.compile("太阳照常"), "太阳照常"),
     (re.compile("不清"), "父亲"),
+    (re.compile("不苦"), "不哭"),
+    (re.compile("莫苦"), "莫哭"),
+    (re.compile("一莫哭"), "莫哭"),
     (re.compile("初期"), "朱祁钰"),
+    (re.compile("朱言此精花此数"), "朱颜辞镜花辞树"),
+    (re.compile("尊是人间留不住"), "最是人间留不住"),
     (re.compile("朱言"), "朱元璋"),
     (re.compile("红武朝"), "洪武朝"),
     (re.compile("从西朝"), "正统朝"),
@@ -233,6 +919,11 @@ _SOURCE_TEXT_FIXES: list[tuple[re.Pattern, str]] = [
     (re.compile("七夏山"), "栖霞山"),
     (re.compile("秦哥"), "秦哥"),
     (re.compile("龙姐"), "龙姐"),
+    (re.compile("海繁的动物"), "还能翻得动不"),
+    (re.compile("繁的动"), "翻得动"),
+    (re.compile("能连繁"), "能连翻"),
+    (re.compile("能繁多少"), "能翻多少"),
+    (re.compile("不插气"), "不喘气"),
 ]
 
 
@@ -499,12 +1190,31 @@ _VI_NAME_FIXES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"Thái tử và đại sư", re.IGNORECASE), "Thái tử thái sư"),
     (re.compile(r"Hãy hứa với chúng tôi một điều", re.IGNORECASE), "Xin hãy hứa với thần một điều"),
     (re.compile(r"Thưa bệ hạ, tôi sẽ làm theo lời ngài", re.IGNORECASE), "Bệ hạ nói gì, thần nhất định sẽ làm theo"),
+    (re.compile(r"Xin hãy hứa với ta một chuyện", re.IGNORECASE), "Xin hãy hứa với trẫm một chuyện"),
+    (re.compile(r"\bHứa với ta một chuyện", re.IGNORECASE), "Hứa với trẫm một chuyện"),
+    (re.compile(r"\bHứa với ta một việc", re.IGNORECASE), "Hứa với trẫm một việc"),
+    (re.compile(r"Hãy thay ta bảo vệ", re.IGNORECASE), "Hãy thay trẫm bảo vệ"),
+    (re.compile(r"\bThay ta bảo vệ", re.IGNORECASE), "Thay trẫm bảo vệ"),
+    (re.compile(r"bảo vệ nó", re.IGNORECASE), "bảo vệ người ấy"),
+    (re.compile(r"bảo vệ người\. Dốc", re.IGNORECASE), "bảo vệ người ấy. Dốc"),
+    (re.compile(r"để nó sống", re.IGNORECASE), "để người ấy sống"),
+    (re.compile(r"Hãy bảo vệ nó, bảo vệ cho tốt", re.IGNORECASE), "Hãy bảo vệ người ấy, bảo vệ cho tốt"),
+    (re.compile(r"Bảo nó cứ sống như thường", re.IGNORECASE), "Bảo người ấy cứ sống như thường"),
+    (re.compile(r"bảo vệ hắn", re.IGNORECASE), "bảo vệ người ấy"),
+    (re.compile(r"Bệ hạ cứ nói, tôi", re.IGNORECASE), "Bệ hạ cứ nói, thần"),
+    (re.compile(r"Bệ hạ cứ nói, con", re.IGNORECASE), "Bệ hạ cứ nói, thần"),
+    (re.compile(r"Bệ hạ nói gì, tôi", re.IGNORECASE), "Bệ hạ nói gì, thần"),
+    (re.compile(r"Bệ hạ nói gì, con", re.IGNORECASE), "Bệ hạ nói gì, thần"),
     (re.compile(r"Hãy bảo vệ anh ấy bằng gần như toàn bộ sức lực của bạn", re.IGNORECASE), "Thần sẽ dốc gần như toàn lực để bảo vệ người ấy"),
     (re.compile(r"Hãy bảo anh ấy làm như bình thường\.?\s*Gọi mặt trời như thường lệ\.?\s*Gọi mặt trời như thường lệ\.?", re.IGNORECASE), "Hãy để mặt trời vẫn chiếu như thường."),
     (re.compile(r"Xin đừng giữ Mặc Nguyệt lên núi Tê Hà", re.IGNORECASE), "Xin hãy ôm Mặc Nguyệt lên núi Tê Hà"),
+    (re.compile(r"Làm phiền ôm Mặc Nguyệt lên núi Tê Hà", re.IGNORECASE), "Xin hãy ôm Mặc Nguyệt lên núi Tê Hà"),
     (re.compile(r"Đừng để mọi người tan vỡ", re.IGNORECASE), "Sinh ly tử biệt khiến người ta rơi lệ"),
     (re.compile(r"Đếm xem Tần ca có thể nhân lên bao nhiêu lần", re.IGNORECASE), "Đếm xem Tần ca làm được bao nhiêu lần"),
+    (re.compile(r"Tần ca, huynh nói xem, động vật dưới biển\.{0,3}", re.IGNORECASE), "Tần ca, huynh nói xem, huynh còn nhào lộn nổi không?"),
+    (re.compile(r"Tần ca, huynh nói xem, .*?dưới biển\.{0,3}", re.IGNORECASE), "Tần ca, huynh nói xem, huynh còn nhào lộn nổi không?"),
     (re.compile(r"Cha ơi con ở đây", re.IGNORECASE), "Phụ thân, con ở đây"),
+    (re.compile(r"Được\.\.\. ta sẽ sống thật tốt", re.IGNORECASE), "Được... con sẽ sống thật tốt"),
     (re.compile(r"Cha ơi, sao trời tối thế", re.IGNORECASE), "Phụ thân, sao trời tối thế"),
     (re.compile(r"ngay cả cha tôi cũng là học trò của ông", re.IGNORECASE), "ngay cả phụ hoàng của ta cũng là học trò của ông"),
 ]

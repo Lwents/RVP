@@ -1,5 +1,7 @@
 from pathlib import Path
 import asyncio
+import traceback
+from datetime import UTC, datetime
 from typing import Callable
 
 from app.core import settings
@@ -9,8 +11,9 @@ from app.services.media.downloader import prepare_source_video
 from app.services.media.ffmpeg import extract_audio, extract_demucs_audio, find_ffmpeg, probe_video_duration
 from app.services.media.renderer import render_video
 from app.services.media.separation import separate_background_with_demucs
+from app.services.presets import get_processing_profile
 from app.services.store import job_store
-from app.services.subtitles.source import get_or_create_subtitles
+from app.services.subtitles.source import asr_timeout_for_duration, get_or_create_subtitles
 from app.models.job import PublishTarget
 
 class PipelineError(RuntimeError):
@@ -30,6 +33,23 @@ async def process_dubbing_job(job_id: str) -> None:
             job_store.update(job_id, stage=stage, progress=percent)
 
         voice_warning: str | None = None
+        profile = get_processing_profile(job.request.processing_mode)
+        effective_request = job.request
+        if (
+            not profile.use_demucs
+            and job.request.use_demucs
+            and job.request.bgm_mode != BgmMode.none
+        ):
+            effective_request = job.request.model_copy(
+                update={
+                    "use_demucs": False,
+                    "bgm_mode": (
+                        BgmMode.ducking
+                        if job.request.bgm_mode == BgmMode.demucs
+                        else job.request.bgm_mode
+                    ),
+                }
+            )
 
         job_store.update(job_id, status=JobStatus.processing, stage="Kiểm tra môi trường xử lý", progress=5)
         ffmpeg = find_ffmpeg()
@@ -50,8 +70,10 @@ async def process_dubbing_job(job_id: str) -> None:
 
         progress("Tách audio bằng FFmpeg", 25)
         audio_file = work_dir / "source_audio.wav"
-        await extract_audio(ffmpeg, source_video, audio_file)
+        if not audio_file.exists() or audio_file.stat().st_size == 0:
+            await extract_audio(ffmpeg, source_video, audio_file)
         video_duration = await probe_video_duration(ffmpeg, source_video)
+        asr_timeout_seconds = asr_timeout_for_duration(video_duration)
 
         progress("Kiểm tra AI engine", 40)
         if settings.ai_engine != "passthrough":
@@ -61,13 +83,20 @@ async def process_dubbing_job(job_id: str) -> None:
             )
 
         bgm_audio: Path | None = None
-        if job.request.bgm_mode != BgmMode.none:
-            if job.request.use_demucs:
+        if effective_request.bgm_mode != BgmMode.none:
+            if effective_request.use_demucs:
                 progress("Tách nhạc nền và giọng nói gốc bằng Demucs", 45)
                 try:
                     demucs_audio = work_dir / "demucs_audio.wav"
-                    await extract_demucs_audio(ffmpeg, source_video, demucs_audio)
-                    bgm_audio = await separate_background_with_demucs(demucs_audio, work_dir / "separated" / "htdemucs" / demucs_audio.stem)
+                    if not demucs_audio.exists() or demucs_audio.stat().st_size == 0:
+                        await extract_demucs_audio(ffmpeg, source_video, demucs_audio)
+                    separated_dir = work_dir / "separated" / "htdemucs" / demucs_audio.stem
+                    existing_bgm = separated_dir / "no_vocals.wav"
+                    bgm_audio = (
+                        existing_bgm
+                        if existing_bgm.exists() and existing_bgm.stat().st_size > 0
+                        else await separate_background_with_demucs(demucs_audio, separated_dir)
+                    )
                 except Exception as exc:
                     print(f"Demucs warning/error: {exc}")
                     bgm_audio = None
@@ -82,15 +111,22 @@ async def process_dubbing_job(job_id: str) -> None:
                 work_dir,
                 job.request.source_language,
                 progress,
+                source_video,
+                asr_timeout_seconds=asr_timeout_seconds,
+                processing_mode=job.request.processing_mode,
             )
             progress("Tạo giọng đọc khớp phụ đề", 70)
-            narration_audio, voice_warning = await _try_synthesize_voice(
-                subtitle_file,
-                work_dir / "narration_timed.wav",
-                job.request.voice_gender,
-                video_duration,
-                progress,
-            )
+            narration_file = work_dir / "narration_timed.wav"
+            if narration_file.exists() and narration_file.stat().st_size > 0:
+                narration_audio, voice_warning = narration_file, None
+            else:
+                narration_audio, voice_warning = await _try_synthesize_voice(
+                    subtitle_file,
+                    narration_file,
+                    job.request.voice_gender,
+                    video_duration,
+                    progress,
+                )
             output_file = work_dir / "output_keep_existing_subtitles.mp4"
             progress(
                 "Render giọng đọc theo timecode" if narration_audio else "Edge TTS lỗi, render video với âm thanh gốc",
@@ -101,7 +137,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 source_video,
                 output_file,
                 work_dir,
-                job.request,
+                effective_request,
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=None,
                 narration_audio=narration_audio,
@@ -115,15 +151,22 @@ async def process_dubbing_job(job_id: str) -> None:
                 work_dir,
                 job.request.source_language,
                 progress,
+                source_video,
+                asr_timeout_seconds=asr_timeout_seconds,
+                processing_mode=job.request.processing_mode,
             )
             progress("Tạo giọng đọc khớp phụ đề", 70)
-            narration_audio, voice_warning = await _try_synthesize_voice(
-                subtitle_file,
-                work_dir / "narration_timed.wav",
-                job.request.voice_gender,
-                video_duration,
-                progress,
-            )
+            narration_file = work_dir / "narration_timed.wav"
+            if narration_file.exists() and narration_file.stat().st_size > 0:
+                narration_audio, voice_warning = narration_file, None
+            else:
+                narration_audio, voice_warning = await _try_synthesize_voice(
+                    subtitle_file,
+                    narration_file,
+                    job.request.voice_gender,
+                    video_duration,
+                    progress,
+                )
             output_file = work_dir / "output_hardsub.mp4"
             progress(
                 "Render phụ đề và giọng đọc theo live view" if narration_audio else "Edge TTS lỗi, render phụ đề với âm thanh gốc",
@@ -134,7 +177,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 source_video,
                 output_file,
                 work_dir,
-                job.request,
+                effective_request,
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=subtitle_file,
                 narration_audio=narration_audio,
@@ -149,7 +192,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 source_video,
                 output_file,
                 work_dir,
-                job.request,
+                effective_request,
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=None,
                 bgm_audio=bgm_audio,
@@ -196,6 +239,7 @@ async def process_dubbing_job(job_id: str) -> None:
             status=JobStatus.completed,
             stage="Hoàn tất pipeline và phụ đề",
             progress=100,
+            completed_at=datetime.now(UTC),
             output_video_url=f"/api/jobs/{job_id}/download",
             output_file_path=str(output_file),
             seo_title=seo_title,
@@ -207,7 +251,9 @@ async def process_dubbing_job(job_id: str) -> None:
         job_store.update(job_id, status=JobStatus.failed, stage="Đã huỷ", error="Người dùng huỷ tiến trình.")
         raise
     except Exception as exc:
-        job_store.update(job_id, status=JobStatus.failed, stage="Xử lý thất bại", error=str(exc))
+        traceback.print_exc()
+        error = str(exc).strip() or f"{type(exc).__name__}: {exc!r}"
+        job_store.update(job_id, status=JobStatus.failed, stage="Xử lý thất bại", error=error)
     finally:
         from app.services import task_manager
         task_manager.unregister_task(job_id)

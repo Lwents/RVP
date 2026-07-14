@@ -9,6 +9,8 @@ Cải tiến:
 from pathlib import Path
 
 from app.core import settings
+from app.models.job import ProcessingMode
+from app.services.presets import get_processing_profile
 from app.services.subtitles.ass import write_srt
 from app.services.subtitles.timing import SubtitleEvent
 
@@ -45,13 +47,27 @@ _INITIAL_PROMPTS: dict[str, str] = {
 
 
 class AsrEngine:
-    async def transcribe_to_srt(self, audio_file: Path, output_file: Path, language: str) -> Path:
+    async def transcribe_to_srt(
+        self,
+        audio_file: Path,
+        output_file: Path,
+        language: str,
+        processing_mode: ProcessingMode | str | None = None,
+    ) -> Path:
         raise NotImplementedError
 
 
 class FasterWhisperAsr(AsrEngine):
-    async def transcribe_to_srt(self, audio_file: Path, output_file: Path, language: str) -> Path:
+    async def transcribe_to_srt(
+        self,
+        audio_file: Path,
+        output_file: Path,
+        language: str,
+        processing_mode: ProcessingMode | str | None = None,
+    ) -> Path:
         import asyncio
+
+        profile = get_processing_profile(processing_mode)
 
         def transcribe() -> Path:
             _load_nvidia_runtime_dlls()
@@ -74,8 +90,8 @@ class FasterWhisperAsr(AsrEngine):
                 str(audio_file),
                 language=whisper_language,
                 vad_filter=settings.whisper_vad_filter,
-                beam_size=settings.whisper_beam_size,
-                word_timestamps=settings.whisper_word_timestamps,
+                beam_size=profile.whisper_beam_size,
+                word_timestamps=profile.whisper_word_timestamps,
                 condition_on_previous_text=True,   # giúp giữ ngữ cảnh tên nhân vật
                 initial_prompt=initial_prompt,
                 # Giảm hallucination: segment im lặng bị bỏ

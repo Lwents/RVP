@@ -39,13 +39,18 @@ class JobStore:
 
     def list(self) -> list[JobProgress]:
         with self._lock:
-            return sorted(self._jobs.values(), key=lambda item: item.created_at, reverse=True)
+            return sorted(
+                self._jobs.values(),
+                key=lambda item: item.completed_at or item.updated_at,
+                reverse=True,
+            )
 
-    def clear(self) -> None:
+    def clear(self) -> list[str]:
         with self._lock:
-            self._trash_job_artifacts_unlocked()
+            warnings = self._trash_job_artifacts_unlocked()
             self._jobs.clear()
             self._save_unlocked()
+            return warnings
 
     def update(self, job_id: str, **changes: object) -> JobProgress:
         with self._lock:
@@ -64,7 +69,14 @@ class JobStore:
         try:
             data = json.loads(self._index_file.read_text(encoding="utf-8"))
             self._jobs = {
-                item["job_id"]: JobProgress.model_validate(item)
+                item["job_id"]: JobProgress.model_validate(
+                    {
+                        **item,
+                        "completed_at": item.get("completed_at") or (
+                            item.get("updated_at") if item.get("status") == JobStatus.completed.value else None
+                        ),
+                    }
+                )
                 for item in data
                 if isinstance(item, dict) and item.get("job_id")
             }
@@ -96,23 +108,22 @@ class JobStore:
         data = [job.model_dump(mode="json") for job in self._jobs.values()]
         self._index_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _trash_job_artifacts_unlocked(self) -> None:
+    def _trash_job_artifacts_unlocked(self) -> list[str]:
         paths = self._artifact_paths_unlocked()
         if not paths:
-            return
+            return []
         try:
             from send2trash import send2trash
         except ImportError as exc:
             raise RuntimeError("Thiếu Send2Trash. Chạy pip install -r requirements.txt trong backend.") from exc
 
-        errors: list[str] = []
+        warnings: list[str] = []
         for path in paths:
             try:
                 send2trash(str(path))
             except Exception as exc:
-                errors.append(f"{path}: {exc}")
-        if errors:
-            raise RuntimeError("Không đưa được một số file job vào thùng rác:\n" + "\n".join(errors[:10]))
+                warnings.append(f"{path}: {exc}")
+        return warnings[:10]
 
     def _artifact_paths_unlocked(self) -> list[Path]:
         storage_dir = Path(settings.storage_dir).resolve()
