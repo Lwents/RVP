@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 import json
 
 from app.core import settings
-from app.models.job import BgmMode, CustomBlurBox, DubbingRequest, JobCreateResponse, JobProgress, JobStatus, UploadResponse
+from app.models.job import BgmMode, CustomBlurBox, DubbingRequest, JobCreateResponse, JobProgress, JobStatus, ProcessingMode, UploadResponse
 from app.models.review import (
     AnalyzedScene,
     EditDecision,
@@ -57,6 +57,7 @@ class ReviewDraftRequest(BaseModel):
     custom_blur_boxes: list[CustomBlurBox] = Field(default_factory=list)
     watermark_file_name: str | None = None
     output_resolution: str = "original"
+    processing_mode: ProcessingMode = "balanced"
 
 
 class ReviewBeatResponse(BaseModel):
@@ -117,8 +118,24 @@ class ReviewSegmentPatchRequest(BaseModel):
     end_seconds: float | None = Field(default=None, ge=0)
 
 
+class ReviewRetryRequest(BaseModel):
+    processing_mode: ProcessingMode | None = None
+
+
 REVIEW_JOBS_INDEX_FILE = Path(settings.storage_dir) / "review_jobs_index.json"
 review_draft_jobs: dict[str, ReviewDraftJob] = {}
+review_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+def _start_review_task(job_id: str, coroutine) -> None:
+    task = asyncio.create_task(coroutine)
+    review_tasks[job_id] = task
+
+    def discard(completed: asyncio.Task[None]) -> None:
+        if review_tasks.get(job_id) is completed:
+            review_tasks.pop(job_id, None)
+
+    task.add_done_callback(discard)
 
 
 def _load_review_jobs() -> None:
@@ -436,6 +453,11 @@ def _format_review_time_hint(start: float, end: float) -> str:
     return f"{stamp(start)}-{stamp(end)}"
 
 
+def _review_package_progress(percent: int) -> int:
+    """Map package-local 53..79 progress after translation's 70..80 range."""
+    return 80 + int((max(53, min(79, percent)) - 53) * 3 / 26)
+
+
 def _build_review_render_request(request: ReviewDraftRequest, source_video: Path) -> DubbingRequest:
     from app.models.job import VoiceGender
 
@@ -469,6 +491,7 @@ def _build_review_render_request(request: ReviewDraftRequest, source_video: Path
         blur_box_height_percent=request.blur_box_height_percent,
         custom_blur_boxes=request.custom_blur_boxes,
         watermark_file_name=request.watermark_file_name,
+        processing_mode=request.processing_mode,
     )
 
 
@@ -501,7 +524,8 @@ async def _process_review_draft_job(job_id: str) -> None:
 
         _update_review_job(job_id, progress=20, stage="Tach audio phim")
         audio_file = work_dir / "source_audio.wav"
-        await extract_audio(ffmpeg, source_video, audio_file)
+        if not audio_file.is_file() or audio_file.stat().st_size == 0:
+            await extract_audio(ffmpeg, source_video, audio_file)
         video_duration = await probe_video_duration(ffmpeg, source_video)
         asr_timeout_seconds = _review_asr_timeout(video_duration)
 
@@ -515,6 +539,9 @@ async def _process_review_draft_job(job_id: str) -> None:
                 progress,
                 source_video,
                 asr_timeout_seconds=asr_timeout_seconds,
+                processing_mode=job.request.processing_mode,
+                translation_progress_start=70,
+                translation_progress_end=80,
             )
         except Exception as subtitle_error:
             # Review analysis is multilingual and can continue from the source
@@ -528,8 +555,8 @@ async def _process_review_draft_job(job_id: str) -> None:
                 raise
             _update_review_job(
                 job_id,
-                progress=50,
-                stage=f"Dịch tạm lỗi; Gemini sẽ phân tích trực tiếp phụ đề nguồn ({subtitle_error})",
+                progress=80,
+                stage=f"Dịch tạm lỗi; AI sẽ phân tích trực tiếp phụ đề nguồn ({subtitle_error})",
             )
 
         package = await build_verified_review_package(
@@ -543,8 +570,9 @@ async def _process_review_draft_job(job_id: str) -> None:
             lambda stage, percent: _update_review_job(
                 job_id,
                 stage=stage,
-                progress=max(50, min(82, percent)),
+                progress=_review_package_progress(percent),
             ),
+            processing_mode=job.request.processing_mode,
         )
 
         package.edit_decision_list = _review_decisions_with_urls(job_id, package.edit_decision_list)
@@ -553,7 +581,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             _update_review_job(
                 job_id,
                 status="needs_review",
-                progress=82,
+                progress=83,
                 stage=(
                     f"QA {package.quality_report.overall_score:.1f}/100: "
                     "cần duyệt các câu màu đỏ trước khi render"
@@ -609,8 +637,13 @@ async def _process_review_draft_job(job_id: str) -> None:
             render_request,
         )
 
-        _update_review_job(job_id, progress=98, stage="Gemini kiểm tra lại hình và lời sau render")
-        post_report = await verify_rendered_review(draft_file, package, work_dir)
+        _update_review_job(job_id, progress=98, stage="AI kiểm tra lại hình và lời sau render")
+        post_report = await verify_rendered_review(
+            draft_file,
+            package,
+            work_dir,
+            processing_mode=job.request.processing_mode,
+        )
         if not post_report.passed:
             revised_decisions, changed = replace_failed_decisions_with_alternatives(
                 package.edit_decision_list,
@@ -633,7 +666,12 @@ async def _process_review_draft_job(job_id: str) -> None:
                     lambda percent: _update_review_job(job_id, progress=max(98, min(99, percent))),
                     render_request,
                 )
-                post_report = await verify_rendered_review(retry_file, package, work_dir)
+                post_report = await verify_rendered_review(
+                    retry_file,
+                    package,
+                    work_dir,
+                    processing_mode=job.request.processing_mode,
+                )
                 draft_file = retry_file
 
         package.quality_report = post_report
@@ -724,7 +762,7 @@ async def _render_existing_review_job(job_id: str) -> None:
             _update_review_job(
                 job_id,
                 status="needs_review",
-                progress=82,
+                progress=83,
                 stage=f"Pre-render QA {package.quality_report.overall_score:.1f}/100: cần duyệt lại",
                 result=_review_result_from_package(job_id, package),
             )
@@ -772,7 +810,12 @@ async def _render_existing_review_job(job_id: str) -> None:
             lambda percent: _update_review_job(job_id, progress=max(90, min(98, percent))),
             _build_review_render_request(job.request, source_video),
         )
-        post_report = await verify_rendered_review(draft_file, package, work_dir)
+        post_report = await verify_rendered_review(
+            draft_file,
+            package,
+            work_dir,
+            processing_mode=job.request.processing_mode,
+        )
         package.quality_report = post_report
         package.artifact_paths["review_draft"] = str(draft_file)
         package.artifact_paths["post_render_quality"] = str(work_dir / "quality_report_post_render.json")
@@ -818,8 +861,6 @@ def _review_asr_timeout(video_duration_seconds: float) -> int:
 
 @router.post("/review/jobs", response_model=ReviewDraftJob, tags=["review"])
 async def create_review_draft_job(request: ReviewDraftRequest) -> ReviewDraftJob:
-    import asyncio
-
     now = datetime.now(UTC)
     job = ReviewDraftJob(
         job_id=str(uuid4()),
@@ -832,8 +873,35 @@ async def create_review_draft_job(request: ReviewDraftRequest) -> ReviewDraftJob
     )
     review_draft_jobs[job.job_id] = job
     _save_review_jobs()
-    asyncio.create_task(_process_review_draft_job(job.job_id))
+    _start_review_task(job.job_id, _process_review_draft_job(job.job_id))
     return job
+
+
+@router.post("/review/jobs/{job_id}/retry", response_model=ReviewDraftJob, tags=["review"])
+async def retry_review_draft_job(
+    job_id: str,
+    retry: ReviewRetryRequest | None = None,
+) -> ReviewDraftJob:
+    job = review_draft_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Review job not found.")
+    running = review_tasks.get(job_id)
+    if job.status in {"queued", "processing"} or (running and not running.done()):
+        raise HTTPException(status_code=409, detail="Review job đang chạy.")
+    request = job.request
+    if retry and retry.processing_mode:
+        request = request.model_copy(update={"processing_mode": retry.processing_mode})
+    updated = _update_review_job(
+        job_id,
+        request=request,
+        status="queued",
+        progress=0,
+        stage="Chạy lại từ checkpoint đã lưu",
+        error=None,
+        result=None,
+    )
+    _start_review_task(job_id, _process_review_draft_job(job_id))
+    return updated
 
 
 @router.get("/review/jobs", response_model=list[ReviewDraftJob], tags=["review"])
@@ -843,6 +911,10 @@ async def list_review_draft_jobs() -> list[ReviewDraftJob]:
 
 @router.delete("/review/jobs", tags=["review"])
 async def clear_review_draft_jobs() -> dict[str, str]:
+    for task in list(review_tasks.values()):
+        if not task.done():
+            task.cancel()
+    review_tasks.clear()
     warnings = _trash_review_jobs()
     review_draft_jobs.clear()
     _save_review_jobs()
@@ -875,7 +947,7 @@ async def render_review_draft_job(job_id: str) -> ReviewDraftJob:
     if not job.result.quality_report or not job.result.quality_report.passed:
         raise HTTPException(status_code=409, detail="QA chưa đạt 90/100 hoặc vẫn còn câu dưới 75%.")
     updated = _update_review_job(job_id, status="processing", progress=83, stage="Đã nhận lệnh render bản duyệt", error=None)
-    asyncio.create_task(_render_existing_review_job(job_id))
+    _start_review_task(job_id, _render_existing_review_job(job_id))
     return updated
 
 
@@ -1046,7 +1118,7 @@ async def patch_review_segment(
     return _update_review_job(
         job_id,
         status=next_status,
-        progress=82,
+        progress=83,
         stage=next_stage,
         result=result,
     )

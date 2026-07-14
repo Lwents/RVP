@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 LanguageOption = Literal["auto", "en", "zh", "vi"]
+ProcessingMode = Literal["fast", "balanced", "quality"]
 
 
 class VoiceGender(str, Enum):
@@ -72,6 +73,7 @@ class DubbingRequest(BaseModel):
     output_resolution: str = "original"
     auto_detect_sub: bool = False
     auto_detect_logo: bool = False
+    processing_mode: ProcessingMode = "balanced"
 
     @model_validator(mode="after")
     def validate_input_source(self) -> "DubbingRequest":

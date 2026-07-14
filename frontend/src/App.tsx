@@ -20,6 +20,7 @@ import type { BgmMode, DubbingRequest, JobProgress, VoiceGender } from "./types/
 import { YoutubeStats } from "./components/YoutubeStats";
 import { LivePreview } from "./components/LivePreview";
 import { MovieReview } from "./components/MovieReview";
+import { ProcessingModeSelector } from "./components/ProcessingModeSelector";
 
 const languages = [
   { value: "auto", label: "Tự nhận diện" },
@@ -59,6 +60,7 @@ function readInitialActiveJobId(): string | null {
 const defaultForm: DubbingRequest = {
   source_url: "",
   local_file_path: "",
+  processing_mode: "balanced",
   voice_gender: "female",
   bgm_mode: "demucs",
   use_demucs: true,
@@ -681,6 +683,11 @@ export function App() {
                     />
                   </label>
                 </div>
+
+                <ProcessingModeSelector
+                  value={form.processing_mode}
+                  onChange={(value) => setField("processing_mode", value)}
+                />
               </section>
 
               <section className="ios-card">
@@ -748,7 +755,7 @@ export function App() {
                     onChange={() => setField("source_has_hard_subtitles", !form.source_has_hard_subtitles)}
                   />
                   <CheckBox checked={form.cinematic_bars_enabled} label="Dải đen viền video (Cinematic bars)" onChange={() => setField("cinematic_bars_enabled", !form.cinematic_bars_enabled)} />
-                  <CheckBox checked={form.blur_box_enabled} label="Thanh làm mờ chữ gốc" onChange={() => setField("blur_box_enabled", !form.blur_box_enabled)} />
+                  <CheckBox checked={form.blur_box_enabled} label="Thanh làm mờ chữ gốc (cố định suốt video)" onChange={() => setField("blur_box_enabled", !form.blur_box_enabled)} />
                   <CheckBox 
                     checked={form.logo_enabled} 
                     label="Đóng dấu Logo Watermark" 

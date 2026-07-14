@@ -11,7 +11,7 @@ from app.services.subtitles.timing import parse_srt
 
 
 class ReviewTimelineTests(unittest.TestCase):
-    def test_verified_window_is_reused_instead_of_crossing_into_next_scene(self) -> None:
+    def test_verified_window_expands_to_one_continuous_clip_for_the_full_voice(self) -> None:
         hints = [
             {
                 "start_seconds": 7.0,
@@ -25,9 +25,26 @@ class ReviewTimelineTests(unittest.TestCase):
         clips = build_review_scenes(20.0, 4.5, hints)
 
         self.assertAlmostEqual(sum(duration for _, duration in clips), 4.5, places=3)
-        self.assertGreater(len(clips), 1)
-        self.assertTrue(all(start >= 7.0 for start, _ in clips))
-        self.assertTrue(all(start + duration <= 9.001 for start, duration in clips))
+        self.assertEqual(len(clips), 1)
+        start, duration = clips[0]
+        self.assertLessEqual(start, 7.0)
+        self.assertGreaterEqual(start + duration, 9.0)
+        self.assertAlmostEqual(start, 5.75, places=3)
+
+    def test_continuous_review_clip_stays_inside_source_at_boundaries(self) -> None:
+        near_start = build_review_scenes(
+            20.0,
+            4.0,
+            [{"start_seconds": 0.1, "end_seconds": 0.8, "duration_seconds": 4.0}],
+        )
+        near_end = build_review_scenes(
+            20.0,
+            4.0,
+            [{"start_seconds": 19.3, "end_seconds": 19.9, "duration_seconds": 4.0}],
+        )
+
+        self.assertEqual(near_start, [(0.0, 4.0)])
+        self.assertEqual(near_end, [(16.0, 4.0)])
 
     def test_voice_duration_is_not_stretched_to_requested_minutes(self) -> None:
         hints = []

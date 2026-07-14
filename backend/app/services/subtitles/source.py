@@ -7,6 +7,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from app.core import settings
+from app.models.job import ProcessingMode
 from app.services.ai.context import analyze_video_context
 from app.services.ai.asr import get_asr_engine
 from app.services.ai.translation import get_translation_engine
@@ -17,6 +18,18 @@ from app.services.subtitles.timing import group_subtitle_events, parse_srt, spli
 
 class SubtitleSourceError(RuntimeError):
     pass
+
+
+def translation_progress_percent(
+    completed: int,
+    total: int,
+    start_percent: int,
+    end_percent: int,
+) -> int:
+    ratio = completed / max(total, 1)
+    return start_percent + int(
+        max(0.0, min(1.0, ratio)) * max(0, end_percent - start_percent)
+    )
 
 
 def _platform_name(url: str) -> str:
@@ -102,25 +115,51 @@ async def get_or_create_subtitles(
     progress: Callable[[str, int], None],
     source_video: Path | None = None,
     asr_timeout_seconds: int | None = None,
+    processing_mode: ProcessingMode | str | None = None,
+    translation_progress_start: int = 68,
+    translation_progress_end: int = 69,
 ) -> Path:
     target_file = work_dir / f"subtitles.{settings.target_language}.srt"
     if target_file.exists() and target_file.stat().st_size > 0:
-        progress("Dùng lại phụ đề đã dịch xong", 69)
+        progress("Dùng lại phụ đề đã dịch xong", translation_progress_end)
         return target_file
 
     if source_url and settings.prefer_youtube_subtitles:
         try:
             subtitle_file = await download_platform_subtitles(source_url, work_dir, progress)
-            return await _prepare_target_subtitles(subtitle_file, work_dir, source_language, progress, source_video)
+            return await _prepare_target_subtitles(
+                subtitle_file,
+                work_dir,
+                source_language,
+                progress,
+                source_video,
+                processing_mode,
+                translation_progress_start,
+                translation_progress_end,
+            )
         except SubtitleSourceError:
             progress("Nền tảng không có phụ đề phù hợp, tự tạo phụ đề bằng Whisper", 58)
 
     whisper_file = work_dir / "subtitles.whisper.srt"
     if whisper_file.exists() and whisper_file.stat().st_size > 0:
         progress("Dùng lại phụ đề Whisper đã nhận diện xong", 66)
-        return await _prepare_target_subtitles(whisper_file, work_dir, source_language, progress, source_video)
+        return await _prepare_target_subtitles(
+            whisper_file,
+            work_dir,
+            source_language,
+            progress,
+            source_video,
+            processing_mode,
+            translation_progress_start,
+            translation_progress_end,
+        )
 
-    asr_task = get_asr_engine().transcribe_to_srt(audio_file, whisper_file, source_language)
+    asr_task = get_asr_engine().transcribe_to_srt(
+        audio_file,
+        whisper_file,
+        source_language,
+        processing_mode,
+    )
     subtitle_file = await _run_with_heartbeat(
         asr_task,
         progress,
@@ -129,7 +168,16 @@ async def get_or_create_subtitles(
         70,
         asr_timeout_seconds or settings.asr_timeout_seconds,
     )
-    return await _prepare_target_subtitles(subtitle_file, work_dir, source_language, progress, source_video)
+    return await _prepare_target_subtitles(
+        subtitle_file,
+        work_dir,
+        source_language,
+        progress,
+        source_video,
+        processing_mode,
+        translation_progress_start,
+        translation_progress_end,
+    )
 
 
 def asr_timeout_for_duration(video_duration_seconds: float) -> int:
@@ -145,6 +193,9 @@ async def _prepare_target_subtitles(
     source_language: str,
     progress: Callable[[str, int], None],
     source_video: Path | None = None,
+    processing_mode: ProcessingMode | str | None = None,
+    translation_progress_start: int = 68,
+    translation_progress_end: int = 69,
 ) -> Path:
     grouped_max_chars = min(settings.subtitle_group_max_chars, 42)
     grouped_max_duration = min(settings.subtitle_group_max_duration, 3.2)
@@ -170,15 +221,30 @@ async def _prepare_target_subtitles(
     ):
         return grouped_file
 
-    progress("AI nhận diện tên phim, nhân vật và vai vế", 67)
+    progress("AI nhận diện tên phim, nhân vật và vai vế", max(0, translation_progress_start - 1))
     context = await analyze_video_context(source_video, events, work_dir)
 
-    progress("Dịch phụ đề sang tiếng Việt", 68)
+    progress("Dịch phụ đề sang tiếng Việt", translation_progress_start)
+    def translation_progress(completed: int, total: int) -> None:
+        percent = translation_progress_percent(
+            completed,
+            total,
+            translation_progress_start,
+            translation_progress_end,
+        )
+        progress(
+            f"Dịch phụ đề sang tiếng Việt ({completed}/{max(total, 1)} batch, đã lưu checkpoint)",
+            percent,
+        )
+
     translated_events = await get_translation_engine().translate_events(
         events,
         source_language,
         target_language,
         context=context,
+        processing_mode=processing_mode,
+        checkpoint_file=work_dir / "translation_checkpoint.json",
+        on_batch_progress=translation_progress,
     )
     translated_events = split_long_subtitle_events(
         translated_events,

@@ -15,6 +15,7 @@ import numpy as np
 from openai import AsyncOpenAI
 
 from app.core import settings
+from app.models.job import ProcessingMode
 from app.models.review import (
     AnalyzedScene,
     EditDecision,
@@ -29,6 +30,7 @@ from app.models.review import (
     VerifiedReviewPackage,
 )
 from app.services.media.ffmpeg import find_ffmpeg, probe_video_duration
+from app.services.presets import get_processing_profile
 from app.services.subtitles.timing import SubtitleEvent, parse_srt
 
 
@@ -44,6 +46,7 @@ async def build_verified_review_package(
     style: str,
     notes: str | None,
     on_progress: ProgressCallback,
+    processing_mode: ProcessingMode | str | None = None,
 ) -> VerifiedReviewPackage:
     """Build a review from visual evidence before any narration is rendered.
 
@@ -53,6 +56,7 @@ async def build_verified_review_package(
     """
 
     events = parse_srt(transcript_file)
+    profile = get_processing_profile(processing_mode)
     scene_dir = work_dir / "review_scenes"
     on_progress("Phát hiện shot và lấy keyframe toàn bộ phim", 53)
     scenes = await asyncio.to_thread(
@@ -61,12 +65,20 @@ async def build_verified_review_package(
         scene_dir,
         duration,
         events,
+        profile.review_max_scenes,
+        profile.review_keyframes_per_scene,
     )
     if not scenes:
         raise RuntimeError("Không phát hiện được scene/keyframe hợp lệ trong video.")
 
-    on_progress("Gemini Pro phân tích hình ảnh, thoại và chữ trên màn hình", 60)
-    scenes = await _analyze_scene_batches(scenes, events, on_progress)
+    on_progress("AI đa phương thức phân tích hình ảnh, thoại và chữ trên màn hình", 60)
+    scenes = await _analyze_scene_batches(
+        scenes,
+        events,
+        on_progress,
+        batch_size=profile.review_scene_batch_size,
+        concurrency=profile.review_ai_concurrency,
+    )
     scenes = _reconcile_character_identities(scenes)
 
     on_progress("Lập timeline sự kiện và kiểm tra danh tính nhân vật", 71)
@@ -88,10 +100,20 @@ async def build_verified_review_package(
 
     on_progress("Ghép từng câu với cảnh và tạo EDL", 79)
     decisions = _match_segments_to_scenes(segments, story_events, scenes)
-    decisions = await _multimodal_rescore_selected_clips(segments, scenes, decisions)
+    decisions = await _multimodal_rescore_selected_clips(
+        segments,
+        scenes,
+        decisions,
+        batch_size=profile.review_scene_batch_size,
+    )
     decisions, changed = _replace_low_pre_render_matches(decisions)
     if changed:
-        decisions = await _multimodal_rescore_selected_clips(segments, scenes, decisions)
+        decisions = await _multimodal_rescore_selected_clips(
+            segments,
+            scenes,
+            decisions,
+            batch_size=profile.review_scene_batch_size,
+        )
     report = _quality_report(segments, story_events, scenes, decisions)
 
     narration_script = " ".join(item.narration.strip() for item in segments if item.narration.strip())
@@ -118,6 +140,8 @@ def _detect_scenes_and_keyframes(
     scene_dir: Path,
     duration: float,
     transcript_events: list[SubtitleEvent],
+    max_scenes: int | None = None,
+    keyframes_per_scene: int | None = None,
 ) -> list[AnalyzedScene]:
     scene_dir.mkdir(parents=True, exist_ok=True)
     for old in scene_dir.glob("*.jpg"):
@@ -176,9 +200,14 @@ def _detect_scenes_and_keyframes(
         for index in range(len(boundaries) - 1)
         if boundaries[index + 1] - boundaries[index] >= 0.8
     ]
-    ranges = _consolidate_ranges(raw_ranges, max(12, settings.review_max_scenes))
+    scene_limit = settings.review_max_scenes if max_scenes is None else max_scenes
+    ranges = _consolidate_ranges(raw_ranges, max(12, scene_limit))
     scenes: list[AnalyzedScene] = []
-    keyframe_count = max(3, settings.review_keyframes_per_scene)
+    keyframe_count = (
+        max(3, settings.review_keyframes_per_scene)
+        if keyframes_per_scene is None
+        else max(1, keyframes_per_scene)
+    )
     ratios = np.linspace(0.14, 0.86, keyframe_count).tolist()
 
     for index, (start, end) in enumerate(ranges, start=1):
@@ -235,21 +264,35 @@ async def _analyze_scene_batches(
     scenes: list[AnalyzedScene],
     transcript_events: list[SubtitleEvent],
     on_progress: ProgressCallback,
+    *,
+    batch_size: int | None = None,
+    concurrency: int = 1,
 ) -> list[AnalyzedScene]:
-    batch_size = max(1, min(8, settings.review_scene_batch_size))
+    batch_size = max(1, min(8, batch_size or settings.review_scene_batch_size))
     batches = [scenes[index : index + batch_size] for index in range(0, len(scenes), batch_size)]
-    results: list[AnalyzedScene] = []
-    for index, batch in enumerate(batches):
-        try:
-            analyzed = await _analyze_scene_batch(batch, transcript_events)
-        except Exception as exc:
-            print(f"Review scene analysis fallback for batch {index + 1}: {exc}")
-            analyzed = batch
-        by_id = {scene.scene_id: scene for scene in analyzed}
-        results.extend(by_id.get(scene.scene_id, scene) for scene in batch)
-        percent = 60 + int(((index + 1) / max(len(batches), 1)) * 10)
-        on_progress(f"Đã phân tích {min((index + 1) * batch_size, len(scenes))}/{len(scenes)} scene", percent)
-    return results
+    semaphore = asyncio.Semaphore(max(1, min(3, concurrency)))
+
+    async def analyze(index: int, batch: list[AnalyzedScene]) -> tuple[int, list[AnalyzedScene]]:
+        async with semaphore:
+            try:
+                analyzed = await _analyze_scene_batch(batch, transcript_events)
+            except Exception as exc:
+                print(f"Review scene analysis fallback for batch {index + 1}: {exc}")
+                analyzed = batch
+            by_id = {scene.scene_id: scene for scene in analyzed}
+            return index, [by_id.get(scene.scene_id, scene) for scene in batch]
+
+    tasks = [asyncio.create_task(analyze(index, batch)) for index, batch in enumerate(batches)]
+    indexed_results: dict[int, list[AnalyzedScene]] = {}
+    completed = 0
+    for task in asyncio.as_completed(tasks):
+        index, analyzed = await task
+        indexed_results[index] = analyzed
+        completed += 1
+        scene_count = min(completed * batch_size, len(scenes))
+        percent = 60 + int((completed / max(len(batches), 1)) * 10)
+        on_progress(f"Đã phân tích {scene_count}/{len(scenes)} scene", percent)
+    return [scene for index in range(len(batches)) for scene in indexed_results[index]]
 
 
 async def _analyze_scene_batch(
@@ -810,13 +853,15 @@ async def _multimodal_rescore_selected_clips(
     segments: list[NarrationSegment],
     scenes: list[AnalyzedScene],
     decisions: list[EditDecision],
+    *,
+    batch_size: int | None = None,
 ) -> list[EditDecision]:
     """Resolve cross-language action matching with the actual keyframe evidence."""
 
     segment_by_id = {item.segment_id: item for item in segments}
     scene_by_id = {item.scene_id: item for item in scenes}
     ai_scores: dict[str, tuple[float, str, float | None]] = {}
-    batch_size = max(1, min(8, settings.review_scene_batch_size))
+    batch_size = max(1, min(8, batch_size or settings.review_scene_batch_size))
     for offset in range(0, len(decisions), batch_size):
         batch = decisions[offset : offset + batch_size]
         content: list[dict] = [
@@ -991,6 +1036,8 @@ async def verify_rendered_review(
     rendered_video: Path,
     package: VerifiedReviewPackage,
     work_dir: Path,
+    *,
+    processing_mode: ProcessingMode | str | None = None,
 ) -> ReviewQualityReport:
     """Check the actual rendered frames against every narration sentence."""
 
@@ -1012,7 +1059,8 @@ async def verify_rendered_review(
     notes: dict[str, str] = {}
     direct_matches: dict[str, bool] = {}
     decisions = package.edit_decision_list
-    batch_size = max(1, min(8, settings.review_scene_batch_size))
+    profile = get_processing_profile(processing_mode)
+    batch_size = max(1, min(8, profile.review_scene_batch_size))
     for offset in range(0, len(decisions), batch_size):
         batch = decisions[offset : offset + batch_size]
         content: list[dict] = [

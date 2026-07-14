@@ -605,6 +605,38 @@ select.ios-input {
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
 }
 
+.processing-mode-segments button {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding-inline: 8px;
+  white-space: nowrap;
+}
+
+.processing-mode-segments button.active {
+  color: #007aff;
+  box-shadow: 0 2px 8px rgba(0, 122, 255, 0.14);
+}
+
+.processing-mode-segments button svg {
+  flex: 0 0 auto;
+  stroke-width: 3;
+}
+
+.processing-mode-description {
+  min-height: 38px;
+  margin: 2px 2px 0;
+  color: #6e6e73;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.processing-mode-description strong {
+  color: #1c1c1e;
+}
+
 .check-grid {
   display: flex;
   flex-direction: column;
@@ -1104,6 +1136,10 @@ input[type="range"]:active::-moz-range-thumb {
 .review-status-head span {
   color: #007aff;
   font-weight: 800;
+}
+
+.review-retry-button {
+  justify-self: start;
 }
 
 .review-result {

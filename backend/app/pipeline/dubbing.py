@@ -11,6 +11,7 @@ from app.services.media.downloader import prepare_source_video
 from app.services.media.ffmpeg import extract_audio, extract_demucs_audio, find_ffmpeg, probe_video_duration
 from app.services.media.renderer import render_video
 from app.services.media.separation import separate_background_with_demucs
+from app.services.presets import get_processing_profile
 from app.services.store import job_store
 from app.services.subtitles.source import asr_timeout_for_duration, get_or_create_subtitles
 from app.models.job import PublishTarget
@@ -32,6 +33,23 @@ async def process_dubbing_job(job_id: str) -> None:
             job_store.update(job_id, stage=stage, progress=percent)
 
         voice_warning: str | None = None
+        profile = get_processing_profile(job.request.processing_mode)
+        effective_request = job.request
+        if (
+            not profile.use_demucs
+            and job.request.use_demucs
+            and job.request.bgm_mode != BgmMode.none
+        ):
+            effective_request = job.request.model_copy(
+                update={
+                    "use_demucs": False,
+                    "bgm_mode": (
+                        BgmMode.ducking
+                        if job.request.bgm_mode == BgmMode.demucs
+                        else job.request.bgm_mode
+                    ),
+                }
+            )
 
         job_store.update(job_id, status=JobStatus.processing, stage="Kiểm tra môi trường xử lý", progress=5)
         ffmpeg = find_ffmpeg()
@@ -65,8 +83,8 @@ async def process_dubbing_job(job_id: str) -> None:
             )
 
         bgm_audio: Path | None = None
-        if job.request.bgm_mode != BgmMode.none:
-            if job.request.use_demucs:
+        if effective_request.bgm_mode != BgmMode.none:
+            if effective_request.use_demucs:
                 progress("Tách nhạc nền và giọng nói gốc bằng Demucs", 45)
                 try:
                     demucs_audio = work_dir / "demucs_audio.wav"
@@ -95,6 +113,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 progress,
                 source_video,
                 asr_timeout_seconds=asr_timeout_seconds,
+                processing_mode=job.request.processing_mode,
             )
             progress("Tạo giọng đọc khớp phụ đề", 70)
             narration_file = work_dir / "narration_timed.wav"
@@ -118,7 +137,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 source_video,
                 output_file,
                 work_dir,
-                job.request,
+                effective_request,
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=None,
                 narration_audio=narration_audio,
@@ -134,6 +153,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 progress,
                 source_video,
                 asr_timeout_seconds=asr_timeout_seconds,
+                processing_mode=job.request.processing_mode,
             )
             progress("Tạo giọng đọc khớp phụ đề", 70)
             narration_file = work_dir / "narration_timed.wav"
@@ -157,7 +177,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 source_video,
                 output_file,
                 work_dir,
-                job.request,
+                effective_request,
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=subtitle_file,
                 narration_audio=narration_audio,
@@ -172,7 +192,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 source_video,
                 output_file,
                 work_dir,
-                job.request,
+                effective_request,
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=None,
                 bgm_audio=bgm_audio,

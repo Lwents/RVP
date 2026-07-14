@@ -1,15 +1,9 @@
-import logging
 from pathlib import Path
 
 from app.core import settings
 from app.models.job import BgmMode, DubbingRequest
 from app.services.media.ffmpeg import copy_mp4, probe_video_duration, probe_video_size, run_ffmpeg_with_progress
-from app.services.media.subtitle_mask import SubtitleMaskAssets, build_subtitle_mask_video
 from app.services.subtitles.ass import srt_to_positioned_ass, subtitle_font_dir
-
-
-logger = logging.getLogger(__name__)
-
 
 async def render_video(
     ffmpeg: str,
@@ -29,47 +23,15 @@ async def render_video(
         return
 
     width, height = await probe_video_size(ffmpeg, source_video)
-    subtitle_mask: SubtitleMaskAssets | None = None
-    if request.blur_box_enabled:
-        try:
-            subtitle_mask = await build_subtitle_mask_video(
-                source_video,
-                work_dir / "subtitle_blur_mask.mp4",
-                request.blur_box_y_percent,
-                request.blur_box_height_percent,
-            )
-        except Exception:
-            logger.exception("Khong tao duoc mask dong cho phu de goc; dung mask fallback.")
-
     command = [ffmpeg, "-y", "-i", str(source_video)]
     next_input_index = 1
-    video_label = "[0:v]"
-    filter_parts: list[str] = []
+    video_label = "[vbase]"
+    filter_parts: list[str] = ["[0:v]setpts=PTS-STARTPTS[vbase]"]
 
-    if subtitle_mask is not None:
-        command.extend(["-i", str(subtitle_mask.mask_file)])
-        mask_index = next_input_index
-        next_input_index += 1
-        command.extend(["-i", str(subtitle_mask.cleaned_video_file)])
-        cleaned_index = next_input_index
-        next_input_index += 1
-        blur_sigma = _gaussian_blur_sigma(width, height)
-        filter_parts.append(
-            f"[{cleaned_index}:v]scale={width}:{height}:flags=bilinear,"
-            f"setpts=PTS-STARTPTS,gblur=sigma={blur_sigma}:steps=2[vsubmask_blurred]"
-        )
-        filter_parts.append(
-            f"[{mask_index}:v]format=gray,scale={width}:{height}:flags=bilinear,"
-            "lut=y='min(255\\,val*1.25)',setpts=PTS-STARTPTS[vsubmask_alpha]"
-        )
-        filter_parts.append(
-            f"{video_label}[vsubmask_blurred][vsubmask_alpha]"
-            "maskedmerge=planes=15[vsubmask]"
-        )
-        video_label = "[vsubmask]"
-    elif request.blur_box_enabled:
-        # Last-resort safety mask. It is feathered and alpha-blended, never a
-        # solid rectangle, and is only used if per-frame detection cannot run.
+    if request.blur_box_enabled:
+        # The subtitle band is intentionally static for the whole video. FFmpeg
+        # applies one feathered Gaussian-blur mask in the final encode, avoiding
+        # the expensive OpenCV OCR/inpaint pass and temporal mask flicker.
         video_label = _append_soft_box_blur(
             filter_parts,
             video_label,
@@ -83,7 +45,7 @@ async def render_video(
                 None,
                 None,
             )],
-            "subfallback",
+            "substatic",
             pad_boxes=False,
         )
 

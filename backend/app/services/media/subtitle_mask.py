@@ -62,8 +62,8 @@ def detect_subtitle_text_box(
     preferred_bottom = (preferred_y_percent + preferred_height_percent) / 100
     # Keep the scan close to the configured subtitle zone. Creator watermarks
     # often run around 70-75% height and must not be mistaken for subtitles.
-    scan_top = int(height * max(0.77, min(0.86, preferred_top - 0.02)))
-    scan_bottom = int(height * min(0.97, max(0.94, preferred_bottom + 0.04)))
+    scan_top = int(height * max(0.78, min(0.90, preferred_top)))
+    scan_bottom = int(height * min(0.96, max(preferred_bottom + 0.02, preferred_top + 0.08)))
     scan_left = int(width * 0.06)
     scan_right = int(width * 0.94)
     roi = frame[scan_top:scan_bottom, scan_left:scan_right]
@@ -76,7 +76,10 @@ def detect_subtitle_text_box(
     spread = maximum - minimum
 
     # Most hard subtitles are white, yellow, or another bright saturated color.
-    near_white = (minimum > 155) & (spread < 70)
+    # Original captions may be rendered semi-transparent grey. A 155 floor
+    # misses their faded edge characters, so use a lower neutral-colour floor
+    # and rely on typographic row/position filtering to reject the scene.
+    near_white = (minimum > 110) & (spread < 70)
     bright_color = (maximum > 215) & (spread > 75)
     seed = ((near_white | bright_color).astype(np.uint8)) * 255
 
@@ -95,37 +98,77 @@ def detect_subtitle_text_box(
             continue
         if area < 4:
             continue
+        # Wide, almost solid highlights (chair/table edges in the failing
+        # animation) are not typographic strokes.
+        fill_ratio = area / max(1, box_width * box_height)
+        if fill_ratio > 0.82 and box_width > box_height * 2.5:
+            continue
         components.append(TextBox(x, y, box_width, box_height))
 
     if not components:
         return None
 
     preferred_center = height * (preferred_top + preferred_bottom) / 2
-    run = _choose_text_run(components, width, height, preferred_center)
-    if not run:
+    runs = _candidate_text_runs(components, width, height, preferred_center)
+    if not runs:
         return None
 
-    x0 = min(item.x for item in run)
-    x1 = max(item.right for item in run)
-    y0 = min(item.y for item in run)
-    y1 = max(item.bottom for item in run)
+    run = max(runs, key=lambda item: _text_run_score(item, width, height, preferred_center))
+
+    # Source subtitles in the reported video consist of a small attribution
+    # row immediately above the main Chinese row. Treat both as one compact
+    # subtitle region; otherwise the upper row leaks through the blur.
+    primary_box = _box_from_items(run)
+    adjacent: list[tuple[float, list[TextBox]]] = []
+    primary_center_x = (primary_box.x + primary_box.right) / 2
+    for candidate in runs:
+        if candidate is run:
+            continue
+        candidate_box = _box_from_items(candidate)
+        if candidate_box == primary_box:
+            continue
+        candidate_center_x = (candidate_box.x + candidate_box.right) / 2
+        vertical_gap = max(
+            0,
+            max(primary_box.y, candidate_box.y) - min(primary_box.bottom, candidate_box.bottom),
+        )
+        if vertical_gap > max(round(height * 0.045), max(primary_box.height, candidate_box.height)):
+            continue
+        if abs(candidate_center_x - primary_center_x) > width * 0.18:
+            continue
+        horizontal_overlap = min(primary_box.right, candidate_box.right) - max(primary_box.x, candidate_box.x)
+        if horizontal_overlap <= 0 and abs(candidate_center_x - primary_center_x) > width * 0.10:
+            continue
+        score = _text_run_score(candidate, width, height, preferred_center) - vertical_gap
+        adjacent.append((score, candidate))
+    selected_rows = [run]
+    if adjacent:
+        selected_rows.append(max(adjacent, key=lambda item: item[0])[1])
+
+    selected = [item for row in selected_rows for item in row]
+
+    x0 = min(item.x for item in selected)
+    x1 = max(item.right for item in selected)
+    y0 = min(item.y for item in selected)
+    y1 = max(item.bottom for item in selected)
 
     # Pull in detached dots, accents, digits, and punctuation belonging to the
     # same row, while rejecting scene objects separated by a large x gap.
-    extension = max(8, round(np.median([item.height for item in run]) * 1.5))
+    extension = max(8, round(np.median([item.height for item in selected]) * 1.5))
     y_tolerance = max(2, round(height * 0.006))
-    median_top = float(np.median([item.y for item in run]))
-    median_bottom = float(np.median([item.bottom for item in run]))
-    median_height = float(np.median([item.height for item in run]))
+    row_tops = [float(np.median([item.y for item in row])) for row in selected_rows]
+    row_bottoms = [float(np.median([item.bottom for item in row])) for row in selected_rows]
+    median_height = float(np.median([item.height for item in selected]))
     related = [
         item
         for item in components
         if item.right >= x0 - extension
         and item.x <= x1 + extension
         and item.height <= median_height * 1.8
-        and (
-            abs(item.y - median_top) <= y_tolerance * 2
-            or abs(item.bottom - median_bottom) <= y_tolerance * 2
+        and any(
+            abs(item.y - row_top) <= y_tolerance * 2
+            or abs(item.bottom - row_bottom) <= y_tolerance * 2
+            for row_top, row_bottom in zip(row_tops, row_bottoms)
         )
     ]
     if related:
@@ -144,7 +187,21 @@ def _choose_text_run(
     preferred_center_y: float,
 ) -> list[TextBox] | None:
     """Pick a typographic row while rejecting bright scene objects."""
-    best: tuple[float, list[TextBox]] | None = None
+    runs = _candidate_text_runs(components, width, height, preferred_center_y)
+    if not runs:
+        return None
+    return max(runs, key=lambda item: _text_run_score(item, width, height, preferred_center_y))
+
+
+def _candidate_text_runs(
+    components: list[TextBox],
+    width: int,
+    height: int,
+    preferred_center_y: float,
+) -> list[list[TextBox]]:
+    """Return unique, centered text-like rows in the configured lower zone."""
+    del preferred_center_y  # Ranking uses it; filtering deliberately does not.
+    unique: dict[tuple[tuple[int, int, int, int], ...], list[TextBox]] = {}
     y_tolerance = max(2, round(height * 0.006))
     for anchor in components:
         row = []
@@ -176,24 +233,37 @@ def _choose_text_run(
             )
             regular = (
                 len(run) >= 3
-                and span >= width * 0.09
-                and width * 0.18 <= center_x <= width * 0.82
+                and span >= width * 0.06
+                and width * 0.30 <= center_x <= width * 0.70
             )
             if not (single_centered or short_centered or regular):
                 continue
-            distance_penalty = abs(((y0 + y1) / 2) - preferred_center_y) / max(height, 1)
-            height_variance = float(np.std([item.height for item in run])) / max(
-                float(np.mean([item.height for item in run])), 1.0
-            )
-            score = (
-                len(run) * 3
-                + (span / width) * 15
-                - distance_penalty * 24
-                - height_variance * 6
-            )
-            if best is None or score > best[0]:
-                best = (score, run)
-    return best[1] if best else None
+            key = tuple(sorted((item.x, item.y, item.width, item.height) for item in run))
+            unique[key] = run
+    return list(unique.values())
+
+
+def _text_run_score(
+    run: list[TextBox],
+    width: int,
+    height: int,
+    preferred_center_y: float,
+) -> float:
+    box = _box_from_items(run)
+    span = box.width
+    distance_penalty = abs(((box.y + box.bottom) / 2) - preferred_center_y) / max(height, 1)
+    height_variance = float(np.std([item.height for item in run])) / max(
+        float(np.mean([item.height for item in run])), 1.0
+    )
+    return len(run) * 3 + (span / width) * 15 - distance_penalty * 24 - height_variance * 6
+
+
+def _box_from_items(items: list[TextBox]) -> TextBox:
+    x0 = min(item.x for item in items)
+    x1 = max(item.right for item in items)
+    y0 = min(item.y for item in items)
+    y1 = max(item.bottom for item in items)
+    return TextBox(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
 
 def _horizontal_runs(items: list[TextBox], width: int, height: int) -> list[list[TextBox]]:
@@ -201,7 +271,9 @@ def _horizontal_runs(items: list[TextBox], width: int, height: int) -> list[list
         return []
     ordered = sorted(items, key=lambda item: item.x)
     median_height = float(np.median([item.height for item in ordered]))
-    gap_limit = max(width * 0.025, median_height * 1.45, height * 0.035)
+    # Stylised Chinese captions can have unusually wide tracking. Keep them in
+    # one row without widening the final mask beyond the actual outer glyphs.
+    gap_limit = max(width * 0.045, median_height * 1.8, height * 0.045)
     runs: list[list[TextBox]] = [[ordered[0]]]
     current_right = ordered[0].right
     for item in ordered[1:]:
@@ -268,18 +340,21 @@ def _build_subtitle_mask_video_sync(
         logger.warning("Khong tao duoc video inpainting phu de: %s", cleaned_output_file)
         return None
 
-    history: deque[TextBox] = deque(maxlen=5)
+    history: deque[TextBox] = deque(maxlen=7)
     last_box: TextBox | None = None
+    pending_box: TextBox | None = None
+    pending_frames = 0
     missed_frames = 0
     previous_mask: np.ndarray | None = None
     detected_frames = 0
     written_frames = 0
-    padding = max(4, min(20, round(22 * mask_height / 1080)))
-    feather_pixels = max(5, min(25, round(20 * mask_height / 1080)))
+    padding = max(6, min(20, round(30 * mask_height / 1080)))
+    feather_pixels = max(6, min(25, round(25 * mask_height / 1080)))
     feather_sigma = max(1.5, feather_pixels / 3)
-    glyph_dilate = max(3, min(12, round(12 * mask_height / 1080)))
+    glyph_dilate = max(5, min(14, round(18 * mask_height / 1080)))
     inpaint_radius = max(3, min(7, round(5 * mask_height / 1080)))
-    previous_fallback: bool | None = None
+    hold_frames = max(8, round(fps * 0.5))
+    switch_frames = 3
 
     try:
         while True:
@@ -292,21 +367,54 @@ def _build_subtitle_mask_video_sync(
             detected = detect_subtitle_text_box(frame, preferred_y_percent, preferred_height_percent)
             fallback = False
             if detected is not None:
+                # Do not let one bright object teleport the blur away from the
+                # subtitle. A genuinely different region must persist for a
+                # few frames before it replaces the tracked row.
+                if last_box is not None and not _boxes_compatible(
+                    last_box,
+                    detected,
+                    mask_width,
+                    mask_height,
+                ):
+                    if pending_box is not None and _boxes_compatible(
+                        pending_box,
+                        detected,
+                        mask_width,
+                        mask_height,
+                    ):
+                        pending_frames += 1
+                        pending_box = detected
+                    else:
+                        pending_box = detected
+                        pending_frames = 1
+                    if pending_frames < switch_frames:
+                        detected = None
+                    else:
+                        history.clear()
+                        pending_box = None
+                        pending_frames = 0
+                else:
+                    pending_box = None
+                    pending_frames = 0
+
+            if detected is not None:
                 detected_frames += 1
                 history.append(detected)
                 box = _smooth_box(detected, history, mask_width, mask_height)
                 last_box = box
                 missed_frames = 0
-            elif last_box is not None and missed_frames < max(4, round(fps * 0.2)):
+            elif last_box is not None and missed_frames < hold_frames:
                 missed_frames += 1
                 box = last_box
             else:
                 missed_frames += 1
+                last_box = None
+                history.clear()
                 fallback = True
-                fallback_y = max(0.72, min(0.90, preferred_y_percent / 100))
-                fallback_height = max(0.10, min(0.18, preferred_height_percent / 100))
-                if fallback_y + fallback_height > 0.97:
-                    fallback_y = 0.97 - fallback_height
+                fallback_y = max(0.78, min(0.90, preferred_y_percent / 100))
+                fallback_height = max(0.08, min(0.16, preferred_height_percent / 100))
+                if fallback_y + fallback_height > 0.96:
+                    fallback_y = 0.96 - fallback_height
                 box = TextBox(
                     round(mask_width * 0.05),
                     round(mask_height * fallback_y),
@@ -314,25 +422,42 @@ def _build_subtitle_mask_video_sync(
                     round(mask_height * fallback_height),
                 )
 
-            hard_mask = _text_glyph_mask(
+            glyph_mask = _text_glyph_mask(
                 frame,
                 box,
                 padding=0 if fallback else padding,
                 glyph_dilate=glyph_dilate,
                 strict_components=fallback,
             )
-            soft_mask = cv2.GaussianBlur(hard_mask, (0, 0), feather_sigma)
-            if previous_mask is not None and previous_fallback == fallback:
-                temporal_blend = cv2.addWeighted(previous_mask, 0.15, soft_mask, 0.85, 0)
-                soft_mask = cv2.max(hard_mask, temporal_blend)
+
+            if fallback:
+                glyph_points = cv2.findNonZero(glyph_mask)
+                if glyph_points is None:
+                    coverage_mask = np.zeros((mask_height, mask_width), dtype=np.uint8)
+                else:
+                    gx, gy, gw, gh = cv2.boundingRect(glyph_points)
+                    coverage_mask = _box_coverage_mask(
+                        mask_width,
+                        mask_height,
+                        TextBox(gx, gy, gw, gh),
+                        padding,
+                    )
+            else:
+                coverage_mask = _box_coverage_mask(mask_width, mask_height, box, padding)
+
+            soft_mask = cv2.GaussianBlur(coverage_mask, (0, 0), feather_sigma)
+            if previous_mask is not None:
+                # Fast attack, slow release prevents a one-frame detection
+                # dropout from revealing the old Chinese glyphs.
+                released = (previous_mask.astype(np.float32) * 0.82).astype(np.uint8)
+                soft_mask = cv2.max(soft_mask, released)
             previous_mask = soft_mask
-            previous_fallback = fallback
             writer.write(cv2.cvtColor(soft_mask, cv2.COLOR_GRAY2BGR))
             cleaned_frame = frame
-            if cv2.countNonZero(hard_mask) > 0:
+            if cv2.countNonZero(glyph_mask) > 0:
                 cleaned_frame = cv2.inpaint(
                     frame,
-                    hard_mask,
+                    glyph_mask,
                     inpaint_radius,
                     cv2.INPAINT_TELEA,
                 )
@@ -362,7 +487,7 @@ def _bright_text_seed(frame: np.ndarray) -> np.ndarray:
     maximum = np.maximum.reduce([blue, green, red])
     minimum = np.minimum.reduce([blue, green, red])
     spread = maximum - minimum
-    near_white = (minimum > 155) & (spread < 70)
+    near_white = (minimum > 110) & (spread < 70)
     bright_color = (maximum > 215) & (spread > 75)
     return ((near_white | bright_color).astype(np.uint8)) * 255
 
@@ -387,6 +512,19 @@ def _text_glyph_mask(
 
     crop = frame[y0:y1, x0:x1]
     seed = _bright_text_seed(crop)
+    if not strict_components:
+        # Inside a detector-approved compact box, keep every bright stroke.
+        # Component height filtering used to discard thin anti-aliased parts
+        # of Chinese glyphs, leaving readable outlines after the blur.
+        kernel_size = glyph_dilate * 2 + 1
+        glyph_mask = cv2.dilate(
+            seed,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)),
+            iterations=1,
+        )
+        full_mask[y0:y1, x0:x1] = glyph_mask
+        return full_mask
+
     count, labels, stats, _ = cv2.connectedComponentsWithStats(seed, 8)
     indexed_components: list[tuple[int, TextBox]] = []
     for label in range(1, count):
@@ -404,32 +542,33 @@ def _text_glyph_mask(
             )
         )
 
-    chosen = _choose_text_run(
-        [item for _, item in indexed_components],
-        width,
-        height,
-        (box.y + box.bottom) / 2,
-    )
-    if not chosen:
-        return full_mask
-    run_x0 = min(item.x for item in chosen)
-    run_x1 = max(item.right for item in chosen)
-    median_top = float(np.median([item.y for item in chosen]))
-    median_bottom = float(np.median([item.bottom for item in chosen]))
-    median_height = float(np.median([item.height for item in chosen]))
-    extension = max(6, round(median_height * 1.2))
-    y_tolerance = max(2, round(height * 0.006))
-    selected_labels = {
-        label
-        for label, item in indexed_components
-        if item.right >= run_x0 - extension
-        and item.x <= run_x1 + extension
-        and item.height <= median_height * 1.8
-        and (
-            abs(item.y - median_top) <= y_tolerance * 2
-            or abs(item.bottom - median_bottom) <= y_tolerance * 2
+    if strict_components:
+        chosen = _choose_text_run(
+            [item for _, item in indexed_components],
+            width,
+            height,
+            (box.y + box.bottom) / 2,
         )
-    }
+        if not chosen:
+            return full_mask
+        run_x0 = min(item.x for item in chosen)
+        run_x1 = max(item.right for item in chosen)
+        median_top = float(np.median([item.y for item in chosen]))
+        median_bottom = float(np.median([item.bottom for item in chosen]))
+        median_height = float(np.median([item.height for item in chosen]))
+        extension = max(6, round(median_height * 1.2))
+        y_tolerance = max(2, round(height * 0.006))
+        selected_labels = {
+            label
+            for label, item in indexed_components
+            if item.right >= run_x0 - extension
+            and item.x <= run_x1 + extension
+            and item.height <= median_height * 1.8
+            and (
+                abs(item.y - median_top) <= y_tolerance * 2
+                or abs(item.bottom - median_bottom) <= y_tolerance * 2
+            )
+        }
     glyph_mask = np.zeros_like(seed)
     for label in selected_labels:
         glyph_mask[labels == label] = 255
@@ -443,6 +582,47 @@ def _text_glyph_mask(
     )
     full_mask[y0:y1, x0:x1] = glyph_mask
     return full_mask
+
+
+def _box_coverage_mask(
+    width: int,
+    height: int,
+    box: TextBox,
+    padding: int,
+) -> np.ndarray:
+    mask = np.zeros((height, width), dtype=np.uint8)
+    # A few faded edge glyphs are darker than the detector threshold. Add a
+    # small horizontal-only safety margin (about 10px at 1280 wide) so those
+    # final characters cannot peek out while the vertical band stays tight.
+    horizontal_padding = padding + max(
+        2,
+        round(width * 0.008),
+        round(box.width * 0.10),
+    )
+    x0 = max(0, box.x - horizontal_padding)
+    y0 = max(0, box.y - padding)
+    x1 = min(width, box.right + horizontal_padding)
+    y1 = min(height, box.bottom + padding)
+    if x1 > x0 and y1 > y0:
+        cv2.rectangle(mask, (x0, y0), (x1 - 1, y1 - 1), 255, -1)
+    return mask
+
+
+def _boxes_compatible(
+    previous: TextBox,
+    current: TextBox,
+    width: int,
+    height: int,
+) -> bool:
+    previous_center_x = (previous.x + previous.right) / 2
+    current_center_x = (current.x + current.right) / 2
+    previous_center_y = (previous.y + previous.bottom) / 2
+    current_center_y = (current.y + current.bottom) / 2
+    return (
+        abs(previous_center_x - current_center_x) <= width * 0.18
+        and abs(previous_center_y - current_center_y)
+        <= max(height * 0.045, max(previous.height, current.height) * 1.5)
+    )
 
 
 def _smooth_box(current: TextBox, history: deque[TextBox], width: int, height: int) -> TextBox:

@@ -4,6 +4,7 @@ export type PublishTarget = "youtube" | "facebook";
 export type JobStatus = "queued" | "processing" | "completed" | "failed";
 export type ReviewJobStatus = JobStatus | "needs_review" | "ready_to_render";
 export type SourceLanguage = "auto" | "en" | "zh" | "vi";
+export type ProcessingMode = "fast" | "balanced" | "quality";
 
 export interface CustomBlurBox {
   x_percent: number;
@@ -17,6 +18,7 @@ export interface CustomBlurBox {
 export interface DubbingRequest {
   source_url?: string | null;
   local_file_path?: string | null;
+  processing_mode: ProcessingMode;
   voice_gender: VoiceGender;
   bgm_mode: BgmMode;
   use_demucs: boolean;
@@ -77,6 +79,7 @@ export interface ReviewDraftRequest {
   video_path: string;
   target_minutes: number;
   style: "story" | "fast" | "emotional" | "funny";
+  processing_mode: ProcessingMode;
   source_language: SourceLanguage;
   notes?: string | null;
   hard_subtitles: boolean;

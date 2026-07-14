@@ -8,12 +8,18 @@ compatibility tests but are never selected by ``get_translation_engine``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+import time
 import unicodedata
 from collections import Counter
+from collections.abc import Callable
+from pathlib import Path
 
 from app.core import settings
+from app.models.job import ProcessingMode
+from app.services.presets import ProcessingProfile, get_processing_profile
 from app.services.subtitles.timing import SubtitleEvent
 
 
@@ -30,6 +36,10 @@ class TranslationEngine:
         source_language: str,
         target_language: str,
         context: dict | None = None,
+        *,
+        processing_mode: ProcessingMode | str | None = None,
+        checkpoint_file: Path | None = None,
+        on_batch_progress: Callable[[int, int], None] | None = None,
     ) -> list[SubtitleEvent]:
         raise NotImplementedError
 
@@ -41,6 +51,10 @@ class PassthroughTranslation(TranslationEngine):
         source_language: str,
         target_language: str,
         context: dict | None = None,
+        *,
+        processing_mode: ProcessingMode | str | None = None,
+        checkpoint_file: Path | None = None,
+        on_batch_progress: Callable[[int, int], None] | None = None,
     ) -> list[SubtitleEvent]:
         return events
 
@@ -60,6 +74,10 @@ class GeminiTranslation(TranslationEngine):
         source_language: str,
         target_language: str,
         context: dict | None = None,
+        *,
+        processing_mode: ProcessingMode | str | None = None,
+        checkpoint_file: Path | None = None,
+        on_batch_progress: Callable[[int, int], None] | None = None,
     ) -> list[SubtitleEvent]:
         if not events:
             return []
@@ -78,15 +96,56 @@ class GeminiTranslation(TranslationEngine):
         client = AsyncOpenAI(
             api_key=settings.ninerouter_api_key,
             base_url=settings.ninerouter_api_url,
+            # Retry is controlled below so one failing batch cannot silently
+            # multiply the SDK retries by the pipeline retries.
+            max_retries=0,
         )
+        profile = get_processing_profile(processing_mode)
         source_texts = [
             unicodedata.normalize("NFC", _normalize_source_text(event.text.strip()))
             for event in events
         ]
-        memory = _initial_translation_memory(context)
-        translated_texts: list[str] = []
+        ranges = _ai_translation_batch_ranges(
+            source_texts,
+            max_items=profile.translation_batch_items,
+            max_chars=profile.translation_batch_chars,
+        )
+        fingerprint = _translation_fingerprint(
+            source_texts,
+            source_language,
+            target_language,
+            context,
+            profile,
+        )
+        translated_texts, memory = _load_translation_checkpoint(
+            checkpoint_file,
+            fingerprint,
+            context,
+            ranges,
+        )
+        completed_batches = sum(end <= len(translated_texts) for _, end in ranges)
+        if on_batch_progress:
+            on_batch_progress(completed_batches, len(ranges))
 
-        for start, end in _ai_translation_batch_ranges(source_texts):
+        started_at = time.monotonic()
+        total_budget = max(
+            profile.translation_request_timeout_seconds,
+            len(ranges) * profile.translation_batch_budget_seconds,
+        )
+
+        for batch_index, (start, end) in enumerate(ranges, start=1):
+            if end <= len(translated_texts):
+                continue
+            if start != len(translated_texts):
+                raise TranslationError(
+                    "Checkpoint dịch không nằm đúng ranh giới batch; hãy xóa checkpoint và chạy lại."
+                )
+            elapsed = time.monotonic() - started_at
+            if elapsed >= total_budget:
+                raise TranslationError(
+                    f"Dịch vượt quá ngân sách {int(total_budget)} giây; "
+                    f"đã lưu checkpoint {completed_batches}/{len(ranges)} batch để chạy tiếp."
+                )
             batch = [
                 {"id": index + 1, "source": source_texts[index]}
                 for index in range(start, end)
@@ -112,6 +171,8 @@ class GeminiTranslation(TranslationEngine):
                 memory,
                 previous_context,
                 next_context,
+                retries=profile.translation_retries,
+                request_timeout_seconds=profile.translation_request_timeout_seconds,
             )
 
             for item, translated in zip(batch, batch_texts):
@@ -135,6 +196,16 @@ class GeminiTranslation(TranslationEngine):
                 }
                 for item, translated in zip(batch[-8:], batch_texts[-8:])
             ]
+            completed_batches = batch_index
+            _write_translation_checkpoint(
+                checkpoint_file,
+                fingerprint,
+                translated_texts,
+                memory,
+                len(source_texts),
+            )
+            if on_batch_progress:
+                on_batch_progress(completed_batches, len(ranges))
 
         if len(translated_texts) != len(events):
             raise TranslationError("AI trả về thiếu câu dịch so với phụ đề nguồn.")
@@ -151,6 +222,10 @@ class GoogleTranslation(TranslationEngine):
         source_language: str,
         target_language: str,
         context: dict | None = None,
+        *,
+        processing_mode: ProcessingMode | str | None = None,
+        checkpoint_file: Path | None = None,
+        on_batch_progress: Callable[[int, int], None] | None = None,
     ) -> list[SubtitleEvent]:
         if not events:
             return []
@@ -242,6 +317,88 @@ def _ai_translation_batch_ranges(
     return ranges
 
 
+def _translation_fingerprint(
+    source_texts: list[str],
+    source_language: str,
+    target_language: str,
+    context: dict | None,
+    profile: ProcessingProfile,
+) -> str:
+    payload = {
+        "source_texts": source_texts,
+        "source_language": source_language,
+        "target_language": target_language,
+        "context": context or {},
+        "model": settings.ai_model,
+        "processing_mode": profile.name,
+        "batch_items": profile.translation_batch_items,
+        "batch_chars": profile.translation_batch_chars,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_translation_checkpoint(
+    checkpoint_file: Path | None,
+    fingerprint: str,
+    context: dict | None,
+    ranges: list[tuple[int, int]],
+) -> tuple[list[str], dict]:
+    fallback = ([], _initial_translation_memory(context))
+    if checkpoint_file is None or not checkpoint_file.is_file():
+        return fallback
+    try:
+        data = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+    if not isinstance(data, dict) or data.get("fingerprint") != fingerprint:
+        return fallback
+    translated = data.get("translated_texts")
+    memory = data.get("memory")
+    if not isinstance(translated, list) or not all(isinstance(item, str) for item in translated):
+        return fallback
+    if not isinstance(memory, dict):
+        return fallback
+    valid_offsets = {0, *(end for _, end in ranges)}
+    if len(translated) not in valid_offsets:
+        return fallback
+    return list(translated), memory
+
+
+def _write_translation_checkpoint(
+    checkpoint_file: Path | None,
+    fingerprint: str,
+    translated_texts: list[str],
+    memory: dict,
+    total_items: int,
+) -> None:
+    if checkpoint_file is None:
+        return
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "fingerprint": fingerprint,
+        "model": settings.ai_model,
+        "translated_items": len(translated_texts),
+        "total_items": total_items,
+        "completed": len(translated_texts) == total_items,
+        "translated_texts": translated_texts,
+        "memory": memory,
+    }
+    temporary = checkpoint_file.with_suffix(f"{checkpoint_file.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(checkpoint_file)
+
+
 def _initial_translation_memory(context: dict | None) -> dict:
     return {
         "character_bible": _compact_context(context),
@@ -297,6 +454,7 @@ async def _translate_gemini_batch(
     memory: dict,
     previous_context: list[dict[str, object]],
     next_context: list[dict[str, object]],
+    request_timeout_seconds: float = 150,
 ) -> tuple[list[str], dict]:
     system_prompt = (
         "Bạn là biên dịch viên phụ đề phim nhiều tập, chuyên giữ nhất quán nhân vật và ngữ cảnh. "
@@ -330,7 +488,7 @@ async def _translate_gemini_batch(
         ],
         response_format={"type": "json_object"},
         temperature=0.15,
-        timeout=150,
+        timeout=request_timeout_seconds,
     )
     content = response.choices[0].message.content or ""
     data = _loads_json_object(content)
@@ -377,24 +535,33 @@ async def _translate_gemini_batch_with_retries(
     previous_context: list[dict[str, object]],
     next_context: list[dict[str, object]],
     retries: int = 3,
+    request_timeout_seconds: float = 150,
 ) -> tuple[list[str], dict]:
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            return await _translate_gemini_batch(
-                client,
-                batch,
-                source_language,
-                target_language,
-                context,
-                memory,
-                previous_context,
-                next_context,
+            return await asyncio.wait_for(
+                _translate_gemini_batch(
+                    client,
+                    batch,
+                    source_language,
+                    target_language,
+                    context,
+                    memory,
+                    previous_context,
+                    next_context,
+                    request_timeout_seconds=request_timeout_seconds,
+                ),
+                timeout=request_timeout_seconds + 5,
+            )
+        except TimeoutError as exc:
+            last_error = TranslationError(
+                f"9router không phản hồi trong {int(request_timeout_seconds)} giây"
             )
         except Exception as exc:
             last_error = exc
-            if attempt < retries:
-                await asyncio.sleep(min(2 * attempt, 6))
+        if attempt < retries:
+            await asyncio.sleep(min(2 * attempt, 6))
     assert last_error is not None
     first_id = batch[0]["id"] if batch else "?"
     last_id = batch[-1]["id"] if batch else "?"

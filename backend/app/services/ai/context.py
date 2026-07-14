@@ -20,6 +20,15 @@ async def analyze_video_context(
     if not video_file or not video_file.exists() or not settings.ninerouter_api_key:
         return {}
 
+    context_file = work_dir / "ai_context.json"
+    if context_file.is_file() and context_file.stat().st_size > 0:
+        try:
+            cached = json.loads(context_file.read_text(encoding="utf-8"))
+            if isinstance(cached, dict):
+                return cached
+        except (OSError, json.JSONDecodeError):
+            pass
+
     transcript = _compact_transcript(events)
     frames = _sample_video_frames(video_file)
     if not transcript and not frames:
@@ -66,7 +75,7 @@ async def analyze_video_context(
 
     context = _sanitize_context(context, transcript)
     if context:
-        (work_dir / "ai_context.json").write_text(
+        context_file.write_text(
             json.dumps(context, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )

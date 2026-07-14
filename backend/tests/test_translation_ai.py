@@ -75,6 +75,7 @@ class GeminiTranslationTests(unittest.IsolatedAsyncioTestCase):
                         "characters": [{"name": "Lục Trạch", "source": "陆泽"}],
                         "relationships": [],
                     },
+                    processing_mode="quality",
                 )
         finally:
             settings.ninerouter_api_key = original_key
@@ -147,7 +148,7 @@ class GeminiTranslationTests(unittest.IsolatedAsyncioTestCase):
         app_dir = Path(__file__).resolve().parents[1] / "app"
         occurrences: list[Path] = []
         for source in app_dir.rglob("*.py"):
-            if "ag/gemini-pro-agent" in source.read_text(encoding="utf-8"):
+            if "ag/gemini-3-flash-agent" in source.read_text(encoding="utf-8"):
                 occurrences.append(source)
         self.assertEqual(occurrences, [app_dir / "core.py"])
 

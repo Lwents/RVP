@@ -1,9 +1,10 @@
 import React, { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, Clapperboard, Clock3, Copy, Download, FileImage, ImageOff, Loader2, Play, Plus, Save, Sparkles, Trash2, Upload, Video, Wand2 } from "lucide-react";
-import { clearReviewDraftJobs, createReviewDraftJob, detectBlurRegions, getReviewDraftJob, listReviewDraftJobs, renderReviewDraftJob, toAbsoluteApiUrl, updateReviewDraftSegment, uploadVideo, uploadWatermark } from "../lib/api";
+import { AlertTriangle, Check, Clapperboard, Clock3, Copy, Download, FileImage, ImageOff, Loader2, Play, Plus, RotateCcw, Save, Sparkles, Trash2, Upload, Video, Wand2 } from "lucide-react";
+import { clearReviewDraftJobs, createReviewDraftJob, detectBlurRegions, getReviewDraftJob, listReviewDraftJobs, renderReviewDraftJob, retryReviewDraftJob, toAbsoluteApiUrl, updateReviewDraftSegment, uploadVideo, uploadWatermark } from "../lib/api";
 import type { UploadProgress } from "../lib/api";
-import type { CustomBlurBox, ReviewBeat, ReviewBeatCandidate, ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
+import type { CustomBlurBox, ProcessingMode, ReviewBeat, ReviewBeatCandidate, ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
 import { LivePreview } from "./LivePreview";
+import { ProcessingModeSelector } from "./ProcessingModeSelector";
 
 const reviewStyles: Array<{ label: string; value: ReviewDraftRequest["style"] }> = [
   { label: "Kể chuyện", value: "story" },
@@ -86,6 +87,7 @@ export const MovieReview = React.memo(function MovieReview() {
   const [videoName, setVideoName] = useState("Chưa có phim được import");
   const [targetMinutes, setTargetMinutes] = useState(8);
   const [style, setStyle] = useState<ReviewDraftRequest["style"]>("story");
+  const [processingMode, setProcessingMode] = useState<ProcessingMode>("balanced");
   const [sourceLanguage, setSourceLanguage] = useState<SourceLanguage>("auto");
   const [notes, setNotes] = useState("");
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
@@ -93,6 +95,7 @@ export const MovieReview = React.memo(function MovieReview() {
   const [isLogoUploading, setLogoUploading] = useState(false);
   const [isDetectingAI, setDetectingAI] = useState(false);
   const [isCreating, setCreating] = useState(false);
+  const [isRetrying, setRetrying] = useState(false);
   const [isRenderingReview, setRenderingReview] = useState(false);
   const [isClearingHistory, setClearingHistory] = useState(false);
   const [job, setJob] = useState<ReviewDraftJob | null>(null);
@@ -120,6 +123,7 @@ export const MovieReview = React.memo(function MovieReview() {
     setVideoPath(item.request.video_path);
     setSourceVideoUrl(sourceUrlFromPath(item.request.video_path));
     setVideoName(fileNameFromPath(item.request.video_path));
+    setProcessingMode(item.request.processing_mode ?? "balanced");
     setRenderOptions(renderOptionsFromRequest(item.request));
     setWatermarkName(item.request.watermark_file_name ? "Logo đã lưu trong job" : "Chưa có logo được tải lên");
     setPreviewMode(item.result?.output_video_url ? "output" : "source");
@@ -317,6 +321,7 @@ export const MovieReview = React.memo(function MovieReview() {
         video_path: videoPath,
         target_minutes: targetMinutes,
         style,
+        processing_mode: processingMode,
         source_language: sourceLanguage,
         notes: notes.trim() || null,
         ...renderOptions,
@@ -328,7 +333,24 @@ export const MovieReview = React.memo(function MovieReview() {
     } finally {
       setCreating(false);
     }
-  }, [applyReviewJob, notes, refreshReviewJobs, renderOptions, sourceLanguage, style, targetMinutes, videoPath]);
+  }, [applyReviewJob, notes, processingMode, refreshReviewJobs, renderOptions, sourceLanguage, style, targetMinutes, videoPath]);
+
+  const retryFailedJob = useCallback(async () => {
+    if (!job || job.status !== "failed") return;
+
+    setRetrying(true);
+    setMessage(null);
+    try {
+      const retried = await retryReviewDraftJob(job.job_id, processingMode);
+      applyReviewJob(retried);
+      await refreshReviewJobs();
+      setMessage("Đã chạy lại job từ checkpoint đã lưu.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Không thể chạy lại review job.");
+    } finally {
+      setRetrying(false);
+    }
+  }, [applyReviewJob, job, processingMode, refreshReviewJobs]);
 
   const selectReviewJob = useCallback((item: ReviewDraftJob) => {
     applyReviewJob(item);
@@ -526,6 +548,8 @@ export const MovieReview = React.memo(function MovieReview() {
             </label>
           </div>
 
+          <ProcessingModeSelector value={processingMode} onChange={setProcessingMode} />
+
           <div className="segment-wrap">
             <span className="label">Phong cách review</span>
             <div className="segments">
@@ -635,6 +659,17 @@ export const MovieReview = React.memo(function MovieReview() {
                 <div className="upload-progress-bar" style={{ width: `${job.progress}%` }} />
               </div>
               {job.error && <div className="review-error">{job.error}</div>}
+              {job.status === "failed" && (
+                <button
+                  className="ios-button ios-button-secondary review-retry-button"
+                  type="button"
+                  onClick={retryFailedJob}
+                  disabled={isRetrying}
+                >
+                  {isRetrying ? <Loader2 className="spin" size={16} /> : <RotateCcw size={16} />}
+                  {isRetrying ? "Đang chạy lại..." : "Chạy lại từ checkpoint"}
+                </button>
+              )}
             </div>
           )}
 
@@ -864,7 +899,7 @@ function ReviewDisplayControls({
         />
         <ReviewCheckBox
           checked={options.blur_box_enabled}
-          label="Làm mờ chữ gốc"
+          label="Làm mờ chữ gốc (cố định suốt video)"
           onChange={() => onFieldChange("blur_box_enabled", !options.blur_box_enabled)}
         />
         <ReviewCheckBox

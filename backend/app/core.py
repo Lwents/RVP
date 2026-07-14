@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_AI_MODEL = "ag/gemini-3-flash-agent"
 
 
 class Settings(BaseSettings):
@@ -55,7 +56,7 @@ class Settings(BaseSettings):
     ninerouter_api_url: str = "http://localhost:20128/v1"
     ninerouter_api_key: str | None = None
     # One source of truth for every 9router/Gemini feature in this project.
-    ai_model: str = "ag/gemini-pro-agent"
+    ai_model: str = DEFAULT_AI_MODEL
     review_scene_batch_size: int = 4
     review_keyframes_per_scene: int = 3
     review_max_scenes: int = 240

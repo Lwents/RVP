@@ -8,8 +8,7 @@ from typing import Callable, TypedDict
 from app.core import settings
 from app.models.job import DubbingRequest
 from app.services.media.ffmpeg import probe_video_duration, run_command, run_command_with_progress
-from app.services.media.renderer import _append_soft_box_blur, _gaussian_blur_sigma
-from app.services.media.subtitle_mask import SubtitleMaskAssets, build_subtitle_mask_video
+from app.services.media.renderer import _append_soft_box_blur
 from app.services.subtitles.ass import srt_to_positioned_ass, subtitle_font_dir, write_srt
 from app.services.subtitles.timing import SubtitleEvent
 
@@ -88,22 +87,14 @@ def build_review_scenes(
         end = start + durations[index] if end is None else end
         start = max(0.0, min(start, max(0.0, source_duration - 1.0)))
         end = max(start + 0.8, min(end, source_duration))
-        duration = max(0.8, durations[index])
-        available = max(0.4, end - start)
-        if duration <= available + 0.02:
-            scenes.append((start, duration))
-            continue
-
-        # Never let a long voice sentence run beyond its verified scene into an
-        # unrelated shot. Reuse short slices inside the same evidence window.
-        repeat_count = max(2, math.ceil(duration / available))
-        chunk_duration = duration / repeat_count
-        travel = max(0.0, available - chunk_duration)
-        for repeat_index in range(repeat_count):
-            ratio = 0.0 if repeat_count == 1 else repeat_index / (repeat_count - 1)
-            chunk_start = min(end - chunk_duration, start + travel * ratio)
-            chunk_start = max(0.0, min(chunk_start, max(0.0, source_duration - chunk_duration)))
-            scenes.append((chunk_start, chunk_duration))
+        duration = min(max(0.8, durations[index]), max(source_duration, 0.8))
+        # Keep the verified evidence near the middle of one continuous source
+        # window. Replaying slices from a 0.7-2.5s evidence window while a
+        # sentence is still being read creates the visible Doraemon loop.
+        evidence_center = (start + end) / 2
+        clip_start = evidence_center - duration / 2
+        clip_start = max(0.0, min(clip_start, max(0.0, source_duration - duration)))
+        scenes.append((clip_start, duration))
     return scenes
 
 
@@ -187,14 +178,6 @@ async def render_movie_review_video(
 
     on_progress(93)
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    subtitle_mask: SubtitleMaskAssets | None = None
-    if render_request and render_request.blur_box_enabled:
-        subtitle_mask = await build_subtitle_mask_video(
-            silent_video,
-            work_dir / "review_subtitle_blur_mask.mp4",
-            render_request.blur_box_y_percent,
-            render_request.blur_box_height_percent,
-        )
     command = _build_review_output_command(
         ffmpeg,
         silent_video,
@@ -204,7 +187,6 @@ async def render_movie_review_video(
         work_dir,
         target_seconds,
         render_request,
-        subtitle_mask,
     )
     await run_command_with_progress(
         command,
@@ -226,38 +208,19 @@ def _build_review_output_command(
     work_dir: Path,
     target_seconds: float,
     request: DubbingRequest | None,
-    subtitle_mask: SubtitleMaskAssets | None = None,
 ) -> list[str]:
     command = [ffmpeg, "-y", "-i", str(silent_video), "-i", str(narration_audio)]
-    filter_parts: list[str] = []
-    video_label = "[0:v]"
-    video_map = "0:v"
+    filter_parts: list[str] = ["[0:v]setpts=PTS-STARTPTS[vbase]"]
+    video_label = "[vbase]"
+    video_map = video_label
     next_input_index = 2
     width, height = 1280, 720
 
     if request:
-        if subtitle_mask is not None:
-            command.extend(["-i", str(subtitle_mask.mask_file)])
-            mask_index = next_input_index
-            next_input_index += 1
-            command.extend(["-i", str(subtitle_mask.cleaned_video_file)])
-            cleaned_index = next_input_index
-            next_input_index += 1
-            blur_sigma = _gaussian_blur_sigma(width, height)
-            filter_parts.append(
-                f"[{cleaned_index}:v]scale={width}:{height}:flags=bilinear,"
-                f"setpts=PTS-STARTPTS,gblur=sigma={blur_sigma}:steps=2[reviewmask_blurred]"
-            )
-            filter_parts.append(
-                f"[{mask_index}:v]format=gray,scale={width}:{height}:flags=bilinear,"
-                "lut=y='min(255\\,val*1.25)',setpts=PTS-STARTPTS[reviewmask_alpha]"
-            )
-            filter_parts.append(
-                f"{video_label}[reviewmask_blurred][reviewmask_alpha]"
-                "maskedmerge=planes=15[reviewmask_out]"
-            )
-            video_label = "[reviewmask_out]"
-        elif request.blur_box_enabled:
+        if request.blur_box_enabled:
+            # Use one fixed, feathered subtitle band for the entire review.
+            # This avoids an extra OpenCV detect/inpaint/encode pass and keeps
+            # the blur position stable instead of following text per frame.
             video_label = _append_soft_box_blur(
                 filter_parts,
                 video_label,
@@ -271,7 +234,7 @@ def _build_review_output_command(
                     None,
                     None,
                 )],
-                "reviewfallback",
+                "reviewstatic",
                 pad_boxes=False,
             )
 
@@ -326,7 +289,7 @@ def _build_review_output_command(
                 video_label = "[vwm]"
     else:
         filter_parts.append(
-            f"[0:v]subtitles='{_filter_path(subtitle_file)}':"
+            f"{video_label}subtitles='{_filter_path(subtitle_file)}':"
             f"fontsdir='{_filter_path(subtitle_font_dir())}':wrap_unicode=1:"
             "force_style='FontName=Be Vietnam Pro ExtraBold,FontSize=40,"
             "PrimaryColour=&H0000F2FF,OutlineColour=&H00000000,"
@@ -335,8 +298,7 @@ def _build_review_output_command(
         )
         video_label = "[v]"
 
-    if video_label != "[0:v]":
-        video_map = video_label
+    video_map = video_label
 
     filter_parts.append(f"[1:a]apad,atrim=0:{target_seconds:.3f},asetpts=N/SR/TB[a]")
 

@@ -120,7 +120,10 @@ class EdgeTtsVoiceEngine(VoiceEngine):
             raise VoiceError("Thiếu edge-tts. Chạy pip install -r requirements.txt trong backend.") from exc
 
         # Keep voice generation aligned with the exact subtitle events burned into the output.
-        events = _group_events(normalize_events(parse_srt(subtitle_file)))
+        raw_events = _group_events(normalize_events(parse_srt(subtitle_file)))
+
+        events = _clamp_events_to_duration(raw_events, duration)
+
         if not events:
             raise VoiceError("Không có phụ đề hợp lệ để tạo giọng đọc theo thời gian.")
 
@@ -238,6 +241,18 @@ def get_voice_engine() -> VoiceEngine:
     if settings.voice_engine.lower() in {"edge", "edge-tts", "edge_tts"}:
         return EdgeTtsVoiceEngine()
     return DisabledVoiceEngine()
+
+
+def _clamp_events_to_duration(
+    events: list[SubtitleEvent],
+    duration: float,
+) -> list[SubtitleEvent]:
+    """Return timeline-safe copies without mutating frozen SubtitleEvent objects."""
+    return [
+        SubtitleEvent(event.start, min(event.end, duration), event.text)
+        for event in events
+        if event.start < duration - 0.1
+    ]
 
 
 def _normalize_tts_text(text: str) -> str:

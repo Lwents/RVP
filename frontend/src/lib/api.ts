@@ -1,4 +1,4 @@
-import type { DubbingRequest, JobProgress, ReviewDraftJob, ReviewDraftRequest, ReviewSegmentPatch, UploadResponse } from "../types/api";
+import type { DubbingRequest, JobProgress, ProcessingMode, ReviewDraftJob, ReviewDraftRequest, ReviewSegmentPatch, UploadResponse } from "../types/api";
 
 const ENV_API_URL = import.meta.env.VITE_API_URL?.trim();
 
@@ -273,6 +273,13 @@ export async function createReviewDraftJob(payload: ReviewDraftRequest): Promise
   return request("/api/review/jobs", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export async function retryReviewDraftJob(jobId: string, processingMode: ProcessingMode): Promise<ReviewDraftJob> {
+  return request(`/api/review/jobs/${encodeURIComponent(jobId)}/retry`, {
+    method: "POST",
+    body: JSON.stringify({ processing_mode: processingMode }),
   });
 }
 
