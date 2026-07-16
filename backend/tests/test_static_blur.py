@@ -20,16 +20,35 @@ class StaticSubtitleBlurTests(unittest.TestCase):
             720,
             [(5.0, 80.0, 90.0, 13.0, None, None)],
             "substatic",
-            pad_boxes=False,
+            strong_subtitle=True,
         )
         graph = ";".join(filters)
 
         self.assertEqual(output, "[substatic_out]")
         self.assertIn("between(X", graph)
         self.assertIn("between(Y", graph)
-        self.assertIn("gblur=sigma=25", graph)
-        self.assertIn("maskedmerge", graph)
+        self.assertIn("gblur=sigma=32:sigmaV=19:steps=3", graph)
+        self.assertIn("alphamerge", graph)
+        self.assertIn("overlay=0:0:format=auto", graph)
+        self.assertNotIn("maskedmerge", graph)
         self.assertNotIn("T-", graph)
+
+    def test_custom_box_keeps_lighter_default_blur(self) -> None:
+        filters: list[str] = []
+
+        _append_soft_box_blur(
+            filters,
+            "[vbase]",
+            1280,
+            720,
+            [(2.0, 2.0, 15.0, 10.0, None, None)],
+            "customsoft",
+        )
+        graph = ";".join(filters)
+
+        self.assertIn("gblur=sigma=25:steps=2", graph)
+        self.assertIn("maskedmerge", graph)
+        self.assertNotIn("alphamerge", graph)
 
     def test_review_command_does_not_add_dynamic_mask_inputs(self) -> None:
         request = DubbingRequest(

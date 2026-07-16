@@ -1,7 +1,9 @@
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 from datetime import UTC, datetime
 import asyncio
+import re
 import shutil
 
 import cv2
@@ -35,7 +37,7 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 class ReviewDraftRequest(BaseModel):
     video_path: str
     target_minutes: int = Field(default=8, ge=1, le=30)
-    style: str = "story"
+    style: Literal["story", "fast", "emotional", "funny"] = "story"
     source_language: str = "auto"
     notes: str | None = None
     hard_subtitles: bool = True
@@ -423,6 +425,40 @@ def _review_result_from_package(
     )
 
 
+def _apply_review_measured_duration_gate(
+    package: VerifiedReviewPackage,
+    measured_seconds: float,
+) -> bool:
+    """Replace the word-budget estimate with the measured Edge TTS runtime."""
+
+    from app.services.ai.review_analysis import review_duration_adherence
+
+    score, accepted = review_duration_adherence(measured_seconds, package.target_minutes)
+    previous = package.quality_report
+    issues = [issue for issue in previous.issues if issue.code != "TARGET_DURATION_MISMATCH"]
+    if not accepted:
+        issues.append(
+            QualityIssue(
+                severity="error",
+                code="TARGET_DURATION_MISMATCH",
+                message=(
+                    f"Giọng đọc thực tế dài {measured_seconds:.1f} giây; "
+                    f"mục tiêu {package.target_minutes} phút chỉ cho phép lệch tối đa 10%."
+                ),
+            )
+        )
+    overall = previous.overall_score - previous.duration_adherence_score * 0.08 + score * 0.08
+    package.quality_report = previous.model_copy(
+        update={
+            "overall_score": round(max(0.0, min(100.0, overall)), 2),
+            "duration_adherence_score": score,
+            "passed": previous.passed and accepted and not any(issue.severity == "error" for issue in issues),
+            "issues": issues,
+        }
+    )
+    return accepted
+
+
 def _review_scene_hints(decisions: list[EditDecision]) -> list[dict]:
     hints: list[dict] = []
     for decision in decisions:
@@ -498,12 +534,15 @@ def _build_review_render_request(request: ReviewDraftRequest, source_video: Path
 async def _process_review_draft_job(job_id: str) -> None:
     from app.services.ai.review_analysis import (
         build_verified_review_package,
+        recenter_edl_on_verified_keyframes,
         replace_failed_decisions_with_alternatives,
         rescale_edl_voice_timeline,
+        review_duration_adherence,
+        review_narration_tempo_factor,
         verify_rendered_review,
     )
     from app.services.ai.voice import get_voice_engine
-    from app.services.media.ffmpeg import extract_audio, find_ffmpeg, probe_video_duration
+    from app.services.media.ffmpeg import adjust_audio_tempo, extract_audio, find_ffmpeg, probe_video_duration
     from app.services.media.review_renderer import render_movie_review_video, write_review_subtitles
     from app.models.job import VoiceGender
     from app.services.subtitles.source import get_or_create_subtitles
@@ -600,8 +639,40 @@ async def _process_review_draft_job(job_id: str) -> None:
         narration_duration = await probe_video_duration(ffmpeg, narration_audio)
         if narration_duration <= 0:
             raise RuntimeError("Không đo được thời lượng giọng đọc review.")
+        _, raw_duration_ok = review_duration_adherence(narration_duration, job.request.target_minutes)
+        if not raw_duration_ok:
+            tempo_factor = review_narration_tempo_factor(narration_duration, job.request.target_minutes)
+            if tempo_factor is not None:
+                _update_review_job(
+                    job_id,
+                    progress=89,
+                    stage=f"Điều chỉnh nhịp đọc {tempo_factor:.3f}x để khớp {job.request.target_minutes} phút",
+                )
+                narration_audio = await adjust_audio_tempo(
+                    ffmpeg,
+                    narration_audio,
+                    work_dir / "review_narration_timed.mp3",
+                    tempo_factor,
+                )
+                narration_duration = await probe_video_duration(ffmpeg, narration_audio)
+        if not _apply_review_measured_duration_gate(package, narration_duration):
+            (work_dir / "quality_report.json").write_text(
+                package.quality_report.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+            _update_review_job(
+                job_id,
+                status="needs_review",
+                progress=83,
+                stage=(
+                    f"Giọng đọc {narration_duration:.1f}s chưa đạt mục tiêu "
+                    f"{job.request.target_minutes} phút; chưa render"
+                ),
+                result=_review_result_from_package(job_id, package),
+            )
+            return
         package.edit_decision_list = rescale_edl_voice_timeline(
-            package.edit_decision_list,
+            recenter_edl_on_verified_keyframes(package.edit_decision_list, package.scenes),
             narration_duration,
         )
         (work_dir / "edit_decision_list.json").write_text(
@@ -648,6 +719,8 @@ async def _process_review_draft_job(job_id: str) -> None:
             revised_decisions, changed = replace_failed_decisions_with_alternatives(
                 package.edit_decision_list,
                 post_report,
+                package.narration_segments,
+                package.scenes,
             )
             if changed:
                 package.edit_decision_list = revised_decisions
@@ -722,11 +795,14 @@ async def _process_review_draft_job(job_id: str) -> None:
 async def _render_existing_review_job(job_id: str) -> None:
     from app.models.job import VoiceGender
     from app.services.ai.review_analysis import (
+        recenter_edl_on_verified_keyframes,
         rescale_edl_voice_timeline,
+        review_duration_adherence,
+        review_narration_tempo_factor,
         verify_rendered_review,
     )
     from app.services.ai.voice import get_voice_engine
-    from app.services.media.ffmpeg import find_ffmpeg, probe_video_duration
+    from app.services.media.ffmpeg import adjust_audio_tempo, find_ffmpeg, probe_video_duration
     from app.services.media.review_renderer import render_movie_review_video, write_review_subtitles
 
     job = review_draft_jobs.get(job_id)
@@ -779,7 +855,42 @@ async def _render_existing_review_job(job_id: str) -> None:
         duration = await probe_video_duration(ffmpeg, narration_audio)
         if duration <= 0:
             raise RuntimeError("Không đo được thời lượng voice review.")
-        package.edit_decision_list = rescale_edl_voice_timeline(package.edit_decision_list, duration)
+        _, raw_duration_ok = review_duration_adherence(duration, job.request.target_minutes)
+        if not raw_duration_ok:
+            tempo_factor = review_narration_tempo_factor(duration, job.request.target_minutes)
+            if tempo_factor is not None:
+                _update_review_job(
+                    job_id,
+                    progress=89,
+                    stage=f"Điều chỉnh nhịp đọc {tempo_factor:.3f}x để khớp {job.request.target_minutes} phút",
+                )
+                narration_audio = await adjust_audio_tempo(
+                    ffmpeg,
+                    narration_audio,
+                    work_dir / "review_narration_timed.mp3",
+                    tempo_factor,
+                )
+                duration = await probe_video_duration(ffmpeg, narration_audio)
+        if not _apply_review_measured_duration_gate(package, duration):
+            (work_dir / "quality_report.json").write_text(
+                package.quality_report.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+            _update_review_job(
+                job_id,
+                status="needs_review",
+                progress=83,
+                stage=(
+                    f"Giọng đọc {duration:.1f}s chưa đạt mục tiêu "
+                    f"{job.request.target_minutes} phút; chưa render"
+                ),
+                result=_review_result_from_package(job_id, package),
+            )
+            return
+        package.edit_decision_list = rescale_edl_voice_timeline(
+            recenter_edl_on_verified_keyframes(package.edit_decision_list, package.scenes),
+            duration,
+        )
         (work_dir / "edit_decision_list.json").write_text(
             json.dumps(
                 [item.model_dump(mode="json") for item in package.edit_decision_list],
@@ -1089,7 +1200,21 @@ async def patch_review_segment(
                 beat.candidates = decision.alternatives
 
     result.narration_script = " ".join(item.narration.strip() for item in result.beats if item.narration.strip())
-    result.quality_report = _recalculate_review_quality(result)
+    narrative_assessment = None
+    if narration is not None:
+        from app.services.ai.review_analysis import _judge_narrative_style
+
+        narrative_assessment = await _judge_narrative_style(
+            result.narration_segments,
+            result.events,
+            job.request.style,
+        )
+    result.quality_report = _recalculate_review_quality(
+        result,
+        edited_segment_id=segment_id,
+        style=job.request.style,
+        narrative_assessment=narrative_assessment,
+    )
     # Any accepted edit invalidates the previously rendered file. Keep the
     # file on disk for recovery, but never expose it as the output of the new
     # script/EDL; the user must render this revision again.
@@ -1124,19 +1249,78 @@ async def patch_review_segment(
     )
 
 
-def _recalculate_review_quality(result: ReviewDraftResult) -> ReviewQualityReport:
+def _recalculate_review_quality(
+    result: ReviewDraftResult,
+    edited_segment_id: str | None = None,
+    style: str = "story",
+    narrative_assessment=None,
+) -> ReviewQualityReport:
     previous = result.quality_report or ReviewQualityReport()
     scores = [item.match_score for item in result.beats if item.match_score is not None]
     direct = 100.0 * sum(score >= 0.75 for score in scores) / max(len(result.beats), 1)
-    chronology_score = 100.0
-    overall = (
-        direct * 0.45
-        + chronology_score * 0.25
-        + previous.evidence_score * 0.20
-        + previous.character_consistency_score * 0.10
+    source_starts = [item.start_seconds for item in result.beats if item.start_seconds is not None]
+    source_is_monotonic = all(left <= right + 0.25 for left, right in zip(source_starts, source_starts[1:]))
+    chronology_score = 100.0 if source_is_monotonic else 60.0
+    from app.services.ai.review_analysis import (
+        _review_narration_budget,
+        _review_source_coverage_score,
     )
-    stale_codes = {"LOW_VISUAL_MATCH", "POST_RENDER_VISUAL_MISMATCH", "VOICE_VIDEO_DRIFT"}
-    retained = [issue for issue in previous.issues if issue.code not in stale_codes]
+
+    budget = _review_narration_budget(result.target_minutes, style)
+    narration_word_count = len(re.findall(r"\w+", result.narration_script, flags=re.UNICODE))
+    duration_error = abs(narration_word_count - budget.target_words) / max(budget.target_words, 1)
+    duration_score = max(0.0, 100.0 - duration_error * 250.0)
+    # Never promote a missing/failed QA score to 100 after a manual edit. Old
+    # jobs without the new fields must be regenerated or explicitly rechecked.
+    story_score = (
+        narrative_assessment.coherence_score
+        if narrative_assessment is not None
+        else previous.story_coherence_score
+    )
+    source_coverage_score = (
+        _review_source_coverage_score(
+            result.scenes,
+            result.edit_decision_list,
+            result.target_minutes,
+        )
+        if result.scenes and result.edit_decision_list
+        else previous.source_coverage_score
+    )
+    style_score = (
+        narrative_assessment.style_score
+        if narrative_assessment is not None
+        else previous.style_adherence_score
+    )
+    overall = (
+        direct * 0.38
+        + chronology_score * 0.16
+        + previous.evidence_score * 0.12
+        + previous.character_consistency_score * 0.07
+        + duration_score * 0.08
+        + story_score * 0.08
+        + source_coverage_score * 0.06
+        + style_score * 0.05
+    )
+    retained = [
+        issue
+        for issue in previous.issues
+        if issue.code not in {
+            "LOW_VISUAL_MATCH",
+            "VOICE_VIDEO_DRIFT",
+            "NARRATION_DURATION_MISMATCH",
+            "TARGET_DURATION_MISMATCH",
+            "CHRONOLOGY",
+        }
+        and not (
+            issue.code == "POST_RENDER_VISUAL_MISMATCH"
+            and edited_segment_id is not None
+            and issue.segment_id == edited_segment_id
+        )
+        and not (
+            narrative_assessment is not None
+            and issue.code in {"NARRATIVE_LOGIC", "STYLE_MISMATCH"}
+        )
+    ]
     retained.extend(
         QualityIssue(
             severity="error",
@@ -1147,6 +1331,50 @@ def _recalculate_review_quality(result: ReviewDraftResult) -> ReviewQualityRepor
         for beat in result.beats
         if beat.match_score is not None and beat.match_score < 0.75
     )
+    if not budget.min_words <= narration_word_count <= budget.max_words:
+        retained.append(
+            QualityIssue(
+                severity="error",
+                code="NARRATION_DURATION_MISMATCH",
+                message=(
+                    f"Kịch bản có {narration_word_count} từ; review {result.target_minutes} phút "
+                    f"cần {budget.min_words}-{budget.max_words} từ."
+                ),
+            )
+        )
+    if not source_is_monotonic:
+        retained.append(
+            QualityIssue(
+                severity="error",
+                code="CHRONOLOGY",
+                message="Cảnh được chọn đang đi ngược thứ tự source time.",
+            )
+        )
+    retained_codes = {issue.code for issue in retained}
+    if story_score < 85.0 and "NARRATIVE_LOGIC" not in retained_codes:
+        retained.append(
+            QualityIssue(
+                severity="error",
+                code="NARRATIVE_LOGIC",
+                message="Kịch bản chưa có điểm QA logic hợp lệ; hãy tạo lại hoặc duyệt lại toàn bộ kịch bản.",
+            )
+        )
+    if source_coverage_score < 85.0 and "SOURCE_COVERAGE" not in retained_codes:
+        retained.append(
+            QualityIssue(
+                severity="error",
+                code="SOURCE_COVERAGE",
+                message="Kịch bản chưa phủ đủ timeline phim gốc.",
+            )
+        )
+    if style_score < 85.0 and "STYLE_MISMATCH" not in retained_codes:
+        retained.append(
+            QualityIssue(
+                severity="error",
+                code="STYLE_MISMATCH",
+                message="Kịch bản chưa có điểm QA đạt cho phong cách đã chọn.",
+            )
+        )
     passed = overall >= settings.review_quality_threshold and not any(issue.severity == "error" for issue in retained)
     return previous.model_copy(
         update={
@@ -1154,6 +1382,10 @@ def _recalculate_review_quality(result: ReviewDraftResult) -> ReviewQualityRepor
             "overall_score": round(overall, 2),
             "direct_visual_match_percent": round(direct, 2),
             "chronology_score": chronology_score,
+            "duration_adherence_score": round(duration_score, 2),
+            "story_coherence_score": story_score,
+            "source_coverage_score": source_coverage_score,
+            "style_adherence_score": style_score,
             "passed": passed,
             "issues": retained,
         }

@@ -46,7 +46,7 @@ async def render_video(
                 None,
             )],
             "substatic",
-            pad_boxes=False,
+            strong_subtitle=True,
         )
 
     if request.custom_blur_boxes:
@@ -204,6 +204,12 @@ def _gaussian_blur_sigma(width: int, height: int) -> int:
     return 25
 
 
+def _subtitle_blur_sigmas(width: int, height: int) -> tuple[int, int]:
+    """Return a stronger horizontal blur that destroys hard-sub glyph edges."""
+    scale = max(2 / 3, min(2.0, min(width / 1920, height / 1080)))
+    return min(64, round(48 * scale)), min(40, round(28 * scale))
+
+
 def _append_soft_box_blur(
     filter_parts: list[str],
     video_label: str,
@@ -212,6 +218,7 @@ def _append_soft_box_blur(
     boxes: list[tuple[float, float, float, float, float | None, float | None]],
     prefix: str,
     pad_boxes: bool = True,
+    strong_subtitle: bool = False,
 ) -> str:
     scale = min(width / 1920, height / 1080)
     padding = max(8, min(30, round(25 * max(scale, 0.35)))) if pad_boxes else 0
@@ -239,22 +246,40 @@ def _append_soft_box_blur(
     combined = expressions[0]
     for expression in expressions[1:]:
         combined = f"max({combined}\\,{expression})"
-    blur_sigma = _gaussian_blur_sigma(width, height)
     filter_parts.append(
         f"{video_label}split=3[{prefix}_base][{prefix}_blur_source][{prefix}_mask_source]"
     )
-    filter_parts.append(
-        f"[{prefix}_blur_source]gblur=sigma={blur_sigma}:steps=2[{prefix}_blurred]"
-    )
+    if strong_subtitle:
+        sigma_x, sigma_y = _subtitle_blur_sigmas(width, height)
+        filter_parts.append(
+            f"[{prefix}_blur_source]gblur=sigma={sigma_x}:sigmaV={sigma_y}:steps=3"
+            f"[{prefix}_blurred]"
+        )
+    else:
+        blur_sigma = _gaussian_blur_sigma(width, height)
+        filter_parts.append(
+            f"[{prefix}_blur_source]gblur=sigma={blur_sigma}:steps=2[{prefix}_blurred]"
+        )
     filter_parts.append(
         f"[{prefix}_mask_source]format=gray,"
         f"geq=lum='255*clip({combined}\\,0\\,1)',"
         f"gblur=sigma={mask_sigma}:steps=2[{prefix}_mask]"
     )
-    filter_parts.append(
-        f"[{prefix}_base][{prefix}_blurred][{prefix}_mask]"
-        f"maskedmerge=planes=15[{prefix}_out]"
-    )
+    if strong_subtitle:
+        # alphamerge + overlay makes the centre of the mask fully opaque. A
+        # limited-range grayscale mask fed to maskedmerge can leak a faint copy
+        # of high-contrast hard subtitles even when its nominal value is 255.
+        filter_parts.append(
+            f"[{prefix}_blurred][{prefix}_mask]alphamerge[{prefix}_rgba]"
+        )
+        filter_parts.append(
+            f"[{prefix}_base][{prefix}_rgba]overlay=0:0:format=auto[{prefix}_out]"
+        )
+    else:
+        filter_parts.append(
+            f"[{prefix}_base][{prefix}_blurred][{prefix}_mask]"
+            f"maskedmerge=planes=15[{prefix}_out]"
+        )
     return f"[{prefix}_out]"
 
 

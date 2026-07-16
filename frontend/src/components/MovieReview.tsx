@@ -2,16 +2,19 @@ import React, { ChangeEvent, useCallback, useEffect, useRef, useState } from "re
 import { AlertTriangle, Check, Clapperboard, Clock3, Copy, Download, FileImage, ImageOff, Loader2, Play, Plus, RotateCcw, Save, Sparkles, Trash2, Upload, Video, Wand2 } from "lucide-react";
 import { clearReviewDraftJobs, createReviewDraftJob, detectBlurRegions, getReviewDraftJob, listReviewDraftJobs, renderReviewDraftJob, retryReviewDraftJob, toAbsoluteApiUrl, updateReviewDraftSegment, uploadVideo, uploadWatermark } from "../lib/api";
 import type { UploadProgress } from "../lib/api";
-import type { CustomBlurBox, ProcessingMode, ReviewBeat, ReviewBeatCandidate, ReviewDraftJob, ReviewDraftRequest, SourceLanguage } from "../types/api";
+import type { CustomBlurBox, ProcessingMode, ReviewBeat, ReviewBeatCandidate, ReviewDraftJob, ReviewDraftRequest, ReviewQualityIssue, SourceLanguage } from "../types/api";
 import { LivePreview } from "./LivePreview";
 import { ProcessingModeSelector } from "./ProcessingModeSelector";
 
-const reviewStyles: Array<{ label: string; value: ReviewDraftRequest["style"] }> = [
-  { label: "Kể chuyện", value: "story" },
-  { label: "Nhanh gọn", value: "fast" },
-  { label: "Cảm xúc", value: "emotional" },
-  { label: "Duyên hài", value: "funny" },
+const reviewStyles: Array<{ label: string; value: ReviewDraftRequest["style"]; description: string }> = [
+  { label: "Kể chuyện", value: "story", description: "Đi theo nguyên nhân → diễn biến → kết quả để mạch phim liền lạc." },
+  { label: "Nhanh gọn", value: "fast", description: "Câu ngắn, nhịp nhanh và chỉ giữ các mốc quan trọng nhất." },
+  { label: "Cảm xúc", value: "emotional", description: "Nhấn vào động cơ, quan hệ và cao trào cảm xúc của nhân vật." },
+  { label: "Duyên hài", value: "funny", description: "Kể tự nhiên, dí dỏm nhưng vẫn giữ đúng trình tự câu chuyện." },
 ];
+
+const MIN_REVIEW_MINUTES = 1;
+const MAX_REVIEW_MINUTES = 30;
 
 const sourceLanguages: Array<{ label: string; value: SourceLanguage }> = [
   { label: "Tự nhận diện", value: "auto" },
@@ -71,6 +74,10 @@ function isRunningReviewJob(job: ReviewDraftJob): boolean {
   return job.status === "queued" || job.status === "processing";
 }
 
+function shouldPollReviewJob(job: ReviewDraftJob): boolean {
+  return isRunningReviewJob(job) || job.status === "needs_review" || job.status === "ready_to_render";
+}
+
 function pickInitialReviewJob(items: ReviewDraftJob[]): ReviewDraftJob | null {
   if (items.length === 0) return null;
   const storedJobId = typeof window === "undefined" ? null : window.localStorage.getItem(ACTIVE_REVIEW_JOB_STORAGE_KEY);
@@ -82,6 +89,7 @@ export const MovieReview = React.memo(function MovieReview() {
   const previewRef = useRef<HTMLVideoElement | null>(null);
   const logoInputRef = useRef<HTMLInputElement | null>(null);
   const didLoadInitialReviewJobRef = useRef(false);
+  const segmentSaveInFlightRef = useRef(false);
   const [videoPath, setVideoPath] = useState("");
   const [sourceVideoUrl, setSourceVideoUrl] = useState<string | null>(null);
   const [videoName, setVideoName] = useState("Chưa có phim được import");
@@ -106,6 +114,7 @@ export const MovieReview = React.memo(function MovieReview() {
   const [selectedBeatIndex, setSelectedBeatIndex] = useState(0);
   const [narrationDrafts, setNarrationDrafts] = useState<Record<string, string>>({});
   const [savingSegmentId, setSavingSegmentId] = useState<string | null>(null);
+  const [outputDurationSeconds, setOutputDurationSeconds] = useState<number | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
   const refreshReviewJobs = useCallback(async () => {
@@ -123,7 +132,11 @@ export const MovieReview = React.memo(function MovieReview() {
     setVideoPath(item.request.video_path);
     setSourceVideoUrl(sourceUrlFromPath(item.request.video_path));
     setVideoName(fileNameFromPath(item.request.video_path));
+    setTargetMinutes(normalizeTargetMinutes(item.request.target_minutes));
+    setStyle(item.request.style);
     setProcessingMode(item.request.processing_mode ?? "balanced");
+    setSourceLanguage(item.request.source_language ?? "auto");
+    setNotes(item.request.notes ?? "");
     setRenderOptions(renderOptionsFromRequest(item.request));
     setWatermarkName(item.request.watermark_file_name ? "Logo đã lưu trong job" : "Chưa có logo được tải lên");
     setPreviewMode(item.result?.output_video_url ? "output" : "source");
@@ -154,20 +167,22 @@ export const MovieReview = React.memo(function MovieReview() {
   }, [applyReviewJob, refreshReviewJobs]);
 
   useEffect(() => {
-    if (!job || !isRunningReviewJob(job)) return;
+    if (!job || !shouldPollReviewJob(job)) return;
 
     let cancelled = false;
     const timer = window.setInterval(async () => {
       try {
         const nextJob = await getReviewDraftJob(job.job_id);
-        if (!cancelled) {
+        if (!cancelled && (nextJob.updated_at !== job.updated_at || nextJob.status !== job.status)) {
+          const outputBecameAvailable = !job.result?.output_video_url && Boolean(nextJob.result?.output_video_url);
           setJob(nextJob);
           setReviewJobs((items) => items.map((item) => item.job_id === nextJob.job_id ? nextJob : item));
+          if (outputBecameAvailable) setPreviewMode("output");
         }
       } catch (error) {
         if (!cancelled) setMessage(error instanceof Error ? error.message : "Không thể lấy trạng thái review job.");
       }
-    }, 1800);
+    }, isRunningReviewJob(job) ? 1800 : 4000);
 
     return () => {
       cancelled = true;
@@ -186,7 +201,9 @@ export const MovieReview = React.memo(function MovieReview() {
 
         const selectedJob = selectedReviewJobId ? items.find((item) => item.job_id === selectedReviewJobId) : null;
         if (selectedJob) {
-          applyReviewJob(selectedJob, false);
+          // Background history polling must not overwrite duration/style/notes
+          // that the user is currently preparing for the next review.
+          setJob(selectedJob);
           return;
         }
 
@@ -317,9 +334,11 @@ export const MovieReview = React.memo(function MovieReview() {
     setCreating(true);
     setMessage(null);
     try {
+      const normalizedTargetMinutes = normalizeTargetMinutes(targetMinutes);
+      setTargetMinutes(normalizedTargetMinutes);
       const created = await createReviewDraftJob({
         video_path: videoPath,
-        target_minutes: targetMinutes,
+        target_minutes: normalizedTargetMinutes,
         style,
         processing_mode: processingMode,
         source_language: sourceLanguage,
@@ -359,9 +378,65 @@ export const MovieReview = React.memo(function MovieReview() {
   const result = job?.result ?? null;
   const qualityReport = result?.quality_report ?? null;
   const reviewIsBusy = Boolean(job && isRunningReviewJob(job));
+  const isSavingAnySegment = savingSegmentId !== null;
+  const reviewConfigurationChanged = Boolean(job && (
+    videoPath !== job.request.video_path
+    || normalizeTargetMinutes(targetMinutes) !== normalizeTargetMinutes(job.request.target_minutes)
+    || style !== job.request.style
+    || processingMode !== (job.request.processing_mode ?? "balanced")
+    || sourceLanguage !== (job.request.source_language ?? "auto")
+    || notes.trim() !== (job.request.notes ?? "").trim()
+    || JSON.stringify(renderOptions) !== JSON.stringify(renderOptionsFromRequest(job.request))
+  ));
+  const qualityIssuesBySegment = (qualityReport?.issues ?? []).reduce<Record<string, ReviewQualityIssue[]>>((groups, issue) => {
+    if (!issue.segment_id) return groups;
+    (groups[issue.segment_id] ??= []).push(issue);
+    return groups;
+  }, {});
+  const canRenderApprovedReview = Boolean(
+    job
+    && job.status === "ready_to_render"
+    && qualityReport?.passed
+    && !reviewIsBusy
+    && !isRenderingReview
+    && !isSavingAnySegment
+    && !reviewConfigurationChanged,
+  );
+  const renderButtonTitle = canRenderApprovedReview
+    ? "Render video từ kịch bản và cảnh đã duyệt"
+    : reviewConfigurationChanged
+      ? "Cấu hình bên trái đã thay đổi. Hãy tạo lại bản review để áp dụng đúng thời lượng, phong cách và tùy chọn render."
+      : reviewIsBusy || isRenderingReview
+      ? "Job đang xử lý; vui lòng đợi hoàn tất"
+      : qualityReport?.phase === "post_render"
+        ? "Hậu kiểm sau render chưa đạt. Mở các segment viền đỏ, sửa lời dẫn hoặc chọn cảnh phù hợp rồi lưu; lỗi không gắn segment được liệt kê trong bảng QA."
+        : "QA trước render chưa đạt. Mở các segment viền đỏ, sửa lời dẫn hoặc chọn cảnh phù hợp rồi lưu.";
   const outputVideoUrl = result?.output_video_url ? toAbsoluteApiUrl(result.output_video_url) : null;
+  const targetDurationSeconds = job ? normalizeTargetMinutes(job.request.target_minutes) * 60 : null;
+  const plannedDurationSeconds = reviewPlannedDurationSeconds(result);
+  const reportedOutputDurationSeconds = firstFinitePositive([
+    result?.actual_duration_seconds,
+    result?.output_duration_seconds,
+  ]);
+  const actualOutputDurationSeconds = outputVideoUrl
+    ? reportedOutputDurationSeconds ?? outputDurationSeconds
+    : null;
+  const durationToAssess = actualOutputDurationSeconds ?? plannedDurationSeconds;
+  const durationAssessment = assessReviewDuration(targetDurationSeconds, durationToAssess);
+  const selectedStyle = reviewStyles.find((item) => item.value === style) ?? reviewStyles[0];
+  const jobStyle = job
+    ? reviewStyles.find((item) => item.value === job.request.style) ?? reviewStyles[0]
+    : selectedStyle;
   const activePreviewUrl = previewMode === "output" ? outputVideoUrl : sourceVideoUrl;
   const selectedBeat = result?.beats[selectedBeatIndex] ?? null;
+
+  useEffect(() => {
+    setOutputDurationSeconds(null);
+  }, [outputVideoUrl]);
+
+  const rememberOutputDuration = useCallback((duration: number) => {
+    setOutputDurationSeconds(Number.isFinite(duration) && duration > 0 ? duration : null);
+  }, []);
 
   const jumpToBeat = useCallback((index: number) => {
     const beat = result?.beats[index];
@@ -407,14 +482,24 @@ export const MovieReview = React.memo(function MovieReview() {
       setMessage("Job cũ chưa có mã segment nên chỉ có thể xem, chưa thể chỉnh từng câu.");
       return;
     }
+    if (segmentSaveInFlightRef.current || isRenderingReview) {
+      setMessage("Đang lưu một câu khác; vui lòng đợi hoàn tất để tránh ghi đè lựa chọn.");
+      return;
+    }
 
     const draftKey = reviewBeatKey(beat, index);
-    const narration = narrationDrafts[draftKey] ?? beat.narration;
+    const narration = (narrationDrafts[draftKey] ?? beat.narration).trim();
+    const narrationChanged = narration !== beat.narration.trim();
+    if (!candidate && !narrationChanged) {
+      setMessage("Lời dẫn chưa thay đổi nên không cần lưu lại.");
+      return;
+    }
+    segmentSaveInFlightRef.current = true;
     setSavingSegmentId(beat.segment_id);
     setMessage(null);
     try {
       const nextJob = await updateReviewDraftSegment(job.job_id, beat.segment_id, {
-        narration,
+        ...(narrationChanged ? { narration } : {}),
         ...(candidate ? {
           candidate_id: candidate.candidate_id,
           scene_id: candidate.scene_id,
@@ -428,14 +513,22 @@ export const MovieReview = React.memo(function MovieReview() {
       setSelectedBeatIndex(index);
       setMessage(candidate ? "Đã đổi cảnh nguồn cho câu này." : "Đã lưu lời dẫn của segment.");
     } catch (error) {
+      try {
+        const refreshed = await getReviewDraftJob(job.job_id);
+        setJob(refreshed);
+        setReviewJobs((items) => items.map((item) => item.job_id === refreshed.job_id ? refreshed : item));
+      } catch {
+        // Periodic polling remains the final recovery path.
+      }
       setMessage(error instanceof Error ? error.message : "Không thể lưu thay đổi cho segment.");
     } finally {
+      segmentSaveInFlightRef.current = false;
       setSavingSegmentId(null);
     }
-  }, [job, narrationDrafts]);
+  }, [isRenderingReview, job, narrationDrafts]);
 
   const renderApprovedReview = useCallback(async () => {
-    if (!job || !job.result?.quality_report?.passed || isRunningReviewJob(job)) return;
+    if (!job || !canRenderApprovedReview || segmentSaveInFlightRef.current) return;
 
     setRenderingReview(true);
     setMessage(null);
@@ -443,14 +536,21 @@ export const MovieReview = React.memo(function MovieReview() {
       const nextJob = await renderReviewDraftJob(job.job_id);
       setJob(nextJob);
       setReviewJobs((items) => items.map((item) => item.job_id === nextJob.job_id ? nextJob : item));
-      setPreviewMode("source");
+      setPreviewMode(nextJob.result?.output_video_url ? "output" : "source");
       setMessage("Đã nhận lệnh render video từ bản review đã duyệt.");
     } catch (error) {
+      try {
+        const refreshed = await getReviewDraftJob(job.job_id);
+        setJob(refreshed);
+        setReviewJobs((items) => items.map((item) => item.job_id === refreshed.job_id ? refreshed : item));
+      } catch {
+        // The regular job poll remains the final recovery path.
+      }
       setMessage(error instanceof Error ? error.message : "Không thể bắt đầu render video đã duyệt.");
     } finally {
       setRenderingReview(false);
     }
-  }, [job]);
+  }, [canRenderApprovedReview, job]);
 
   const clearReviewHistory = useCallback(async () => {
     const confirmed = window.confirm("Đưa toàn bộ file review job vào Thùng rác và xóa lịch sử review?");
@@ -484,9 +584,9 @@ export const MovieReview = React.memo(function MovieReview() {
           <h1>Tạo review phim</h1>
           <p>Nạp phim dài, AI tạo kịch bản kể chuyện và danh sách cảnh gợi ý để dựng review.</p>
         </div>
-        <button className="ios-button" type="button" onClick={createDraft} disabled={isUploading || isCreating || reviewIsBusy || !videoPath}>
-          {isCreating || reviewIsBusy ? <Loader2 className="spin" size={18} /> : <Sparkles size={18} />}
-          Tạo bản review
+        <button className="ios-button" type="button" onClick={createDraft} disabled={isUploading || isCreating || hasRunningReviewJobs || !videoPath}>
+          {isCreating || hasRunningReviewJobs ? <Loader2 className="spin" size={18} /> : <Sparkles size={18} />}
+          {reviewConfigurationChanged ? "Tạo lại theo cấu hình mới" : "Tạo bản review"}
         </button>
       </header>
 
@@ -535,8 +635,26 @@ export const MovieReview = React.memo(function MovieReview() {
 
           <div className="two-fields">
             <label className="field">
-              <span>Thời lượng review</span>
-              <input className="ios-input" type="number" min={1} max={30} value={targetMinutes} onChange={(event) => setTargetMinutes(Number(event.target.value))} />
+              <span>Thời lượng review (phút)</span>
+              <span className="review-duration-input">
+                <input
+                  className="ios-input"
+                  type="number"
+                  inputMode="numeric"
+                  min={MIN_REVIEW_MINUTES}
+                  max={MAX_REVIEW_MINUTES}
+                  step={1}
+                  value={targetMinutes}
+                  onChange={(event) => {
+                    const nextValue = event.currentTarget.valueAsNumber;
+                    if (Number.isFinite(nextValue)) setTargetMinutes(nextValue);
+                  }}
+                  onBlur={() => setTargetMinutes((current) => normalizeTargetMinutes(current))}
+                  aria-describedby="review-duration-help"
+                />
+                <span className="review-input-suffix" aria-hidden="true">phút</span>
+              </span>
+              <small id="review-duration-help" className="review-field-help">Cho phép {MIN_REVIEW_MINUTES}–{MAX_REVIEW_MINUTES} phút; AI phải viết đủ lời đọc cho mốc này.</small>
             </label>
             <label className="field">
               <span>Ngôn ngữ phim</span>
@@ -554,11 +672,19 @@ export const MovieReview = React.memo(function MovieReview() {
             <span className="label">Phong cách review</span>
             <div className="segments">
               {reviewStyles.map((item) => (
-                <button key={item.value} type="button" className={style === item.value ? "active" : ""} onClick={() => setStyle(item.value)}>
+                <button
+                  key={item.value}
+                  type="button"
+                  className={style === item.value ? "active" : ""}
+                  onClick={() => setStyle(item.value)}
+                  aria-pressed={style === item.value}
+                  title={item.description}
+                >
                   {item.label}
                 </button>
               ))}
             </div>
+            <small className="review-field-help"><strong>{selectedStyle.label}:</strong> {selectedStyle.description}</small>
           </div>
 
           <label className="field">
@@ -609,13 +735,14 @@ export const MovieReview = React.memo(function MovieReview() {
                   <button
                     key={item.job_id}
                     type="button"
-                    className="review-beat"
+                    className={`review-beat ${item.job_id === selectedReviewJobId ? "active" : ""}`}
+                    aria-current={item.job_id === selectedReviewJobId ? "true" : undefined}
                     onClick={() => selectReviewJob(item)}
                     style={{ textAlign: "left", cursor: "pointer" }}
                   >
                     <strong>{item.stage}</strong>
                     <span>{item.progress}% • {item.status} • {formatDateTime(item.created_at)}</span>
-                    <p>{fileNameFromPath(item.request.video_path)} • {item.request.target_minutes} phút</p>
+                    <p>{fileNameFromPath(item.request.video_path)} • Mục tiêu {item.request.target_minutes} phút • {reviewStyleName(item.request.style)}</p>
                   </button>
                 ))}
               </div>
@@ -632,8 +759,10 @@ export const MovieReview = React.memo(function MovieReview() {
             outputVideoUrl={outputVideoUrl}
             activeVideoUrl={activePreviewUrl}
             selectedBeat={selectedBeat}
+            outputDurationSeconds={actualOutputDurationSeconds}
             renderOptions={renderOptions}
             onRenderFieldChange={setRenderField}
+            onOutputDurationChange={rememberOutputDuration}
           />
 
           <section className="ios-card">
@@ -658,6 +787,17 @@ export const MovieReview = React.memo(function MovieReview() {
               <div className="upload-progress-track">
                 <div className="upload-progress-bar" style={{ width: `${job.progress}%` }} />
               </div>
+              <div className="review-job-spec" aria-label="Cấu hình của job đang xem">
+                <span><Clock3 size={14} />Mục tiêu <strong>{job.request.target_minutes} phút</strong></span>
+                <span>Phong cách <strong>{jobStyle.label}</strong></span>
+                <span>Chế độ <strong>{processingModeLabel(job.request.processing_mode)}</strong></span>
+              </div>
+              {reviewConfigurationChanged && (
+                <div className="review-duration-warning" role="alert">
+                  <AlertTriangle size={17} />
+                  <span>Bạn đã đổi thời lượng, phong cách hoặc tùy chọn. Bấm <strong>Tạo lại theo cấu hình mới</strong> trước khi render để các lựa chọn này thực sự được áp dụng.</span>
+                </div>
+              )}
               {job.error && <div className="review-error">{job.error}</div>}
               {job.status === "failed" && (
                 <button
@@ -675,6 +815,27 @@ export const MovieReview = React.memo(function MovieReview() {
 
           {result && (
             <div className="review-result">
+              <section className={`review-duration-summary ${durationAssessment?.significant ? "warning" : ""}`}>
+                <div className="review-duration-head">
+                  <span><Clock3 size={17} />Đối chiếu thời lượng</span>
+                  <strong>Mục tiêu {job?.request.target_minutes ?? result.target_minutes} phút</strong>
+                </div>
+                <div className="review-duration-facts">
+                  {plannedDurationSeconds != null && <span>Voice dự kiến <strong>{formatReviewDuration(plannedDurationSeconds)}</strong></span>}
+                  {actualOutputDurationSeconds != null && <span>Video đã render <strong>{formatReviewDuration(actualOutputDurationSeconds)}</strong></span>}
+                  <span>Phong cách <strong>{jobStyle.label}</strong></span>
+                </div>
+                {durationAssessment?.significant && (
+                  <div className="review-duration-warning" role="alert">
+                    <AlertTriangle size={17} />
+                    <span>
+                      Bản {actualOutputDurationSeconds != null ? "render" : "nháp"} đang {durationAssessment.direction === "short" ? "ngắn hơn" : "dài hơn"} mục tiêu {formatReviewDuration(durationAssessment.absoluteDeltaSeconds)}
+                      {durationAssessment.direction === "short" ? `, mới đạt ${durationAssessment.percentOfTarget}% thời lượng yêu cầu.` : "."}
+                      {actualOutputDurationSeconds == null && " Nên tạo lại hoặc bổ sung lời dẫn trước khi render."}
+                    </span>
+                  </div>
+                )}
+              </section>
               {qualityReport && (
                 <section className={`review-qa-panel ${qualityReport.passed ? "passed" : "needs-review"}`}>
                   <div className="review-qa-head">
@@ -689,16 +850,19 @@ export const MovieReview = React.memo(function MovieReview() {
                     <ReviewQaMetric label="Đúng trình tự" value={qualityReport.chronology_score} />
                     <ReviewQaMetric label="Đủ bằng chứng" value={qualityReport.evidence_score} />
                     <ReviewQaMetric label="Nhất quán nhân vật" value={qualityReport.character_consistency_score} />
+                    {qualityReport.duration_adherence_score != null && <ReviewQaMetric label="Đúng thời lượng" value={qualityReport.duration_adherence_score} />}
+                    {qualityReport.story_coherence_score != null && <ReviewQaMetric label="Mạch truyện" value={qualityReport.story_coherence_score} />}
+                    {qualityReport.style_adherence_score != null && <ReviewQaMetric label="Đúng phong cách" value={qualityReport.style_adherence_score} />}
+                    {qualityReport.source_coverage_score != null && <ReviewQaMetric label="Phủ timeline" value={qualityReport.source_coverage_score} />}
                   </div>
                   {qualityReport.issues.length > 0 && (
                     <div className="review-qa-issues">
-                      {qualityReport.issues.slice(0, 3).map((issue, issueIndex) => (
+                      {qualityReport.issues.map((issue, issueIndex) => (
                         <span key={`${issue.code}-${issue.segment_id || issueIndex}`}>
                           <AlertTriangle size={14} />
                           {issue.segment_id ? `${issue.segment_id}: ` : ""}{issue.message}
                         </span>
                       ))}
-                      {qualityReport.issues.length > 3 && <small>+{qualityReport.issues.length - 3} lỗi khác cần kiểm tra</small>}
                     </div>
                   )}
                 </section>
@@ -707,16 +871,18 @@ export const MovieReview = React.memo(function MovieReview() {
                 className="ios-button review-render-approved"
                 type="button"
                 onClick={renderApprovedReview}
-                disabled={!qualityReport?.passed || reviewIsBusy || isRenderingReview}
-                title={qualityReport?.passed ? "Render video từ kịch bản và cảnh đã duyệt" : "QA phải đạt trước khi render"}
+                disabled={!canRenderApprovedReview}
+                title={renderButtonTitle}
               >
                 {reviewIsBusy || isRenderingReview ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-                {reviewIsBusy ? "Đang xử lý / render video..." : "Render video đã duyệt"}
+                {reviewIsBusy || isRenderingReview ? "Đang xử lý / render video..." : "Render video đã duyệt"}
               </button>
               {result.output_video_url && (
                 <a className="ios-button review-download" href={toAbsoluteApiUrl(result.output_video_url)} target="_blank" rel="noreferrer">
                   <Download size={17} />
-                  Tải video review {result.target_minutes} phút
+                  {actualOutputDurationSeconds != null
+                    ? `Tải video review • ${formatReviewDuration(actualOutputDurationSeconds)}`
+                    : `Tải video review • mục tiêu ${job?.request.target_minutes ?? result.target_minutes} phút`}
                 </a>
               )}
               <ReviewBlock title="Tiêu đề" value={result.title} onCopy={copyText} />
@@ -732,15 +898,23 @@ export const MovieReview = React.memo(function MovieReview() {
                     const draftKey = reviewBeatKey(beat, index);
                     const score = normalizedMatchScore(beat.match_score);
                     const isLowConfidence = score != null && score < 0.75;
+                    const segmentQualityIssues = beat.segment_id ? qualityIssuesBySegment[beat.segment_id] ?? [] : [];
+                    const hasSegmentQualityIssue = segmentQualityIssues.length > 0;
+                    const needsReview = isLowConfidence || hasSegmentQualityIssue;
                     const candidates = (beat.candidates ?? []).slice(0, 3);
                     const narrationDraft = narrationDrafts[draftKey] ?? beat.narration;
                     const isSaving = Boolean(beat.segment_id && savingSegmentId === beat.segment_id);
+                    const narrationDirty = narrationDraft.trim() !== beat.narration.trim();
+                    const bestCandidateScore = Math.max(
+                      ...candidates.map((candidate) => normalizedMatchScore(candidate.match_score) ?? 0),
+                      0,
+                    );
                     const thumbnailUrl = beat.thumbnail_url ?? candidates[0]?.thumbnail_url ?? null;
 
                     return (
                       <article
                         key={beat.segment_id || `${beat.time_hint}-${index}`}
-                        className={`review-inspector-card ${index === selectedBeatIndex ? "active" : ""} ${isLowConfidence ? "low-confidence" : ""}`}
+                        className={`review-inspector-card ${index === selectedBeatIndex ? "active" : ""} ${needsReview ? "low-confidence" : ""}`}
                       >
                         <button className="review-inspector-select" type="button" onClick={() => jumpToBeat(index)}>
                           <span className="review-scene-thumbnail">
@@ -753,9 +927,13 @@ export const MovieReview = React.memo(function MovieReview() {
                           <span className="review-inspector-summary">
                             <span className="review-inspector-title-row">
                               <strong>{beat.segment_id || `Câu ${index + 1}`}</strong>
-                              {score != null && (
-                                <span className={`review-match-score ${isLowConfidence ? "low" : ""}`}>
-                                  {Math.round(score * 100)}% khớp
+                              {(score != null || hasSegmentQualityIssue) && (
+                                <span className={`review-match-score ${needsReview ? "low" : ""}`}>
+                                  {hasSegmentQualityIssue && qualityReport?.phase === "post_render"
+                                    ? "Lỗi hậu kiểm"
+                                    : score != null
+                                      ? `${Math.round(score * 100)}% khớp`
+                                      : "Cần kiểm tra"}
                                 </span>
                               )}
                             </span>
@@ -773,10 +951,16 @@ export const MovieReview = React.memo(function MovieReview() {
                           </span>
                         </button>
 
-                        {isLowConfidence && (
+                        {needsReview && (
                           <div className="review-match-warning">
                             <AlertTriangle size={16} />
-                            Điểm khớp dưới 75% — nên xem lại cảnh nguồn hoặc chọn phương án khác.
+                            <span>
+                              {hasSegmentQualityIssue
+                                ? segmentQualityIssues.map((issue) => issue.message).join(" • ")
+                                : bestCandidateScore < 0.75
+                                  ? "Không có cảnh thay thế nào đạt 75% — hãy sửa lời dẫn ngắn gọn để chỉ mô tả đúng cảnh đã chọn rồi lưu."
+                                  : "Điểm khớp dưới 75% — hãy chọn phương án có điểm cao hơn."}
+                            </span>
                           </div>
                         )}
 
@@ -786,13 +970,14 @@ export const MovieReview = React.memo(function MovieReview() {
                             className="ios-input"
                             value={narrationDraft}
                             onChange={(event) => setNarrationDrafts((current) => ({ ...current, [draftKey]: event.target.value }))}
+                            disabled={isSavingAnySegment || isRenderingReview}
                             rows={3}
                           />
                         </label>
                         <button
                           className="ios-button review-segment-save"
                           type="button"
-                          disabled={!beat.segment_id || isSaving || narrationDraft.trim().length === 0}
+                          disabled={!beat.segment_id || isSavingAnySegment || isRenderingReview || !narrationDirty || narrationDraft.trim().length === 0}
                           onClick={() => persistSegmentEdit(beat, index)}
                           title={beat.segment_id ? "Lưu lời dẫn" : "Job cũ chưa hỗ trợ chỉnh từng segment"}
                         >
@@ -811,6 +996,7 @@ export const MovieReview = React.memo(function MovieReview() {
                                     <button
                                       type="button"
                                       className="review-candidate-preview"
+                                      disabled={isSavingAnySegment || isRenderingReview}
                                       onClick={() => previewCandidate(index, candidate)}
                                       title="Xem cảnh này trong phim gốc"
                                     >
@@ -829,7 +1015,7 @@ export const MovieReview = React.memo(function MovieReview() {
                                     <button
                                       type="button"
                                       className="ios-button ios-button-secondary review-candidate-choose"
-                                      disabled={!beat.segment_id || isSaving}
+                                      disabled={!beat.segment_id || isSavingAnySegment || isRenderingReview}
                                       onClick={() => persistSegmentEdit(beat, index, candidate)}
                                     >
                                       {isSaving ? <Loader2 className="spin" size={14} /> : <Check size={14} />}
@@ -1001,9 +1187,11 @@ const ReviewLivePreview = React.forwardRef<HTMLVideoElement, {
   outputVideoUrl: string | null;
   activeVideoUrl: string | null;
   selectedBeat: ReviewBeat | null;
+  outputDurationSeconds: number | null;
   renderOptions: ReviewRenderOptions;
   onRenderFieldChange: <K extends keyof ReviewRenderOptions>(key: K, value: ReviewRenderOptions[K]) => void;
-}>(function ReviewLivePreview({ mode, onModeChange, sourceVideoUrl, outputVideoUrl, activeVideoUrl, selectedBeat, renderOptions, onRenderFieldChange }, ref) {
+  onOutputDurationChange: (duration: number) => void;
+}>(function ReviewLivePreview({ mode, onModeChange, sourceVideoUrl, outputVideoUrl, activeVideoUrl, selectedBeat, outputDurationSeconds, renderOptions, onRenderFieldChange, onOutputDurationChange }, ref) {
   return (
     <section className="ios-card review-live-card">
       <div className="section-title">
@@ -1039,7 +1227,16 @@ const ReviewLivePreview = React.forwardRef<HTMLVideoElement, {
       ) : (
         <div className="video-frame review-live-frame">
           {activeVideoUrl ? (
-          <video ref={ref} className="preview-video-element" src={activeVideoUrl} controls playsInline />
+          <video
+            ref={ref}
+            className="preview-video-element"
+            src={activeVideoUrl}
+            controls
+            playsInline
+            onLoadedMetadata={(event) => {
+              if (mode === "output") onOutputDurationChange(event.currentTarget.duration);
+            }}
+          />
           ) : (
             <div className="review-live-empty">
               <Video size={36} />
@@ -1051,6 +1248,9 @@ const ReviewLivePreview = React.forwardRef<HTMLVideoElement, {
       )}
       <div className="review-preview-meta">
         <strong>{mode === "output" ? "Đang xem video review đã render" : "Đang xem phim gốc để so cảnh"}</strong>
+        {mode === "output" && outputDurationSeconds != null && (
+          <span>Thời lượng video hoàn thành: <strong>{formatReviewDuration(outputDurationSeconds)}</strong></span>
+        )}
         {selectedBeat ? (
           <span>{selectedBeat.time_hint} • {selectedBeat.purpose}</span>
         ) : (
@@ -1118,6 +1318,70 @@ function formatReviewTimestamp(value: number): string {
   const seconds = safeValue % 60;
   if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatReviewDuration(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 giây";
+  const totalSeconds = Math.max(1, Math.round(value));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts: string[] = [];
+  if (hours > 0) parts.push(`${hours} giờ`);
+  if (minutes > 0) parts.push(`${minutes} phút`);
+  if (seconds > 0 || parts.length === 0) parts.push(`${seconds} giây`);
+  return parts.join(" ");
+}
+
+function normalizeTargetMinutes(value: number): number {
+  const rounded = Number.isFinite(value) ? Math.round(value) : 8;
+  return Math.max(MIN_REVIEW_MINUTES, Math.min(MAX_REVIEW_MINUTES, rounded));
+}
+
+function reviewStyleName(value: ReviewDraftRequest["style"]): string {
+  return reviewStyles.find((item) => item.value === value)?.label ?? value;
+}
+
+function processingModeLabel(value: ProcessingMode | null | undefined): string {
+  if (value === "fast") return "Siêu nhanh";
+  if (value === "quality") return "Đẹp nhất";
+  return "Cân bằng";
+}
+
+function firstFinitePositive(values: Array<number | null | undefined>): number | null {
+  const value = values.find((item) => item != null && Number.isFinite(item) && item > 0);
+  return value ?? null;
+}
+
+function reviewPlannedDurationSeconds(result: ReviewDraftJob["result"]): number | null {
+  if (!result) return null;
+  const reported = firstFinitePositive([
+    result.narration_duration_seconds,
+    result.estimated_duration_seconds,
+  ]);
+  if (reported != null) return reported;
+
+  const voiceEnds = result.beats
+    .map((beat) => beat.voice_end ?? beat.voice_end_seconds)
+    .filter((value): value is number => value != null && Number.isFinite(value) && value > 0);
+  return voiceEnds.length > 0 ? Math.max(...voiceEnds) : null;
+}
+
+function assessReviewDuration(targetSeconds: number | null, actualSeconds: number | null): {
+  significant: boolean;
+  direction: "short" | "long";
+  absoluteDeltaSeconds: number;
+  percentOfTarget: number;
+} | null {
+  if (targetSeconds == null || actualSeconds == null || targetSeconds <= 0 || actualSeconds <= 0) return null;
+  const delta = actualSeconds - targetSeconds;
+  const absoluteDeltaSeconds = Math.abs(delta);
+  return {
+    significant: absoluteDeltaSeconds / targetSeconds > 0.10,
+    direction: delta < 0 ? "short" : "long",
+    absoluteDeltaSeconds,
+    percentOfTarget: Math.max(1, Math.round(actualSeconds / targetSeconds * 100)),
+  };
 }
 
 function formatBytes(bytes: number): string {

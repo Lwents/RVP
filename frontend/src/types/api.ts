@@ -155,6 +155,10 @@ export interface ReviewQualityReport {
   chronology_score: number;
   evidence_score: number;
   character_consistency_score: number;
+  duration_adherence_score?: number;
+  story_coherence_score?: number;
+  style_adherence_score?: number;
+  source_coverage_score?: number;
   passed: boolean;
   issues: ReviewQualityIssue[];
 }
@@ -162,6 +166,10 @@ export interface ReviewQualityReport {
 export interface ReviewDraftResult {
   title: string;
   target_minutes: number;
+  estimated_duration_seconds?: number | null;
+  narration_duration_seconds?: number | null;
+  output_duration_seconds?: number | null;
+  actual_duration_seconds?: number | null;
   hook: string;
   summary: string;
   narration_script: string;

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TypedDict
 
 from app.core import settings
 from app.models.job import DubbingRequest
 from app.services.media.ffmpeg import probe_video_duration, run_command, run_command_with_progress
-from app.services.media.renderer import _append_soft_box_blur
+from app.services.media.renderer import _append_soft_box_blur, _video_output_args
 from app.services.subtitles.ass import srt_to_positioned_ass, subtitle_font_dir, write_srt
 from app.services.subtitles.timing import SubtitleEvent
 
@@ -21,6 +22,15 @@ class ReviewSceneHint(TypedDict, total=False):
     voice_start: float | None
     voice_end: float | None
     duration_seconds: float | None
+
+
+@dataclass(frozen=True)
+class ReviewScenePlan:
+    """One verified source window fitted to one narration time range."""
+
+    source_start: float
+    source_duration: float
+    output_duration: float
 
 
 def build_review_starts(source_duration: float, target_seconds: float, clip_count: int) -> list[float]:
@@ -37,17 +47,36 @@ def build_review_scenes(
     target_seconds: float,
     scene_hints: list[ReviewSceneHint] | int | None,
 ) -> list[tuple[float, float]]:
+    """Return the source start and output duration for compatibility.
+
+    Rendering needs both the short, verified source span and the longer voice
+    span, so :func:`build_review_scene_plans` is authoritative.  Keeping this
+    lightweight projection avoids breaking callers that only inspect the
+    output schedule.
+    """
+
+    return [
+        (plan.source_start, plan.output_duration)
+        for plan in build_review_scene_plans(source_duration, target_seconds, scene_hints)
+    ]
+
+
+def build_review_scene_plans(
+    source_duration: float,
+    target_seconds: float,
+    scene_hints: list[ReviewSceneHint] | int | None,
+) -> list[ReviewScenePlan]:
     if isinstance(scene_hints, int):
         starts = build_review_starts(source_duration, target_seconds, scene_hints)
         clip_seconds = target_seconds / max(len(starts), 1)
-        return [(start, clip_seconds) for start in starts]
+        return [ReviewScenePlan(start, clip_seconds, clip_seconds) for start in starts]
 
     hints = scene_hints or []
     if not hints:
         clip_count = max(8, min(24, math.ceil(target_seconds / 30)))
         starts = build_review_starts(source_duration, target_seconds, clip_count)
         clip_seconds = target_seconds / max(len(starts), 1)
-        return [(start, clip_seconds) for start in starts]
+        return [ReviewScenePlan(start, clip_seconds, clip_seconds) for start in starts]
 
     durations: list[float] = []
     for hint in hints:
@@ -73,7 +102,7 @@ def build_review_scenes(
         durations[-1] = max(0.8, durations[-1] + target_seconds - total_duration)
     fallback_starts = build_review_starts(source_duration, target_seconds, len(hints))
 
-    scenes: list[tuple[float, float]] = []
+    scenes: list[ReviewScenePlan] = []
     for index, hint in enumerate(hints):
         start = _coerce_seconds(hint.get("start_seconds"))
         end = _coerce_seconds(hint.get("end_seconds"))
@@ -85,17 +114,107 @@ def build_review_scenes(
         fallback_start = fallback_starts[min(index, len(fallback_starts) - 1)]
         start = fallback_start if start is None else start
         end = start + durations[index] if end is None else end
-        start = max(0.0, min(start, max(0.0, source_duration - 1.0)))
-        end = max(start + 0.8, min(end, source_duration))
-        duration = min(max(0.8, durations[index]), max(source_duration, 0.8))
-        # Keep the verified evidence near the middle of one continuous source
-        # window. Replaying slices from a 0.7-2.5s evidence window while a
-        # sentence is still being read creates the visible Doraemon loop.
-        evidence_center = (start + end) / 2
-        clip_start = evidence_center - duration / 2
-        clip_start = max(0.0, min(clip_start, max(0.0, source_duration - duration)))
-        scenes.append((clip_start, duration))
-    return scenes
+        output_duration = min(max(0.8, durations[index]), max(source_duration, 0.8))
+
+        # The EDL interval is centred on the exact keyframe that multimodal QA
+        # accepted.  Expanding a 2.5s verified interval to a 5s voice interval
+        # can cross two shot cuts and show an unrelated action at the beginning
+        # or end of the sentence.  Preserve that evidence window and fit it to
+        # the voice duration during encoding.  This is continuous slow motion,
+        # not a visible loop of the same slice.
+        safe_source_duration = max(0.01, source_duration)
+        requested_start = max(0.0, min(start, safe_source_duration))
+        requested_end = max(requested_start, min(end, safe_source_duration))
+        evidence_center = (requested_start + requested_end) / 2.0
+        evidence_duration = max(0.0, requested_end - requested_start)
+        source_clip_duration = min(
+            output_duration,
+            max(min(0.8, safe_source_duration), evidence_duration),
+        )
+        clip_start = evidence_center - source_clip_duration / 2.0
+        clip_start = max(
+            0.0,
+            min(clip_start, max(0.0, safe_source_duration - source_clip_duration)),
+        )
+        scenes.append(
+            ReviewScenePlan(
+                source_start=clip_start,
+                source_duration=source_clip_duration,
+                output_duration=output_duration,
+            )
+        )
+    scenes = _partition_repeated_verified_windows(scenes)
+    return _quantize_review_plan_durations(scenes, target_seconds)
+
+
+def _partition_repeated_verified_windows(
+    plans: list[ReviewScenePlan],
+) -> list[ReviewScenePlan]:
+    """Play an identical adjacent evidence window only once.
+
+    Two different atomic facts may be visible in the same verified keyframe.
+    Splitting that short source window into chronological pieces keeps both
+    sentences grounded without replaying the exact same frames twice.
+    """
+
+    result = list(plans)
+    index = 0
+    while index < len(result):
+        end = index + 1
+        while end < len(result):
+            first = result[index]
+            candidate = result[end]
+            if (
+                abs(candidate.source_start - first.source_start) > 0.05
+                or abs(candidate.source_duration - first.source_duration) > 0.05
+            ):
+                break
+            end += 1
+        count = end - index
+        if count > 1:
+            first = result[index]
+            slice_duration = first.source_duration / count
+            for offset in range(count):
+                original = result[index + offset]
+                result[index + offset] = ReviewScenePlan(
+                    source_start=first.source_start + offset * slice_duration,
+                    source_duration=slice_duration,
+                    output_duration=original.output_duration,
+                )
+        index = end
+    return result
+
+
+def _quantize_review_plan_durations(
+    plans: list[ReviewScenePlan],
+    target_seconds: float,
+    fps: int = 30,
+) -> list[ReviewScenePlan]:
+    """Align every cut boundary to the final CFR timeline without drift."""
+
+    if not plans:
+        return plans
+    result: list[ReviewScenePlan] = []
+    cumulative = 0.0
+    previous_frame = 0
+    final_frame = max(len(plans), math.ceil(max(0.0, target_seconds) * fps))
+    for index, plan in enumerate(plans):
+        cumulative += plan.output_duration
+        boundary_frame = (
+            final_frame
+            if index == len(plans) - 1
+            else max(previous_frame + 1, round(cumulative * fps))
+        )
+        output_duration = (boundary_frame - previous_frame) / fps
+        result.append(
+            ReviewScenePlan(
+                source_start=plan.source_start,
+                source_duration=plan.source_duration,
+                output_duration=output_duration,
+            )
+        )
+        previous_frame = boundary_frame
+    return result
 
 
 async def render_movie_review_video(
@@ -113,7 +232,7 @@ async def render_movie_review_video(
     narration_duration = await probe_video_duration(ffmpeg, narration_audio)
     target_seconds = narration_duration if narration_duration > 0 else max(1.0, float(target_minutes) * 60.0)
     source_duration = await probe_video_duration(ffmpeg, source_video)
-    scenes = build_review_scenes(source_duration, target_seconds, scene_hints)
+    scenes = build_review_scene_plans(source_duration, target_seconds, scene_hints)
 
     segment_dir = work_dir / "review_segments"
     segment_dir.mkdir(parents=True, exist_ok=True)
@@ -121,34 +240,32 @@ async def render_movie_review_video(
         old_file.unlink()
 
     segment_files: list[Path] = []
-    for index, (start, clip_seconds) in enumerate(scenes, start=1):
+    for index, plan in enumerate(scenes, start=1):
         percent = 84 + int(((index - 1) / max(len(scenes), 1)) * 8)
         on_progress(percent)
         segment = segment_dir / f"segment_{index:04d}.mp4"
+        tempo = plan.output_duration / max(plan.source_duration, 0.01)
+        output_frames = max(1, round(plan.output_duration * 30))
         video_filter = (
             "scale=1280:720:force_original_aspect_ratio=decrease,"
-            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
+            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+            f"setpts={tempo:.8f}*(PTS-STARTPTS),fps=30,"
+            f"tpad=stop_mode=clone:stop=-1,trim=end_frame={output_frames},"
+            "setpts=PTS-STARTPTS"
         )
         command = [
             ffmpeg,
             "-y",
             "-ss",
-            f"{start:.3f}",
+            f"{plan.source_start:.3f}",
             "-t",
-            f"{clip_seconds:.3f}",
+            f"{plan.source_duration:.3f}",
             "-i",
             str(source_video),
             "-an",
             "-vf",
             video_filter,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
+            *_video_output_args(),
             "-movflags",
             "+faststart",
             str(segment),
@@ -235,7 +352,7 @@ def _build_review_output_command(
                     None,
                 )],
                 "reviewstatic",
-                pad_boxes=False,
+                strong_subtitle=True,
             )
 
         if request.custom_blur_boxes:
@@ -307,12 +424,7 @@ def _build_review_output_command(
         [
             "-t",
             f"{target_seconds:.3f}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
+            *_video_output_args(),
             "-c:a",
             "aac",
             "-b:a",

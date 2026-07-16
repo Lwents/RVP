@@ -53,6 +53,13 @@ class ProcessingModeTests(unittest.IsolatedAsyncioTestCase):
         review = ReviewDraftRequest(video_path="source.mp4")
         self.assertEqual(dubbing.processing_mode, "balanced")
         self.assertEqual(review.processing_mode, "balanced")
+        self.assertEqual(review.style, "story")
+
+        supported_review_styles = ("story", "fast", "emotional", "funny")
+        self.assertEqual(
+            [ReviewDraftRequest(video_path="source.mp4", style=style).style for style in supported_review_styles],
+            list(supported_review_styles),
+        )
 
         fast = get_processing_profile("fast")
         balanced = get_processing_profile("balanced")
@@ -67,6 +74,8 @@ class ProcessingModeTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValidationError):
             ReviewDraftRequest(video_path="source.mp4", processing_mode="best")
+        with self.assertRaises(ValidationError):
+            ReviewDraftRequest(video_path="source.mp4", style="dramatic")
 
     def test_review_translation_progress_is_real_and_monotonic(self) -> None:
         values = [

@@ -89,6 +89,50 @@ async def extract_audio(ffmpeg: str, source_video: Path, audio_file: Path) -> No
     )
 
 
+def audio_tempo_filter(speed: float) -> str:
+    """Build a valid FFmpeg atempo chain for an arbitrary positive speed."""
+
+    remaining = max(0.01, float(speed))
+    factors: list[float] = []
+    while remaining > 2.0:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(max(0.5, min(2.0, remaining)))
+    return ",".join(f"atempo={factor:.6f}" for factor in factors)
+
+
+async def adjust_audio_tempo(
+    ffmpeg: str,
+    source_audio: Path,
+    output_audio: Path,
+    speed: float,
+) -> Path:
+    """Change narration cadence without changing pitch."""
+
+    output_audio.parent.mkdir(parents=True, exist_ok=True)
+    await run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source_audio),
+            "-vn",
+            "-af",
+            audio_tempo_filter(speed),
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "2",
+            str(output_audio),
+        ],
+        "Không điều chỉnh được nhịp giọng đọc review.",
+    )
+    return output_audio
+
+
 async def extract_demucs_audio(ffmpeg: str, source_video: Path, audio_file: Path) -> None:
     await run_command(
         [ffmpeg, "-y", "-i", str(source_video), "-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(audio_file)],

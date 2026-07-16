@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+
+StoryArcRole = Literal["hook", "context", "conflict", "climax", "resolution"]
 
 
 class ReviewEvidence(BaseModel):
@@ -65,6 +70,8 @@ class NarrationSegment(BaseModel):
     candidate_scene_ids: list[str] = Field(default_factory=list)
     estimated_voice_duration: float = 3.0
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    story_role: StoryArcRole = "context"
+    sequence_index: int = Field(default=0, ge=0)
     purpose: str = "Minh họa sự kiện đã kiểm chứng"
 
 
@@ -104,6 +111,10 @@ class ReviewQualityReport(BaseModel):
     chronology_score: float = Field(default=0.0, ge=0.0, le=100.0)
     evidence_score: float = Field(default=0.0, ge=0.0, le=100.0)
     character_consistency_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    duration_adherence_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    story_coherence_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    source_coverage_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    style_adherence_score: float = Field(default=0.0, ge=0.0, le=100.0)
     passed: bool = False
     issues: list[QualityIssue] = Field(default_factory=list)
 
