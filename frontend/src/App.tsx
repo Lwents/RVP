@@ -14,13 +14,14 @@ import {
   Wand2,
   Youtube,
 } from "lucide-react";
-import { cancelJob, clearJobs, createJob, detectBlurRegions, fetchUrlPreview, generateJobMetadata, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
+import { cancelJob, clearJobs, createJob, detectBlurRegions, evaluateJob, fetchUrlPreview, generateJobMetadata, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
 import type { UploadProgress } from "./lib/api";
 import type { BgmMode, DubbingRequest, JobProgress, VoiceGender } from "./types/api";
 import { YoutubeStats } from "./components/YoutubeStats";
 import { LivePreview } from "./components/LivePreview";
 import { MovieReview } from "./components/MovieReview";
 import { ProcessingModeSelector } from "./components/ProcessingModeSelector";
+import { ReviewFinalEvaluationPanel } from "./components/ReviewFinalEvaluation";
 
 const languages = [
   { value: "auto", label: "Tự nhận diện" },
@@ -415,6 +416,15 @@ export function App() {
   const handleSelectJob = useCallback((id: string) => {
     trackActiveJobId(id);
   }, [trackActiveJobId]);
+
+  const handleJobUpdated = useCallback((updatedJob: JobProgress) => {
+    setActiveJob(updatedJob);
+    setJobs((previous) =>
+      [updatedJob, ...previous.filter((item) => item.job_id !== updatedJob.job_id)]
+        .sort((a, b) => new Date(b.completed_at || b.updated_at).getTime() - new Date(a.completed_at || a.updated_at).getTime())
+        .slice(0, 8),
+    );
+  }, []);
 
   const handleAddBlurBox = useCallback(() => {
     const boxes = [...form.custom_blur_boxes];
@@ -937,7 +947,7 @@ export function App() {
               </section>
 
               <aside className="side-stack">
-                <StatusPanel job={activeJob} />
+                <StatusPanel job={activeJob} onJobUpdated={handleJobUpdated} />
                 <HistoryPanel jobs={jobs} onSelect={handleSelectJob} onClear={handleClearJobs} isClearing={isClearingJobs} />
               </aside>
             </div>
@@ -1071,9 +1081,22 @@ const CheckBox = React.memo(function CheckBox({
   );
 });
 
-const StatusPanel = React.memo(function StatusPanel({ job }: { job: JobProgress | null }) {
+const StatusPanel = React.memo(function StatusPanel({
+  job,
+  onJobUpdated,
+}: {
+  job: JobProgress | null;
+  onJobUpdated: (job: JobProgress) => void;
+}) {
   const [etaText, setEtaText] = useState<string | null>(null);
+  const [isEvaluating, setIsEvaluating] = useState(false);
+  const [evaluationError, setEvaluationError] = useState<string | null>(null);
   const lastProgressRef = useRef<{ progress: number; time: number; stage: string } | null>(null);
+
+  useEffect(() => {
+    setIsEvaluating(false);
+    setEvaluationError(null);
+  }, [job?.job_id]);
 
   useEffect(() => {
     if (!job || job.status !== "processing" || job.progress >= 100) {
@@ -1126,6 +1149,20 @@ const StatusPanel = React.memo(function StatusPanel({ job }: { job: JobProgress 
     if (!value) return;
     await navigator.clipboard.writeText(value);
   }, []);
+
+  const handleEvaluate = useCallback(async () => {
+    if (!job || isEvaluating) return;
+    setIsEvaluating(true);
+    setEvaluationError(null);
+    try {
+      const evaluatedJob = await evaluateJob(job.job_id);
+      onJobUpdated(evaluatedJob);
+    } catch (error) {
+      setEvaluationError(error instanceof Error ? error.message : "Không thể đánh giá video.");
+    } finally {
+      setIsEvaluating(false);
+    }
+  }, [isEvaluating, job, onJobUpdated]);
 
   if (!job) {
     return (
@@ -1180,6 +1217,28 @@ const StatusPanel = React.memo(function StatusPanel({ job }: { job: JobProgress 
           Tải video đầu ra
         </a>
       )}
+      {job.status === "completed" && job.output_video_url && !job.final_evaluation && (
+        <button
+          type="button"
+          className="ios-button ios-button-secondary"
+          style={{ width: "100%", marginTop: 10 }}
+          disabled={isEvaluating}
+          onClick={handleEvaluate}
+        >
+          {isEvaluating ? <Loader2 className="spin" size={17} /> : <Wand2 size={17} />}
+          {isEvaluating ? "AI đang đánh giá video..." : "AI đánh giá video"}
+        </button>
+      )}
+      {evaluationError && (
+        <p role="alert" style={{ color: "#b42318", margin: "10px 0 0", fontSize: "0.86rem" }}>
+          {evaluationError}
+        </p>
+      )}
+      {job.status === "completed" && job.final_evaluation && (
+        <div style={{ marginTop: 16 }}>
+          <ReviewFinalEvaluationPanel evaluation={job.final_evaluation} />
+        </div>
+      )}
       {job.status === "completed" && youtubeUploadText && (
         <div style={{ marginTop: 16, display: "grid", gap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -1199,7 +1258,8 @@ const StatusPanel = React.memo(function StatusPanel({ job }: { job: JobProgress 
           Tổng thời gian xử lý:{" "}
           <strong>
             {(() => {
-              const diffSecs = Math.floor((new Date(job.updated_at).getTime() - new Date(job.created_at).getTime()) / 1000);
+              const finishedAt = job.completed_at || job.updated_at;
+              const diffSecs = Math.floor((new Date(finishedAt).getTime() - new Date(job.created_at).getTime()) / 1000);
               return diffSecs > 60 ? `${Math.floor(diffSecs / 60)} phút ${diffSecs % 60} giây` : `${diffSecs} giây`;
             })()}
           </strong>

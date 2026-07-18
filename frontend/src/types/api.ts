@@ -64,6 +64,7 @@ export interface JobProgress {
   seo_title?: string | null;
   seo_description?: string | null;
   seo_tags?: string[] | null;
+  final_evaluation?: ReviewFinalEvaluation | null;
   error?: string | null;
 }
 
@@ -163,6 +164,40 @@ export interface ReviewQualityReport {
   issues: ReviewQualityIssue[];
 }
 
+export type ReviewFinalEvaluationVerdict = "excellent" | "good" | "needs_improvement" | "poor";
+
+export type ReviewFinalEvaluationCriterionKey =
+  | "content_fidelity"
+  | "translation_accuracy"
+  | "av_subtitle_sync"
+  | "narrative_coherence"
+  | "technical_quality"
+  | "safety_compliance";
+
+export interface ReviewFinalEvaluationCriterion {
+  key: ReviewFinalEvaluationCriterionKey;
+  label: string;
+  score: number;
+  weight_percent: number;
+  passed: boolean;
+  feedback: string;
+  findings: string[];
+}
+
+export interface ReviewFinalEvaluation {
+  phase: "final_evaluation";
+  overall_score: number;
+  verdict: ReviewFinalEvaluationVerdict;
+  passed: boolean;
+  summary: string;
+  strengths: string[];
+  recommendations: string[];
+  criteria: ReviewFinalEvaluationCriterion[];
+  model: string;
+  fallback_used: boolean;
+  evaluated_at: string;
+}
+
 export interface ReviewDraftResult {
   title: string;
   target_minutes: number;
@@ -180,6 +215,7 @@ export interface ReviewDraftResult {
   output_video_url?: string | null;
   output_file_path?: string | null;
   quality_report?: ReviewQualityReport | null;
+  final_evaluation?: ReviewFinalEvaluation | null;
 }
 
 export interface ReviewDraftJob {

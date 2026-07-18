@@ -47,8 +47,12 @@ _PROFILES: dict[ProcessingMode, ProcessingProfile] = {
         translation_request_timeout_seconds=120,
         translation_retries=3,
         translation_batch_budget_seconds=180,
-        review_max_scenes=144,
-        review_keyframes_per_scene=2,
+        # A feature-length film consolidated to 144 scenes left roughly
+        # forty-second windows with only two frames to prove the narration.
+        # Keep the default practical, but sample densely enough for dialogue
+        # and short character actions to land in the selected visual.
+        review_max_scenes=192,
+        review_keyframes_per_scene=3,
         review_scene_batch_size=6,
         review_ai_concurrency=2,
         use_demucs=True,
@@ -62,8 +66,8 @@ _PROFILES: dict[ProcessingMode, ProcessingProfile] = {
         translation_request_timeout_seconds=180,
         translation_retries=3,
         translation_batch_budget_seconds=360,
-        review_max_scenes=240,
-        review_keyframes_per_scene=3,
+        review_max_scenes=300,
+        review_keyframes_per_scene=4,
         review_scene_batch_size=4,
         review_ai_concurrency=1,
         use_demucs=True,

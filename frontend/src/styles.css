@@ -1405,9 +1405,40 @@ input[type="range"]:active::-moz-range-thumb {
   box-shadow: none;
 }
 
+.review-cancel-button {
+  margin-top: 11px;
+  min-height: 38px;
+  color: #b42318;
+  border-color: rgba(211, 47, 47, 0.32);
+}
+
+.review-automation-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.review-auto-optimize,
+.review-render-preview {
+  min-height: 46px;
+  border-radius: 13px;
+  font-size: 0.88rem;
+}
+
+.review-auto-optimize {
+  background: linear-gradient(135deg, #5856d6, #007aff);
+  box-shadow: 0 8px 18px rgba(88, 86, 214, 0.18);
+}
+
 .review-download {
   width: 100%;
   text-decoration: none;
+}
+
+@media (max-width: 620px) {
+  .review-automation-actions {
+    grid-template-columns: 1fr;
+  }
 }
 
 .review-block {

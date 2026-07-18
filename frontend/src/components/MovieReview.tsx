@@ -1,10 +1,11 @@
 import React, { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, Clapperboard, Clock3, Copy, Download, FileImage, ImageOff, Loader2, Play, Plus, RotateCcw, Save, Sparkles, Trash2, Upload, Video, Wand2 } from "lucide-react";
-import { clearReviewDraftJobs, createReviewDraftJob, detectBlurRegions, getReviewDraftJob, listReviewDraftJobs, renderReviewDraftJob, retryReviewDraftJob, toAbsoluteApiUrl, updateReviewDraftSegment, uploadVideo, uploadWatermark } from "../lib/api";
+import { AlertTriangle, Check, Clapperboard, Clock3, Copy, Download, FileImage, ImageOff, Loader2, Play, Plus, RotateCcw, Save, Sparkles, Trash2, Upload, Video, Wand2, XCircle } from "lucide-react";
+import { cancelReviewDraftJob, clearReviewDraftJobs, createReviewDraftJob, detectBlurRegions, getReviewDraftJob, listReviewDraftJobs, optimizeReviewDraftJob, renderReviewDraftJob, renderReviewPreviewJob, retryReviewDraftJob, toAbsoluteApiUrl, updateReviewDraftSegment, uploadVideo, uploadWatermark } from "../lib/api";
 import type { UploadProgress } from "../lib/api";
 import type { CustomBlurBox, ProcessingMode, ReviewBeat, ReviewBeatCandidate, ReviewDraftJob, ReviewDraftRequest, ReviewQualityIssue, SourceLanguage } from "../types/api";
 import { LivePreview } from "./LivePreview";
 import { ProcessingModeSelector } from "./ProcessingModeSelector";
+import { ReviewFinalEvaluationPanel } from "./ReviewFinalEvaluation";
 
 const reviewStyles: Array<{ label: string; value: ReviewDraftRequest["style"]; description: string }> = [
   { label: "Kể chuyện", value: "story", description: "Đi theo nguyên nhân → diễn biến → kết quả để mạch phim liền lạc." },
@@ -60,7 +61,7 @@ const defaultReviewRenderOptions: ReviewRenderOptions = {
   logo_y_percent: 8,
   cinematic_bars_enabled: false,
   cinematic_bars_height_percent: 10,
-  blur_box_enabled: false,
+  blur_box_enabled: true,
   blur_box_y_percent: 80,
   blur_box_height_percent: 13,
   custom_blur_boxes: [],
@@ -104,6 +105,9 @@ export const MovieReview = React.memo(function MovieReview() {
   const [isDetectingAI, setDetectingAI] = useState(false);
   const [isCreating, setCreating] = useState(false);
   const [isRetrying, setRetrying] = useState(false);
+  const [isCancellingReview, setCancellingReview] = useState(false);
+  const [isOptimizingReview, setOptimizingReview] = useState(false);
+  const [isPreviewingReview, setPreviewingReview] = useState(false);
   const [isRenderingReview, setRenderingReview] = useState(false);
   const [isClearingHistory, setClearingHistory] = useState(false);
   const [job, setJob] = useState<ReviewDraftJob | null>(null);
@@ -371,6 +375,23 @@ export const MovieReview = React.memo(function MovieReview() {
     }
   }, [applyReviewJob, job, processingMode, refreshReviewJobs]);
 
+  const cancelRunningReview = useCallback(async () => {
+    if (!job || !isRunningReviewJob(job) || isCancellingReview) return;
+    if (!window.confirm("Hủy job review đang xử lý? Bạn có thể chạy lại từ checkpoint sau đó.")) return;
+    setCancellingReview(true);
+    setMessage(null);
+    try {
+      const cancelled = await cancelReviewDraftJob(job.job_id);
+      applyReviewJob(cancelled, false);
+      await refreshReviewJobs();
+      setMessage("Đã hủy job review. Bạn có thể chạy lại từ checkpoint khi sẵn sàng.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Không thể hủy job review.");
+    } finally {
+      setCancellingReview(false);
+    }
+  }, [applyReviewJob, isCancellingReview, job, refreshReviewJobs]);
+
   const selectReviewJob = useCallback((item: ReviewDraftJob) => {
     applyReviewJob(item);
   }, [applyReviewJob]);
@@ -402,6 +423,23 @@ export const MovieReview = React.memo(function MovieReview() {
     && !isSavingAnySegment
     && !reviewConfigurationChanged,
   );
+  const canAutoOptimizeReview = Boolean(
+    job
+    && result
+    && !reviewIsBusy
+    && !isSavingAnySegment
+    && !isRenderingReview
+    && !isOptimizingReview,
+  );
+  const canRenderPreviewReview = Boolean(
+    job
+    && result
+    && !reviewIsBusy
+    && !isSavingAnySegment
+    && !isRenderingReview
+    && !isOptimizingReview
+    && !reviewConfigurationChanged,
+  );
   const renderButtonTitle = canRenderApprovedReview
     ? "Render video từ kịch bản và cảnh đã duyệt"
     : reviewConfigurationChanged
@@ -411,7 +449,10 @@ export const MovieReview = React.memo(function MovieReview() {
       : qualityReport?.phase === "post_render"
         ? "Hậu kiểm sau render chưa đạt. Mở các segment viền đỏ, sửa lời dẫn hoặc chọn cảnh phù hợp rồi lưu; lỗi không gắn segment được liệt kê trong bảng QA."
         : "QA trước render chưa đạt. Mở các segment viền đỏ, sửa lời dẫn hoặc chọn cảnh phù hợp rồi lưu.";
-  const outputVideoUrl = result?.output_video_url ? toAbsoluteApiUrl(result.output_video_url) : null;
+  const outputVideoBaseUrl = result?.output_video_url ? toAbsoluteApiUrl(result.output_video_url) : null;
+  const outputVideoUrl = outputVideoBaseUrl
+    ? `${outputVideoBaseUrl}${outputVideoBaseUrl.includes("?") ? "&" : "?"}v=${encodeURIComponent(job?.updated_at ?? "latest")}`
+    : null;
   const targetDurationSeconds = job ? normalizeTargetMinutes(job.request.target_minutes) * 60 : null;
   const plannedDurationSeconds = reviewPlannedDurationSeconds(result);
   const reportedOutputDurationSeconds = firstFinitePositive([
@@ -551,6 +592,40 @@ export const MovieReview = React.memo(function MovieReview() {
       setRenderingReview(false);
     }
   }, [canRenderApprovedReview, job]);
+
+  const optimizeReviewDraft = useCallback(async () => {
+    if (!job || !canAutoOptimizeReview) return;
+    setOptimizingReview(true);
+    setMessage(null);
+    try {
+      const nextJob = await optimizeReviewDraftJob(job.job_id);
+      setJob(nextJob);
+      setReviewJobs((items) => items.map((item) => item.job_id === nextJob.job_id ? nextJob : item));
+      setMessage(nextJob.result?.quality_report?.passed
+        ? "AI đã tự tối ưu timeline, cảnh và thời lượng; bản nháp đã sẵn sàng render."
+        : "AI đã tự xử lý các lỗi nhẹ. Các lỗi nghiêm trọng còn lại được giữ để bạn duyệt.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Không thể tự tối ưu bản nháp.");
+    } finally {
+      setOptimizingReview(false);
+    }
+  }, [canAutoOptimizeReview, job]);
+
+  const renderPreviewReview = useCallback(async () => {
+    if (!job || !canRenderPreviewReview) return;
+    setPreviewingReview(true);
+    setMessage(null);
+    try {
+      const nextJob = await renderReviewPreviewJob(job.job_id);
+      setJob(nextJob);
+      setReviewJobs((items) => items.map((item) => item.job_id === nextJob.job_id ? nextJob : item));
+      setMessage("Đang render bản xem trước. Bản này có thể còn cảnh báo QA.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Không thể render bản xem trước.");
+    } finally {
+      setPreviewingReview(false);
+    }
+  }, [canRenderPreviewReview, job]);
 
   const clearReviewHistory = useCallback(async () => {
     const confirmed = window.confirm("Đưa toàn bộ file review job vào Thùng rác và xóa lịch sử review?");
@@ -792,6 +867,18 @@ export const MovieReview = React.memo(function MovieReview() {
                 <span>Phong cách <strong>{jobStyle.label}</strong></span>
                 <span>Chế độ <strong>{processingModeLabel(job.request.processing_mode)}</strong></span>
               </div>
+              {reviewIsBusy && (
+                <button
+                  className="ios-button ios-button-secondary review-cancel-button"
+                  type="button"
+                  onClick={cancelRunningReview}
+                  disabled={isCancellingReview}
+                  title="Dừng job đang xử lý; sau đó có thể chạy lại từ checkpoint"
+                >
+                  {isCancellingReview ? <Loader2 className="spin" size={16} /> : <XCircle size={16} />}
+                  {isCancellingReview ? "Đang hủy..." : "Hủy xử lý"}
+                </button>
+              )}
               {reviewConfigurationChanged && (
                 <div className="review-duration-warning" role="alert">
                   <AlertTriangle size={17} />
@@ -840,8 +927,12 @@ export const MovieReview = React.memo(function MovieReview() {
                 <section className={`review-qa-panel ${qualityReport.passed ? "passed" : "needs-review"}`}>
                   <div className="review-qa-head">
                     <div>
-                      <span>Kiểm tra chất lượng {qualityReport.phase === "post_render" ? "sau render" : "trước render"}</span>
-                      <strong>{qualityReport.passed ? "Đạt QA — sẵn sàng render" : "Cần duyệt lại trước khi render"}</strong>
+                      <span>{qualityReport.phase === "post_render" ? "Hậu kiểm kỹ thuật trên video đã render" : "Kiểm tra chất lượng trước render"}</span>
+                      <strong>
+                        {qualityReport.phase === "post_render"
+                          ? qualityReport.passed ? "Video cuối đã đạt QA kỹ thuật" : "Video cuối còn lỗi cần kiểm tra lại"
+                          : qualityReport.passed ? "Đạt QA — sẵn sàng render" : "Cần duyệt lại trước khi render"}
+                      </strong>
                     </div>
                     <span className="review-qa-score">{formatQaScore(qualityReport.overall_score)}<small>/100</small></span>
                   </div>
@@ -867,6 +958,7 @@ export const MovieReview = React.memo(function MovieReview() {
                   )}
                 </section>
               )}
+              {result.final_evaluation && <ReviewFinalEvaluationPanel evaluation={result.final_evaluation} />}
               <button
                 className="ios-button review-render-approved"
                 type="button"
@@ -877,8 +969,30 @@ export const MovieReview = React.memo(function MovieReview() {
                 {reviewIsBusy || isRenderingReview ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
                 {reviewIsBusy || isRenderingReview ? "Đang xử lý / render video..." : "Render video đã duyệt"}
               </button>
+              <div className="review-automation-actions">
+                <button
+                  className="ios-button review-auto-optimize"
+                  type="button"
+                  onClick={optimizeReviewDraft}
+                  disabled={!canAutoOptimizeReview}
+                  title="Tự rút/gom lời dẫn, chọn cảnh khớp hơn và giữ timeline tăng dần mà không gọi lại AI phân tích toàn bộ phim"
+                >
+                  {isOptimizingReview ? <Loader2 className="spin" size={18} /> : <Wand2 size={18} />}
+                  {isOptimizingReview ? "Đang tự tối ưu..." : "AI tự tối ưu bản nháp"}
+                </button>
+                <button
+                  className="ios-button ios-button-secondary review-render-preview"
+                  type="button"
+                  onClick={renderPreviewReview}
+                  disabled={!canRenderPreviewReview}
+                  title="Xuất video để kiểm tra ngay cả khi QA còn cảnh báo không nghiêm trọng"
+                >
+                  {isPreviewingReview ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+                  {isPreviewingReview ? "Đang render xem trước..." : "Render bản nháp để xem trước"}
+                </button>
+              </div>
               {result.output_video_url && (
-                <a className="ios-button review-download" href={toAbsoluteApiUrl(result.output_video_url)} target="_blank" rel="noreferrer">
+                <a className="ios-button review-download" href={outputVideoUrl ?? toAbsoluteApiUrl(result.output_video_url)} target="_blank" rel="noreferrer">
                   <Download size={17} />
                   {actualOutputDurationSeconds != null
                     ? `Tải video review • ${formatReviewDuration(actualOutputDurationSeconds)}`
@@ -1085,7 +1199,7 @@ function ReviewDisplayControls({
         />
         <ReviewCheckBox
           checked={options.blur_box_enabled}
-          label="Làm mờ chữ gốc (cố định suốt video)"
+          label="Ẩn phụ đề gốc để chỉ còn 1 dòng review"
           onChange={() => onFieldChange("blur_box_enabled", !options.blur_box_enabled)}
         />
         <ReviewCheckBox
@@ -1228,6 +1342,7 @@ const ReviewLivePreview = React.forwardRef<HTMLVideoElement, {
         <div className="video-frame review-live-frame">
           {activeVideoUrl ? (
           <video
+            key={activeVideoUrl}
             ref={ref}
             className="preview-video-element"
             src={activeVideoUrl}

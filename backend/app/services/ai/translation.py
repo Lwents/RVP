@@ -19,6 +19,11 @@ from pathlib import Path
 
 from app.core import settings
 from app.models.job import ProcessingMode
+from app.services.ai.character_names import (
+    build_character_name_registry,
+    canonicalize_character_text,
+    character_name_contract,
+)
 from app.services.presets import ProcessingProfile, get_processing_profile
 from app.services.subtitles.timing import SubtitleEvent
 
@@ -101,6 +106,7 @@ class GeminiTranslation(TranslationEngine):
             max_retries=0,
         )
         profile = get_processing_profile(processing_mode)
+        character_names = build_character_name_registry(context)
         source_texts = [
             unicodedata.normalize("NFC", _normalize_source_text(event.text.strip()))
             for event in events
@@ -123,6 +129,10 @@ class GeminiTranslation(TranslationEngine):
             context,
             ranges,
         )
+        translated_texts = [
+            canonicalize_character_text(text, character_names)
+            for text in translated_texts
+        ]
         completed_batches = sum(end <= len(translated_texts) for _, end in ranges)
         if on_batch_progress:
             on_batch_progress(completed_batches, len(ranges))
@@ -179,6 +189,7 @@ class GeminiTranslation(TranslationEngine):
                 source = str(item["source"])
                 cleaned = _clean_polished_subtitle(translated, "")
                 cleaned = unicodedata.normalize("NFC", cleaned)
+                cleaned = canonicalize_character_text(cleaned, character_names)
                 if not cleaned or (
                     target_language.lower() == "vi" and _looks_chinese(cleaned)
                 ):
@@ -210,7 +221,11 @@ class GeminiTranslation(TranslationEngine):
         if len(translated_texts) != len(events):
             raise TranslationError("AI trả về thiếu câu dịch so với phụ đề nguồn.")
         return [
-            SubtitleEvent(event.start, event.end, translated_texts[index])
+            SubtitleEvent(
+                event.start,
+                event.end,
+                canonicalize_character_text(translated_texts[index], character_names),
+            )
             for index, event in enumerate(events)
         ]
 
@@ -333,6 +348,9 @@ def _translation_fingerprint(
         "processing_mode": profile.name,
         "batch_items": profile.translation_batch_items,
         "batch_chars": profile.translation_batch_chars,
+        # Invalidate checkpoints produced before proper names were locked to a
+        # single canonical spelling across every batch.
+        "character_name_policy": 2,
     }
     encoded = json.dumps(
         payload,
@@ -465,7 +483,8 @@ async def _translate_gemini_batch(
         "- Mỗi item có dạng {\"id\":1,\"text\":\"...\"}; text chỉ chứa bản dịch, không giải thích.\n"
         "- Giữ nguyên ý, không bịa tình tiết, không thêm tên người nói nếu câu nguồn không có.\n"
         "- Dùng CHARACTER_BIBLE và MEMORY làm sự thật ưu tiên cho tên, biệt danh, giới tính, quan hệ và xưng hô.\n"
-        "- Một nhân vật phải giữ cùng tên Hán Việt/Việt hóa trong toàn bộ video. Không đổi tên giữa các batch.\n"
+        "- CHARACTER_NAME_CONTRACT là bắt buộc: khi nhắc nhân vật phải chép đúng canonical_names, không dịch nghĩa tên riêng, "
+        "không dùng alias và không đổi tên giữa các batch.\n"
         "- Chỉ xác định giới tính, vai vế hoặc quan hệ khi câu nguồn/ngữ cảnh có bằng chứng; chưa chắc thì dùng cách gọi trung tính.\n"
         "- PREVIOUS_CONTEXT và NEXT_CONTEXT chỉ giúp hiểu đại từ/người nói; tuyệt đối không dịch chúng vào items.\n"
         "- Câu ngắn, tự nhiên, phù hợp thời lượng phụ đề/lồng tiếng; không để sót chữ Trung, pinyin hoặc chú thích.\n"
@@ -475,6 +494,9 @@ async def _translate_gemini_batch(
         "source_language": source_language,
         "target_language": target_language,
         "character_bible": _compact_context(context),
+        "character_name_contract": character_name_contract(
+            build_character_name_registry(context)
+        ),
         "memory": memory,
         "previous_context": previous_context,
         "current_items": batch,

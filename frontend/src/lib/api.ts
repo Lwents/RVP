@@ -156,6 +156,13 @@ export async function generateJobMetadata(jobId: string): Promise<JobProgress> {
   });
 }
 
+export async function evaluateJob(jobId: string): Promise<JobProgress> {
+  return request(`/api/jobs/${jobId}/evaluate`, {
+    method: "POST",
+    timeoutMs: 600_000,
+  });
+}
+
 export async function listJobs(): Promise<JobProgress[]> {
   return request("/api/jobs");
 }
@@ -300,6 +307,13 @@ export async function retryReviewDraftJob(jobId: string, processingMode: Process
   });
 }
 
+export async function cancelReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
+  return request(`/api/review/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+    timeoutMs: 30_000,
+  });
+}
+
 export async function listReviewDraftJobs(): Promise<ReviewDraftJob[]> {
   return request("/api/review/jobs");
 }
@@ -310,6 +324,20 @@ export async function getReviewDraftJob(jobId: string): Promise<ReviewDraftJob> 
 
 export async function renderReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
   return request(`/api/review/jobs/${encodeURIComponent(jobId)}/render`, {
+    method: "POST",
+    timeoutMs: 30_000,
+  });
+}
+
+export async function optimizeReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
+  return request(`/api/review/jobs/${encodeURIComponent(jobId)}/optimize`, {
+    method: "POST",
+    timeoutMs: 120_000,
+  });
+}
+
+export async function renderReviewPreviewJob(jobId: string): Promise<ReviewDraftJob> {
+  return request(`/api/review/jobs/${encodeURIComponent(jobId)}/render-preview`, {
     method: "POST",
     timeoutMs: 30_000,
   });

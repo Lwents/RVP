@@ -43,7 +43,7 @@ def normalize_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
         if index + 1 < len(ordered):
             next_start = ordered[index + 1].start
             if next_start < end:
-                end = max(start + 0.35, next_start - 0.04)
+                end = max(start + 0.6, next_start - 0.04)
         normalized.append(SubtitleEvent(start, end, event.text))
     return normalized
 

@@ -5,6 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.core import settings
+from app.services.ai.character_names import (
+    build_character_name_registry,
+    canonical_character_name,
+    canonicalize_character_text,
+)
 from app.services.ai.context import _sanitize_context
 from app.services.ai.translation import GeminiTranslation, get_translation_engine
 from app.services.subtitles.timing import SubtitleEvent
@@ -51,6 +56,94 @@ class _FakeClient:
 
 
 class GeminiTranslationTests(unittest.IsolatedAsyncioTestCase):
+    def test_doraemon_names_are_canonical_without_corrupting_vietnamese_words(self) -> None:
+        registry = build_character_name_registry(
+            {
+                "film_title": "Doraemon: Nobita và chuyến thám hiểm Nam Cực",
+                "characters": [
+                    {"name": "Gian"},
+                    {"name": "Suneo", "aliases": ["Xê-kô"]},
+                ],
+            }
+        )
+
+        self.assertEqual(canonical_character_name("Gian", registry), "Chaien")
+        self.assertEqual(canonical_character_name("Jaian", registry), "Chaien")
+        self.assertEqual(canonical_character_name("Xê-kô", registry), "Suneo")
+        self.assertEqual(
+            canonicalize_character_text(
+                "Gian và Xê-kô mất một thời gian dài để tìm Suneo.",
+                registry,
+            ),
+            "Chaien và Suneo mất một thời gian dài để tìm Suneo.",
+        )
+        self.assertEqual(
+            canonicalize_character_text("A giant monster appears.", registry),
+            "A giant monster appears.",
+        )
+
+    def test_context_aliases_and_scene_spelling_variants_work_for_any_film(self) -> None:
+        registry = build_character_name_registry(
+            {
+                "characters": [
+                    {"name": "Lục Trạch", "aliases": ["Lu Ze"]},
+                    {"name": "Carla"},
+                ],
+                "glossary": [
+                    {"source": "Luc Trach", "target": "Lục Trạch"},
+                ],
+            },
+            observed_names=["Cara"],
+        )
+
+        self.assertEqual(canonical_character_name("Cara", registry), "Carla")
+        self.assertEqual(
+            canonicalize_character_text("Lu Ze gặp Luc Trach và Cara.", registry),
+            "Lục Trạch gặp Lục Trạch và Carla.",
+        )
+
+    async def test_ai_translation_output_is_forced_back_to_canonical_names(self) -> None:
+        class _AliasCompletions:
+            async def create(self, **kwargs):
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps(
+                                    {
+                                        "items": [
+                                            {"id": 1, "text": "Gian gọi Xê-kô chạy tới."}
+                                        ],
+                                        "memory_updates": {},
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            )
+                        )
+                    ]
+                )
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=_AliasCompletions())
+        )
+        original_key = settings.ninerouter_api_key
+        try:
+            settings.ninerouter_api_key = "test-key"
+            with patch("openai.AsyncOpenAI", return_value=fake_client):
+                translated = await GeminiTranslation().translate_events(
+                    [SubtitleEvent(0.0, 1.0, "Gian calls Suneo.")],
+                    "en",
+                    "vi",
+                    context={
+                        "film_title": "Doraemon",
+                        "characters": [{"name": "Gian"}, {"name": "Suneo"}],
+                    },
+                )
+        finally:
+            settings.ninerouter_api_key = original_key
+
+        self.assertEqual(translated[0].text, "Chaien gọi Suneo chạy tới.")
+
     async def test_old_google_setting_uses_direct_contextual_ai(self) -> None:
         original_key = settings.ninerouter_api_key
         original_engine = settings.translation_engine

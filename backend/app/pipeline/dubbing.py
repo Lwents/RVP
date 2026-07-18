@@ -33,6 +33,7 @@ async def process_dubbing_job(job_id: str) -> None:
             job_store.update(job_id, stage=stage, progress=percent)
 
         voice_warning: str | None = None
+        narration_audio: Path | None = None
         profile = get_processing_profile(job.request.processing_mode)
         effective_request = job.request
         if (
@@ -213,6 +214,54 @@ async def process_dubbing_job(job_id: str) -> None:
                 seo_tags = video_details.tags
             except Exception as exc:
                 print(f"Error generating YouTube metadata: {exc}")
+
+        progress("AI đang đánh giá video đầu ra", 99)
+        final_evaluation = None
+        evaluation_stage = "Hoàn tất pipeline · chưa thể hậu kiểm"
+        try:
+            from app.services.ai.final_dubbing_evaluator import (
+                discover_dubbing_evaluation_artifacts,
+                dubbing_evaluation_stage,
+                emergency_dubbing_evaluation,
+                evaluate_final_dubbing_video,
+            )
+
+            try:
+                artifacts = discover_dubbing_evaluation_artifacts(work_dir)
+                final_evaluation = await evaluate_final_dubbing_video(
+                    output_file,
+                    work_dir,
+                    subtitle_file=subtitle_file or artifacts.subtitle_file,
+                    source_subtitle_file=artifacts.source_subtitle_file,
+                    narration_audio=narration_audio or artifacts.narration_audio,
+                    source_video=source_video or artifacts.source_video,
+                    subtitles_expected=job.request.hard_subtitles,
+                    narration_expected=job.request.hard_subtitles,
+                    target_subtitle_burned=(
+                        job.request.hard_subtitles
+                        and not job.request.source_has_hard_subtitles
+                    ),
+                    translation_expected=(
+                        settings.translation_engine.lower() != "passthrough"
+                        and (
+                            job.request.source_language == "auto"
+                            or job.request.source_language.lower() != settings.target_language.lower()
+                        )
+                    ),
+                    source_language=job.request.source_language,
+                    target_language=settings.target_language,
+                    video_speed=job.request.video_speed,
+                )
+            except Exception as exc:
+                # Evaluation is advisory. Preserve the completed MP4 even if
+                # discovery or the evaluator itself fails unexpectedly.
+                print(f"Final dubbing evaluation error: {exc}")
+                final_evaluation = emergency_dubbing_evaluation(str(exc))
+            evaluation_stage = dubbing_evaluation_stage(final_evaluation)
+        except Exception as exc:
+            # Even an import/integration failure after render cannot turn the
+            # already-created MP4 into a failed job.
+            print(f"Final dubbing evaluator unavailable: {exc}")
         
         if job.request.auto_publish and PublishTarget.youtube in job.request.auto_publish:
             progress("Tự động đăng lên YouTube...", 92)
@@ -237,7 +286,7 @@ async def process_dubbing_job(job_id: str) -> None:
         job_store.update(
             job_id,
             status=JobStatus.completed,
-            stage="Hoàn tất pipeline và phụ đề",
+            stage=evaluation_stage,
             progress=100,
             completed_at=datetime.now(UTC),
             output_video_url=f"/api/jobs/{job_id}/download",
@@ -245,6 +294,7 @@ async def process_dubbing_job(job_id: str) -> None:
             seo_title=seo_title,
             seo_description=seo_description,
             seo_tags=seo_tags,
+            final_evaluation=final_evaluation,
             error=voice_warning,
         )
     except asyncio.CancelledError:

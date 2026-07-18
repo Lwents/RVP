@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from app.api.routes import ReviewBeatResponse, ReviewDraftResult, _recalculate_review_quality
+from app.api.routes import (
+    ReviewBeatResponse,
+    ReviewDraftResult,
+    _apply_review_hard_gate,
+    _recalculate_review_quality,
+)
+from app.models.job import DubbingRequest
 from app.models.review import (
     AnalyzedScene,
     EditDecision,
@@ -23,6 +30,10 @@ from app.services.ai.review_analysis import (
     NarrativeStyleAssessment,
     _STYLE_ENFORCEMENT,
     _STYLE_GUIDANCE,
+    _analyze_scene_batch,
+    _canonicalize_narration_names,
+    _canonicalize_scene_character_names,
+    _canonicalize_story_event_names,
     _event_segment_targets,
     _event_story_roles,
     _is_credits_only_scene,
@@ -58,15 +69,74 @@ from app.services.ai.review_analysis import (
     replace_failed_decisions_with_alternatives,
     rescale_edl_voice_timeline,
 )
+from app.services.ai.character_names import build_character_name_registry
 from app.services.media.review_renderer import (
+    align_review_narration_ranges,
+    align_review_subtitle_chunks,
     build_review_scene_plans,
     build_review_scenes,
+    review_subtitle_single_line_max_chars,
     write_review_subtitles,
 )
+from app.services.subtitles.ass import srt_to_positioned_ass
 from app.services.subtitles.timing import parse_srt
 
 
 class ReviewTimelineTests(unittest.TestCase):
+    def test_character_aliases_are_normalized_across_scene_event_and_narration(self) -> None:
+        registry = build_character_name_registry(
+            {
+                "film_title": "Doraemon",
+                "characters": [
+                    {"name": "Gian"},
+                    {"name": "Suneo", "aliases": ["Xê-kô"]},
+                ],
+            }
+        )
+        scenes = _canonicalize_scene_character_names(
+            [
+                AnalyzedScene(
+                    scene_id="scene_0001",
+                    start_time=0,
+                    end_time=2,
+                    characters=["Jaian", "Xê-kô"],
+                    visible_actions=["Gian và Xê-kô chạy trên băng"],
+                    event_summary="Gian đỡ Suneo đứng dậy.",
+                )
+            ],
+            registry,
+        )
+        events = _canonicalize_story_event_names(
+            [
+                StoryEvent(
+                    event_id="event_0001",
+                    order_index=1,
+                    start_time=0,
+                    end_time=2,
+                    scene_ids=["scene_0001"],
+                    characters=["Gian", "Suneo"],
+                    summary="Jaian gọi Xê-kô.",
+                )
+            ],
+            registry,
+        )
+        segments = _canonicalize_narration_names(
+            [
+                NarrationSegment(
+                    segment_id="segment_0001",
+                    event_id="event_0001",
+                    narration="Gian và Xê-kô cùng chạy trên băng.",
+                )
+            ],
+            registry,
+        )
+
+        self.assertEqual(scenes[0].characters, ["Chaien", "Suneo"])
+        self.assertEqual(scenes[0].visible_actions, ["Chaien và Suneo chạy trên băng"])
+        self.assertEqual(events[0].characters, ["Chaien", "Suneo"])
+        self.assertEqual(events[0].summary, "Chaien gọi Suneo.")
+        self.assertEqual(segments[0].narration, "Chaien và Suneo cùng chạy trên băng.")
+
     def test_optional_bool_parses_string_false_without_python_truthiness(self) -> None:
         self.assertIs(_optional_bool("false"), False)
         self.assertIs(_optional_bool("true"), True)
@@ -831,6 +901,75 @@ class ReviewTimelineTests(unittest.TestCase):
         self.assertEqual(_visual_atomicity_issues([valid], scenes), [])
         self.assertTrue(_visual_atomicity_issues([invalid], scenes))
 
+    def test_dialogue_claim_requires_source_subtitle_from_the_same_scene(self) -> None:
+        scene = AnalyzedScene(
+            scene_id="scene_0001",
+            start_time=0,
+            end_time=8,
+            characters=["Nobita"],
+            visible_actions=["Nobita points at the pink door"],
+            important_objects=["Pink door"],
+            location="Bedroom",
+        )
+        segment = NarrationSegment(
+            segment_id="segment_0001",
+            event_id="event_0001",
+            narration="Nobita giải thích cách mở cánh cửa màu hồng.",
+            required_visuals={
+                "characters": ["Nobita"],
+                "actions": ["Nobita points at the pink door"],
+                "objects": ["Pink door"],
+                "locations": ["Bedroom"],
+            },
+            candidate_scene_ids=[scene.scene_id],
+            sequence_index=1,
+        )
+
+        issues = _visual_atomicity_issues([segment], [scene])
+        self.assertTrue(any("dialogue claim lacks source subtitle" in issue for issue in issues))
+
+        supported = scene.model_copy(
+            update={
+                "evidence": ReviewEvidence(
+                    subtitle=["Nobita: Đây là cách mở cánh cửa màu hồng."]
+                )
+            }
+        )
+        supported_issues = _visual_atomicity_issues([segment], [supported])
+        self.assertFalse(
+            any("dialogue claim lacks source subtitle" in issue for issue in supported_issues)
+        )
+
+        selected = SceneCandidate(
+            candidate_id="candidate_0001",
+            scene_id=scene.scene_id,
+            start_seconds=0,
+            end_seconds=2,
+            match_score=0.9,
+        )
+        event = StoryEvent(
+            event_id=segment.event_id,
+            order_index=1,
+            start_time=0,
+            end_time=8,
+            scene_ids=[scene.scene_id],
+            summary="Nobita points at the door.",
+            evidence_count=1,
+            verification_status="verified",
+        )
+        decision = EditDecision(
+            segment_id=segment.segment_id,
+            event_id=segment.event_id,
+            narration=segment.narration,
+            voice_start=0,
+            voice_end=2,
+            selected_candidate_id=selected.candidate_id,
+            source_clips=[selected],
+        )
+        report = _quality_report([segment], [event], [scene], [decision], target_minutes=1)
+        self.assertTrue(any(issue.code == "UNSUPPORTED_NARRATION" for issue in report.issues))
+        self.assertFalse(_apply_review_hard_gate(report).passed)
+
     def test_character_name_on_a_supported_object_is_not_a_missing_actor(self) -> None:
         scenes = [
             AnalyzedScene(
@@ -1306,6 +1445,7 @@ class ReviewTimelineTests(unittest.TestCase):
         self.assertEqual(remaining_post_errors, ["segment_0002"])
         self.assertFalse(any(issue.code == "LOW_VISUAL_MATCH" for issue in after_first_edit.issues))
         self.assertFalse(after_first_edit.passed)
+        self.assertEqual(after_first_edit.issues[0].severity, "error")
 
         result.quality_report = after_first_edit
         after_second_edit = _recalculate_review_quality(
@@ -1332,6 +1472,10 @@ class ReviewTimelineTests(unittest.TestCase):
             ["segment_0001"],
         )
         self.assertFalse(with_recalculated_low_score.passed)
+        self.assertEqual(
+            next(issue for issue in with_recalculated_low_score.issues if issue.code == "LOW_VISUAL_MATCH").severity,
+            "error",
+        )
 
     def test_multimodal_score_does_not_drift_when_saved_again(self) -> None:
         self.assertEqual(_resolved_multimodal_score(0.20, 0.84), 0.84)
@@ -1545,6 +1689,70 @@ class ReviewTimelineTests(unittest.TestCase):
         self.assertAlmostEqual(events[1].start, 2.4, places=2)
         self.assertAlmostEqual(events[-1].end, 5.1, places=2)
 
+    def test_review_subtitles_are_split_before_render_and_never_wrap_to_two_lines(self) -> None:
+        narration = (
+            "Nobita và Doraemon bước vào căn phòng băng rồi nhìn thấy một cánh cửa màu hồng."
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            srt_file = write_review_subtitles(
+                narration,
+                root / "review.srt",
+                target_minutes=1,
+                scene_hints=[
+                    {
+                        "narration": narration,
+                        "voice_start": 0.0,
+                        "voice_end": 8.0,
+                    }
+                ],
+                target_seconds=8.0,
+                subtitle_font_size=120,
+            )
+            events = parse_srt(srt_file)
+            limit = review_subtitle_single_line_max_chars(120)
+            ass_file = srt_to_positioned_ass(
+                srt_file,
+                root / "review.ass",
+                1280,
+                720,
+                DubbingRequest(local_file_path="source.mp4", subtitle_font_size=120),
+                single_line=True,
+            )
+            ass_text = ass_file.read_text(encoding="utf-8")
+
+        self.assertGreater(len(events), 1)
+        self.assertTrue(all("\n" not in event.text and len(event.text) <= limit for event in events))
+        self.assertIn("WrapStyle: 2", ass_text)
+        dialogue_lines = [line for line in ass_text.splitlines() if line.startswith("Dialogue:")]
+        self.assertTrue(dialogue_lines)
+        self.assertTrue(all(r"\q2" in line and r"\N" not in line for line in dialogue_lines))
+
+    def test_review_subtitle_chunks_follow_exact_tts_word_boundaries(self) -> None:
+        chunks = ["Một câu ngắn.", "Đoạn kế tiếp dài hơn."]
+        timings = [
+            {"text": "Một", "start": 0.20, "end": 0.38},
+            {"text": "câu", "start": 0.42, "end": 0.61},
+            {"text": "ngắn.", "start": 0.66, "end": 0.98},
+            {"text": "Đoạn", "start": 1.80, "end": 2.02},
+            {"text": "kế", "start": 2.08, "end": 2.20},
+            {"text": "tiếp", "start": 2.25, "end": 2.43},
+            {"text": "dài", "start": 2.48, "end": 2.65},
+            {"text": "hơn.", "start": 2.70, "end": 2.98},
+        ]
+
+        events = align_review_subtitle_chunks(chunks, timings, target_seconds=3.2)
+
+        self.assertEqual([event.text for event in events], chunks)
+        self.assertAlmostEqual(events[0].start, 0.12, places=2)
+        self.assertAlmostEqual(events[0].end, 1.16, places=2)
+        self.assertAlmostEqual(events[1].start, 1.72, places=2)
+        self.assertAlmostEqual(events[1].end, 3.16, places=2)
+        self.assertEqual(
+            align_review_narration_ranges(chunks, timings, target_seconds=3.2),
+            [(0.0, 1.72), (1.72, 3.2)],
+        )
+
     def test_animation_unknown_alias_is_reconciled_by_hair_descriptor(self) -> None:
         scenes = [
             AnalyzedScene(
@@ -1674,6 +1882,45 @@ class ReviewTimelineTests(unittest.TestCase):
 
 
 class NarrativeJudgeRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scene_analysis_preserves_exact_timestamped_source_dialogue(self) -> None:
+        source_line = "Nobita: Tớ sẽ mở cánh cửa màu hồng ngay bây giờ."
+        scene = AnalyzedScene(
+            scene_id="scene_0001",
+            start_time=0,
+            end_time=8,
+            dialogue_summary=source_line,
+            evidence=ReviewEvidence(dialogue=[source_line]),
+        )
+        payload = {
+            "scenes": [
+                {
+                    "scene_id": scene.scene_id,
+                    "characters": ["Nobita"],
+                    "location": "Bedroom",
+                    "visible_actions": ["Nobita reaches for a pink door"],
+                    "dialogue_summary": "Nobita announces his next action.",
+                    "event_summary": "Nobita reaches for the door.",
+                    "important_objects": ["Pink door"],
+                    "emotion": "determined",
+                    "confidence": 0.9,
+                    "temporal_mode": "present",
+                    "credits": False,
+                    "evidence": {"visual": ["pink door"], "dialogue": [], "subtitle": []},
+                }
+            ]
+        }
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=response)))
+        )
+
+        with patch("app.services.ai.review_analysis._client", return_value=client):
+            analyzed = await _analyze_scene_batch([scene], [])
+
+        self.assertIn(source_line, analyzed[0].evidence.dialogue)
+
     async def test_style_judge_receives_the_exact_selected_contract_for_all_styles(self) -> None:
         event = ReviewTimelineTests._story_events(1)[0]
         segment = NarrationSegment(
@@ -1765,13 +2012,6 @@ class NarrativeJudgeRetryTests(unittest.IsolatedAsyncioTestCase):
             end_seconds=2,
             match_score=0.3,
         )
-        visible = SceneCandidate(
-            candidate_id="visible",
-            scene_id="scene_0002",
-            start_seconds=9,
-            end_seconds=11,
-            match_score=0.7,
-        )
         decision = EditDecision(
             segment_id=segment.segment_id,
             event_id=event.event_id,
@@ -1780,7 +2020,7 @@ class NarrativeJudgeRetryTests(unittest.IsolatedAsyncioTestCase):
             voice_end=3,
             selected_candidate_id=failed.candidate_id,
             source_clips=[failed],
-            alternatives=[failed, visible],
+            alternatives=[failed],
         )
         payload = {
             "segments": [
@@ -1813,6 +2053,111 @@ class NarrativeJudgeRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(changed)
         self.assertEqual(repaired[0].candidate_scene_ids, ["scene_0002"])
         self.assertEqual(repaired[0].required_visuals.actions, ["Nobita holds the battery"])
+
+    async def test_low_visual_repair_processes_more_than_twelve_failed_segments(self) -> None:
+        scenes: list[AnalyzedScene] = []
+        events: list[StoryEvent] = []
+        segments: list[NarrationSegment] = []
+        decisions: list[EditDecision] = []
+        replacement_by_id: dict[str, dict] = {}
+        for index in range(13):
+            number = index + 1
+            scene_id = f"scene_{number:04d}"
+            event_id = f"event_{number:04d}"
+            segment_id = f"segment_{number:04d}"
+            action = f"Character waves beside marker {number}"
+            scene = AnalyzedScene(
+                scene_id=scene_id,
+                start_time=float(index * 10),
+                end_time=float(index * 10 + 8),
+                visible_actions=[action],
+                location="Open field",
+                evidence=ReviewEvidence(visual=[action]),
+            )
+            event = StoryEvent(
+                event_id=event_id,
+                order_index=number,
+                start_time=scene.start_time,
+                end_time=scene.end_time,
+                scene_ids=[scene_id],
+                summary=action,
+                evidence_count=1,
+                verification_status="verified",
+            )
+            segment = NarrationSegment(
+                segment_id=segment_id,
+                event_id=event_id,
+                narration=f"Nhân vật đứng cạnh cột mốc số {number} nhưng hành động chưa rõ ràng.",
+                required_visuals={"actions": [action], "locations": ["Open field"]},
+                candidate_scene_ids=[scene_id],
+                sequence_index=number,
+            )
+            candidate = SceneCandidate(
+                candidate_id=f"candidate_{number:04d}",
+                scene_id=scene_id,
+                start_seconds=scene.start_time,
+                end_seconds=scene.start_time + 2,
+                match_score=0.3,
+            )
+            decision = EditDecision(
+                segment_id=segment_id,
+                event_id=event_id,
+                narration=segment.narration,
+                voice_start=float(index * 2),
+                voice_end=float(index * 2 + 2),
+                selected_candidate_id=candidate.candidate_id,
+                source_clips=[candidate],
+                alternatives=[candidate],
+            )
+            replacement_by_id[segment_id] = {
+                "segment_id": segment_id,
+                "scene_id": scene_id,
+                "narration": f"Nhân vật vẫy tay rõ ràng bên cột mốc số {number}.",
+                "required_visuals": {
+                    "characters": [],
+                    "actions": [action],
+                    "objects": [],
+                    "locations": ["Open field"],
+                },
+                "confidence": 0.9,
+            }
+            scenes.append(scene)
+            events.append(event)
+            segments.append(segment)
+            decisions.append(decision)
+
+        async def create_response(**kwargs):
+            text_parts = [
+                part.get("text", "")
+                for part in kwargs["messages"][0]["content"]
+                if part.get("type") == "text"
+            ]
+            requested_ids = re.findall(
+                r"SEGMENT (segment_\d+);",
+                "\n".join(text_parts),
+            )
+            payload = {"segments": [replacement_by_id[item] for item in requested_ids]}
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]
+            )
+
+        completions = SimpleNamespace(create=AsyncMock(side_effect=create_response))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        with patch("app.services.ai.review_analysis._client", return_value=client):
+            repaired, changed = await _repair_low_visual_narration(
+                segments,
+                events,
+                scenes,
+                decisions,
+                "story",
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            sum(before.narration != after.narration for before, after in zip(segments, repaired)),
+            13,
+        )
+        self.assertEqual(completions.create.await_count, 5)
 
     async def test_low_keyframe_repair_may_keep_the_scene_and_remove_unsupported_details(self) -> None:
         scene = AnalyzedScene(

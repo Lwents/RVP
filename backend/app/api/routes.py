@@ -18,12 +18,17 @@ from app.models.job import BgmMode, CustomBlurBox, DubbingRequest, JobCreateResp
 from app.models.review import (
     AnalyzedScene,
     EditDecision,
+    FinalReviewEvaluation,
     NarrationSegment,
     QualityIssue,
     ReviewQualityReport,
     SceneCandidate,
     StoryEvent,
     VerifiedReviewPackage,
+)
+from app.services.ai.character_names import (
+    build_character_name_registry,
+    canonicalize_nested_strings,
 )
 from app.services.processor import process_job
 from app.services.store import job_store
@@ -53,7 +58,9 @@ class ReviewDraftRequest(BaseModel):
     logo_y_percent: int = Field(default=8, ge=0, le=100)
     cinematic_bars_enabled: bool = False
     cinematic_bars_height_percent: int = Field(default=10, ge=0, le=40)
-    blur_box_enabled: bool = False
+    # Review adds its own subtitle track; hide a source video's hard subtitle
+    # by default so viewers never see the source line plus the review line.
+    blur_box_enabled: bool = True
     blur_box_y_percent: int = Field(default=80, ge=0, le=100)
     blur_box_height_percent: int = Field(default=13, ge=5, le=100)
     custom_blur_boxes: list[CustomBlurBox] = Field(default_factory=list)
@@ -97,6 +104,7 @@ class ReviewDraftResult(BaseModel):
     narration_segments: list[NarrationSegment] = Field(default_factory=list)
     edit_decision_list: list[EditDecision] = Field(default_factory=list)
     quality_report: ReviewQualityReport | None = None
+    final_evaluation: FinalReviewEvaluation | None = None
     artifact_paths: dict[str, str] = Field(default_factory=dict)
 
 
@@ -122,6 +130,12 @@ class ReviewSegmentPatchRequest(BaseModel):
 
 class ReviewRetryRequest(BaseModel):
     processing_mode: ProcessingMode | None = None
+
+
+class ReviewRenderRequest(BaseModel):
+    """A preview deliberately permits non-critical QA warnings."""
+
+    preview: bool = False
 
 
 REVIEW_JOBS_INDEX_FILE = Path(settings.storage_dir) / "review_jobs_index.json"
@@ -151,9 +165,40 @@ def _load_review_jobs() -> None:
             for item in data
             if isinstance(item, dict) and item.get("job_id")
         }
+        review_draft_jobs = {
+            job_id: _canonicalize_loaded_review_job_names(job)
+            for job_id, job in review_draft_jobs.items()
+        }
         _mark_interrupted_review_jobs()
     except Exception:
         review_draft_jobs = {}
+
+
+def _canonicalize_loaded_review_job_names(job: ReviewDraftJob) -> ReviewDraftJob:
+    """Migrate old drafts in memory so users need not rerun analysis to edit them."""
+
+    if job.result is None:
+        return job
+    context: dict = {"film_title": job.result.title}
+    context_file = Path(settings.storage_dir) / "review_jobs" / job.job_id / "ai_context.json"
+    if context_file.is_file():
+        try:
+            saved_context = json.loads(context_file.read_text(encoding="utf-8"))
+            if isinstance(saved_context, dict):
+                context.update(saved_context)
+        except (OSError, json.JSONDecodeError):
+            pass
+    observed_names = [
+        name
+        for scene in job.result.scenes
+        for name in scene.characters
+    ]
+    registry = build_character_name_registry(context, observed_names)
+    if not registry:
+        return job
+    data = job.model_dump()
+    data["result"] = canonicalize_nested_strings(data["result"], registry)
+    return ReviewDraftJob.model_validate(data)
 
 
 def _mark_interrupted_review_jobs() -> None:
@@ -421,6 +466,7 @@ def _review_result_from_package(
         narration_segments=package.narration_segments,
         edit_decision_list=package.edit_decision_list,
         quality_report=package.quality_report,
+        final_evaluation=package.final_evaluation,
         artifact_paths=package.artifact_paths,
     )
 
@@ -457,6 +503,150 @@ def _apply_review_measured_duration_gate(
         }
     )
     return accepted
+
+
+# These are useful editorial signals, but do not by themselves prove that the
+# rendered scene contradicts its narration.
+_REVIEW_SOFT_QA_CODES = {
+    "STYLE_MISMATCH",
+    "REPETITIVE_TRANSITIONS",
+    "UNVERIFIED_EVENT",
+}
+
+
+def _apply_review_hard_gate(report: ReviewQualityReport) -> ReviewQualityReport:
+    """Keep QA informative while only blocking genuine correctness failures.
+
+    A low aggregate score is not itself a reason to lock rendering. Rendering
+    is blocked when a specific narration/scene pair is still unverified after
+    repair, a clip is missing, chronology/duration is broken, or the story may
+    be factually wrong.
+    """
+
+    normalized = [
+        issue.model_copy(update={"severity": "warning"})
+        if issue.code in _REVIEW_SOFT_QA_CODES
+        else issue
+        for issue in report.issues
+    ]
+    hard_codes = {
+        "NO_CLIP",
+        "CHRONOLOGY",
+        "NARRATION_DURATION_MISMATCH",
+        "TARGET_DURATION_MISMATCH",
+        "VOICE_VIDEO_DRIFT",
+        "STORY_ARC_INCOMPLETE",
+        "NARRATIVE_LOGIC",
+        "SOURCE_COVERAGE",
+        "LOW_VISUAL_MATCH",
+        "POST_RENDER_VISUAL_MISMATCH",
+        "UNSUPPORTED_NARRATION",
+    }
+    has_hard_error = any(
+        issue.severity == "error" and issue.code in hard_codes
+        for issue in normalized
+    )
+    return report.model_copy(update={"passed": not has_hard_error, "issues": normalized})
+
+
+def _review_candidate_pool(decision: EditDecision) -> list[SceneCandidate]:
+    """Deduplicate the selected clip and alternatives without losing the best score."""
+
+    by_id: dict[str, SceneCandidate] = {}
+    for candidate in [*decision.source_clips, *decision.alternatives]:
+        current = by_id.get(candidate.candidate_id)
+        if current is None or candidate.match_score > current.match_score:
+            by_id[candidate.candidate_id] = candidate.model_copy(deep=True)
+    return list(by_id.values())
+
+
+def _evenly_spaced_indices(count: int, wanted: int) -> set[int]:
+    if wanted >= count:
+        return set(range(count))
+    if wanted <= 1:
+        return {0}
+    return {
+        min(count - 1, max(0, round(index * (count - 1) / (wanted - 1))))
+        for index in range(wanted)
+    }
+
+
+def _auto_optimize_review_result(
+    result: ReviewDraftResult,
+    style: str,
+) -> tuple[ReviewDraftResult, list[str]]:
+    """Repair deterministic issues without making another full AI review call.
+
+    It keeps evenly distributed story beats to reach the requested runtime and
+    chooses the highest-scoring available candidate that does not move backward
+    in source time.  New prose is intentionally not fabricated here: a too
+    short script remains a human/AI-writing issue instead of padded filler.
+    """
+
+    from app.services.ai.review_analysis import _review_narration_budget
+
+    optimized = result.model_copy(deep=True)
+    notes: list[str] = []
+    budget = _review_narration_budget(optimized.target_minutes, style)
+    segments = sorted(optimized.narration_segments, key=lambda item: item.sequence_index)
+    words = len(re.findall(r"\w+", optimized.narration_script, flags=re.UNICODE))
+    if words > budget.max_words and segments:
+        average_words = max(1.0, words / len(segments))
+        wanted = max(6, min(len(segments), round(budget.target_words / average_words)))
+        keep_ids = {
+            segments[index].segment_id
+            for index in _evenly_spaced_indices(len(segments), wanted)
+        }
+        optimized.narration_segments = [item for item in segments if item.segment_id in keep_ids]
+        optimized.edit_decision_list = [
+            item for item in optimized.edit_decision_list if item.segment_id in keep_ids
+        ]
+        optimized.beats = [item for item in optimized.beats if item.segment_id in keep_ids]
+        notes.append(f"Tự rút gọn {len(segments) - len(optimized.narration_segments)} câu để gần thời lượng mục tiêu.")
+    elif words < budget.min_words:
+        notes.append("Kịch bản ngắn hơn mục tiêu; cần AI viết thêm nội dung có bằng chứng, không tự chèn câu đệm.")
+
+    segment_order = {item.segment_id: index for index, item in enumerate(optimized.narration_segments)}
+    optimized.edit_decision_list.sort(key=lambda item: segment_order.get(item.segment_id, 10**9))
+    previous_start = float("-inf")
+    changed_candidates = 0
+    for decision in optimized.edit_decision_list:
+        pool = _review_candidate_pool(decision)
+        forward = [item for item in pool if item.start_seconds + 0.25 >= previous_start]
+        if not forward:
+            # Preserve the existing clip; the normal QA below will mark this as
+            # a real chronology problem rather than silently inventing a scene.
+            forward = list(decision.source_clips)
+        if not forward:
+            continue
+        chosen = max(forward, key=lambda item: (item.match_score, -item.start_seconds))
+        if not decision.source_clips or chosen.candidate_id != decision.source_clips[0].candidate_id:
+            changed_candidates += 1
+        decision.selected_candidate_id = chosen.candidate_id
+        decision.source_clips = [chosen]
+        previous_start = chosen.start_seconds
+        beat = next((item for item in optimized.beats if item.segment_id == decision.segment_id), None)
+        if beat is not None:
+            beat.selected_candidate_id = chosen.candidate_id
+            beat.scene_id = chosen.scene_id
+            beat.start_seconds = chosen.start_seconds
+            beat.end_seconds = chosen.end_seconds
+            beat.time_hint = _format_review_time_hint(chosen.start_seconds, chosen.end_seconds)
+            beat.match_score = chosen.match_score
+            beat.match_reason = chosen.match_reason
+            beat.thumbnail_url = chosen.thumbnail_url
+
+    if changed_candidates:
+        notes.append(f"Tự thay {changed_candidates} cảnh bằng phương án khớp hơn và đúng timeline.")
+    for index, segment in enumerate(optimized.narration_segments, start=1):
+        segment.sequence_index = index
+    optimized.narration_script = " ".join(
+        item.narration.strip() for item in optimized.narration_segments if item.narration.strip()
+    )
+    optimized.quality_report = _apply_review_hard_gate(
+        _recalculate_review_quality(optimized, style=style)
+    )
+    return optimized, notes
 
 
 def _review_scene_hints(decisions: list[EditDecision]) -> list[dict]:
@@ -532,6 +722,7 @@ def _build_review_render_request(request: ReviewDraftRequest, source_video: Path
 
 
 async def _process_review_draft_job(job_id: str) -> None:
+    from app.services.ai.final_review_evaluator import evaluate_final_review_video
     from app.services.ai.review_analysis import (
         build_verified_review_package,
         recenter_edl_on_verified_keyframes,
@@ -541,9 +732,13 @@ async def _process_review_draft_job(job_id: str) -> None:
         review_narration_tempo_factor,
         verify_rendered_review,
     )
-    from app.services.ai.voice import get_voice_engine
+    from app.services.ai.voice import get_voice_engine, load_voice_word_timings
     from app.services.media.ffmpeg import adjust_audio_tempo, extract_audio, find_ffmpeg, probe_video_duration
-    from app.services.media.review_renderer import render_movie_review_video, write_review_subtitles
+    from app.services.media.review_renderer import (
+        align_review_narration_ranges,
+        render_movie_review_video,
+        write_review_subtitles,
+    )
     from app.models.job import VoiceGender
     from app.services.subtitles.source import get_or_create_subtitles
 
@@ -614,6 +809,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             processing_mode=job.request.processing_mode,
         )
 
+        package.quality_report = _apply_review_hard_gate(package.quality_report)
         package.edit_decision_list = _review_decisions_with_urls(job_id, package.edit_decision_list)
         preliminary_result = _review_result_from_package(job_id, package)
         if not package.quality_report.passed:
@@ -630,11 +826,13 @@ async def _process_review_draft_job(job_id: str) -> None:
             return
 
         _update_review_job(job_id, progress=84, stage="Tạo giọng đọc từ kịch bản đã kiểm chứng")
+        word_timing_file = work_dir / "review_word_timings.json"
         narration_audio = await get_voice_engine().synthesize(
             package.narration_script,
             work_dir / "review_narration.mp3",
             VoiceGender.female,
             lambda stage, percent: _update_review_job(job_id, stage=stage, progress=max(84, min(90, percent))),
+            timing_file=word_timing_file,
         )
         narration_duration = await probe_video_duration(ffmpeg, narration_audio)
         if narration_duration <= 0:
@@ -655,7 +853,9 @@ async def _process_review_draft_job(job_id: str) -> None:
                     tempo_factor,
                 )
                 narration_duration = await probe_video_duration(ffmpeg, narration_audio)
+        word_timings = load_voice_word_timings(word_timing_file, narration_duration)
         if not _apply_review_measured_duration_gate(package, narration_duration):
+            package.quality_report = _apply_review_hard_gate(package.quality_report)
             (work_dir / "quality_report.json").write_text(
                 package.quality_report.model_dump_json(indent=2),
                 encoding="utf-8",
@@ -671,9 +871,22 @@ async def _process_review_draft_job(job_id: str) -> None:
                 result=_review_result_from_package(job_id, package),
             )
             return
-        package.edit_decision_list = rescale_edl_voice_timeline(
-            recenter_edl_on_verified_keyframes(package.edit_decision_list, package.scenes),
+        centered_decisions = recenter_edl_on_verified_keyframes(
+            package.edit_decision_list,
+            package.scenes,
+        )
+        narration_ranges = align_review_narration_ranges(
+            [item.narration for item in centered_decisions],
+            word_timings,
             narration_duration,
+        )
+        package.edit_decision_list = (
+            [
+                item.model_copy(update={"voice_start": start, "voice_end": end})
+                for item, (start, end) in zip(centered_decisions, narration_ranges)
+            ]
+            if len(narration_ranges) == len(centered_decisions)
+            else rescale_edl_voice_timeline(centered_decisions, narration_duration)
         )
         (work_dir / "edit_decision_list.json").write_text(
             json.dumps(
@@ -694,6 +907,8 @@ async def _process_review_draft_job(job_id: str) -> None:
             job.request.target_minutes,
             scene_hints,
             target_seconds=narration_duration,
+            subtitle_font_size=render_request.subtitle_font_size,
+            word_timings=word_timings,
         )
         await render_movie_review_video(
             ffmpeg,
@@ -715,6 +930,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             work_dir,
             processing_mode=job.request.processing_mode,
         )
+        post_report = _apply_review_hard_gate(post_report)
         if not post_report.passed:
             revised_decisions, changed = replace_failed_decisions_with_alternatives(
                 package.edit_decision_list,
@@ -745,6 +961,7 @@ async def _process_review_draft_job(job_id: str) -> None:
                     work_dir,
                     processing_mode=job.request.processing_mode,
                 )
+                post_report = _apply_review_hard_gate(post_report)
                 draft_file = retry_file
 
         package.quality_report = post_report
@@ -769,6 +986,19 @@ async def _process_review_draft_job(job_id: str) -> None:
         await asyncio.to_thread(shutil.copy2, draft_file, output_file)
         package.artifact_paths["review_final"] = str(output_file)
 
+        _update_review_job(job_id, progress=99, stage="AI giám khảo đang chấm video cuối")
+        package.final_evaluation = await evaluate_final_review_video(
+            output_file,
+            package,
+            work_dir,
+            review_subtitle_file=review_subtitle_file,
+            source_transcript_file=_review_source_transcript_file(work_dir),
+            word_timing_file=word_timing_file,
+        )
+        final_evaluation_artifact = work_dir / "final_evaluation.json"
+        if final_evaluation_artifact.is_file():
+            package.artifact_paths["final_evaluation"] = str(final_evaluation_artifact)
+
         result = _review_result_from_package(
             job_id,
             package,
@@ -779,7 +1009,7 @@ async def _process_review_draft_job(job_id: str) -> None:
             job_id,
             status="completed",
             progress=100,
-            stage="Hoan tat ban review phim",
+            stage=f"Hoàn tất bản review phim · AI chấm {package.final_evaluation.overall_score:.1f}/100",
             result=result,
         )
     except Exception as exc:
@@ -792,7 +1022,8 @@ async def _process_review_draft_job(job_id: str) -> None:
             )
 
 
-async def _render_existing_review_job(job_id: str) -> None:
+async def _render_existing_review_job(job_id: str, *, allow_preview: bool = False) -> None:
+    from app.services.ai.final_review_evaluator import evaluate_final_review_video
     from app.models.job import VoiceGender
     from app.services.ai.review_analysis import (
         recenter_edl_on_verified_keyframes,
@@ -801,9 +1032,13 @@ async def _render_existing_review_job(job_id: str) -> None:
         review_narration_tempo_factor,
         verify_rendered_review,
     )
-    from app.services.ai.voice import get_voice_engine
+    from app.services.ai.voice import get_voice_engine, load_voice_word_timings
     from app.services.media.ffmpeg import adjust_audio_tempo, find_ffmpeg, probe_video_duration
-    from app.services.media.review_renderer import render_movie_review_video, write_review_subtitles
+    from app.services.media.review_renderer import (
+        align_review_narration_ranges,
+        render_movie_review_video,
+        write_review_subtitles,
+    )
 
     job = review_draft_jobs.get(job_id)
     if not job or not job.result or not job.result.quality_report:
@@ -834,7 +1069,7 @@ async def _render_existing_review_job(job_id: str) -> None:
         # already-approved job non-deterministic and doubled the AI latency.
         # Keep the saved pre-render gate, then run independent QA on the actual
         # rendered frames below.
-        if not package.quality_report.passed:
+        if not package.quality_report.passed and not allow_preview:
             _update_review_job(
                 job_id,
                 status="needs_review",
@@ -846,11 +1081,13 @@ async def _render_existing_review_job(job_id: str) -> None:
         work_dir = Path(settings.storage_dir) / "review_jobs" / job_id
         work_dir.mkdir(parents=True, exist_ok=True)
         _update_review_job(job_id, status="processing", progress=84, stage="Tạo lại giọng đọc sau khi duyệt")
+        word_timing_file = work_dir / "review_word_timings.json"
         narration_audio = await get_voice_engine().synthesize(
             package.narration_script,
             work_dir / "review_narration.mp3",
             VoiceGender.female,
             lambda stage, percent: _update_review_job(job_id, stage=stage, progress=max(84, min(90, percent))),
+            timing_file=word_timing_file,
         )
         duration = await probe_video_duration(ffmpeg, narration_audio)
         if duration <= 0:
@@ -871,7 +1108,8 @@ async def _render_existing_review_job(job_id: str) -> None:
                     tempo_factor,
                 )
                 duration = await probe_video_duration(ffmpeg, narration_audio)
-        if not _apply_review_measured_duration_gate(package, duration):
+        word_timings = load_voice_word_timings(word_timing_file, duration)
+        if not _apply_review_measured_duration_gate(package, duration) and not allow_preview:
             (work_dir / "quality_report.json").write_text(
                 package.quality_report.model_dump_json(indent=2),
                 encoding="utf-8",
@@ -887,9 +1125,22 @@ async def _render_existing_review_job(job_id: str) -> None:
                 result=_review_result_from_package(job_id, package),
             )
             return
-        package.edit_decision_list = rescale_edl_voice_timeline(
-            recenter_edl_on_verified_keyframes(package.edit_decision_list, package.scenes),
+        centered_decisions = recenter_edl_on_verified_keyframes(
+            package.edit_decision_list,
+            package.scenes,
+        )
+        narration_ranges = align_review_narration_ranges(
+            [item.narration for item in centered_decisions],
+            word_timings,
             duration,
+        )
+        package.edit_decision_list = (
+            [
+                item.model_copy(update={"voice_start": start, "voice_end": end})
+                for item, (start, end) in zip(centered_decisions, narration_ranges)
+            ]
+            if len(narration_ranges) == len(centered_decisions)
+            else rescale_edl_voice_timeline(centered_decisions, duration)
         )
         (work_dir / "edit_decision_list.json").write_text(
             json.dumps(
@@ -900,12 +1151,15 @@ async def _render_existing_review_job(job_id: str) -> None:
             encoding="utf-8",
         )
         scene_hints = _review_scene_hints(package.edit_decision_list)
+        render_request = _build_review_render_request(job.request, source_video)
         subtitle_file = write_review_subtitles(
             package.narration_script,
             work_dir / "review_subtitles.srt",
             job.request.target_minutes,
             scene_hints,
             target_seconds=duration,
+            subtitle_font_size=render_request.subtitle_font_size,
+            word_timings=word_timings,
         )
         draft_file = work_dir / "review_draft_manual.mp4"
         _update_review_job(job_id, progress=90, stage="Render bản đã duyệt theo EDL")
@@ -919,7 +1173,7 @@ async def _render_existing_review_job(job_id: str) -> None:
             job.request.target_minutes,
             scene_hints,
             lambda percent: _update_review_job(job_id, progress=max(90, min(98, percent))),
-            _build_review_render_request(job.request, source_video),
+            render_request,
         )
         post_report = await verify_rendered_review(
             draft_file,
@@ -927,10 +1181,11 @@ async def _render_existing_review_job(job_id: str) -> None:
             work_dir,
             processing_mode=job.request.processing_mode,
         )
+        post_report = _apply_review_hard_gate(post_report)
         package.quality_report = post_report
         package.artifact_paths["review_draft"] = str(draft_file)
         package.artifact_paths["post_render_quality"] = str(work_dir / "quality_report_post_render.json")
-        if not post_report.passed:
+        if not post_report.passed and not allow_preview:
             _update_review_job(
                 job_id,
                 status="needs_review",
@@ -939,14 +1194,27 @@ async def _render_existing_review_job(job_id: str) -> None:
                 result=_review_result_from_package(job_id, package, subtitle_file_path=str(subtitle_file)),
             )
             return
-        final_file = work_dir / "review_final.mp4"
+        is_warning_preview = allow_preview and not post_report.passed
+        final_file = work_dir / ("review_preview.mp4" if is_warning_preview else "review_final.mp4")
         await asyncio.to_thread(shutil.copy2, draft_file, final_file)
-        package.artifact_paths["review_final"] = str(final_file)
+        package.artifact_paths["review_preview" if is_warning_preview else "review_final"] = str(final_file)
+        _update_review_job(job_id, progress=99, stage="AI giám khảo đang chấm video vừa render")
+        package.final_evaluation = await evaluate_final_review_video(
+            final_file,
+            package,
+            work_dir,
+            review_subtitle_file=subtitle_file,
+            source_transcript_file=_review_source_transcript_file(work_dir),
+            word_timing_file=word_timing_file,
+        )
+        final_evaluation_artifact = work_dir / "final_evaluation.json"
+        if final_evaluation_artifact.is_file():
+            package.artifact_paths["final_evaluation"] = str(final_evaluation_artifact)
         _update_review_job(
             job_id,
             status="completed",
             progress=100,
-            stage="Hoàn tất video review đã qua QA",
+            stage=f"Hoàn tất video review · AI chấm {package.final_evaluation.overall_score:.1f}/100",
             error=None,
             result=_review_result_from_package(
                 job_id,
@@ -968,6 +1236,23 @@ def _review_asr_timeout(video_duration_seconds: float) -> int:
     # short-video ASR timeout. Give Whisper time proportional to the movie length.
     duration_based_timeout = int(video_duration_seconds * 2.5)
     return min(max(settings.asr_timeout_seconds, duration_based_timeout, 1800), 6 * 60 * 60)
+
+
+def _review_source_transcript_file(work_dir: Path) -> Path | None:
+    """Prefer the source-language ASR artifact over a translated review SRT."""
+
+    return next(
+        (
+            path
+            for path in (
+                work_dir / "subtitles.grouped.srt",
+                work_dir / "subtitles.whisper.srt",
+                work_dir / "subtitles.source.srt",
+            )
+            if path.is_file() and path.stat().st_size > 0
+        ),
+        None,
+    )
 
 
 @router.post("/review/jobs", response_model=ReviewDraftJob, tags=["review"])
@@ -1015,6 +1300,30 @@ async def retry_review_draft_job(
     return updated
 
 
+@router.post("/review/jobs/{job_id}/cancel", response_model=ReviewDraftJob, tags=["review"])
+async def cancel_review_draft_job(job_id: str) -> ReviewDraftJob:
+    """Cancel a review task, including a request currently waiting on AI."""
+
+    job = review_draft_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Review job not found.")
+    if job.status not in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="Review job is not running.")
+
+    task = review_tasks.get(job_id)
+    if task is not None and not task.done():
+        task.cancel()
+    # A dev-server reload can lose the in-memory task while leaving a persisted
+    # job as processing.  Mark it stopped in either case so users are never
+    # trapped at a stale percentage and can retry from the UI.
+    return _update_review_job(
+        job_id,
+        status="failed",
+        stage="Đã hủy xử lý review",
+        error="Job đã được hủy bởi người dùng.",
+    )
+
+
 @router.get("/review/jobs", response_model=list[ReviewDraftJob], tags=["review"])
 async def list_review_draft_jobs() -> list[ReviewDraftJob]:
     return sorted(review_draft_jobs.values(), key=lambda item: item.created_at, reverse=True)
@@ -1057,8 +1366,98 @@ async def render_review_draft_job(job_id: str) -> ReviewDraftJob:
         raise HTTPException(status_code=409, detail="Review job đang chạy.")
     if not job.result.quality_report or not job.result.quality_report.passed:
         raise HTTPException(status_code=409, detail="QA chưa đạt 90/100 hoặc vẫn còn câu dưới 75%.")
-    updated = _update_review_job(job_id, status="processing", progress=83, stage="Đã nhận lệnh render bản duyệt", error=None)
+    pending_result = job.result.model_copy(deep=True)
+    pending_result.final_evaluation = None
+    pending_result.output_file_path = None
+    pending_result.output_video_url = None
+    for stale_artifact in ("review_final", "review_preview", "final_evaluation"):
+        pending_result.artifact_paths.pop(stale_artifact, None)
+    updated = _update_review_job(
+        job_id,
+        status="processing",
+        progress=83,
+        stage="Đã nhận lệnh render bản duyệt",
+        error=None,
+        result=pending_result,
+    )
     _start_review_task(job_id, _render_existing_review_job(job_id))
+    return updated
+
+
+@router.post("/review/jobs/{job_id}/optimize", response_model=ReviewDraftJob, tags=["review"])
+async def optimize_review_draft_job(job_id: str) -> ReviewDraftJob:
+    """Apply safe timeline/candidate/duration repairs to a saved draft."""
+
+    job = review_draft_jobs.get(job_id)
+    if not job or not job.result:
+        raise HTTPException(status_code=404, detail="Review job not found.")
+    if job.status in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="Review job is still processing.")
+
+    optimized, notes = _auto_optimize_review_result(job.result, job.request.style)
+    optimized.output_file_path = None
+    optimized.output_video_url = None
+    optimized.final_evaluation = None
+    for stale_artifact in (
+        "review_final",
+        "review_preview",
+        "review_draft",
+        "post_render_quality",
+        "final_evaluation",
+    ):
+        optimized.artifact_paths.pop(stale_artifact, None)
+    work_dir = Path(settings.storage_dir) / "review_jobs" / job_id
+    if work_dir.exists():
+        (work_dir / "verified_review_script.json").write_text(
+            json.dumps([item.model_dump(mode="json") for item in optimized.narration_segments], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (work_dir / "edit_decision_list.json").write_text(
+            json.dumps([item.model_dump(mode="json") for item in optimized.edit_decision_list], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (work_dir / "quality_report.json").write_text(
+            optimized.quality_report.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+    next_status = "ready_to_render" if optimized.quality_report.passed else "needs_review"
+    stage = "AI đã tự tối ưu bản nháp; sẵn sàng render" if next_status == "ready_to_render" else "AI đã tối ưu phần an toàn; còn lỗi nghiêm trọng cần duyệt"
+    if notes:
+        stage = f"{stage}. {notes[0]}"
+    return _update_review_job(
+        job_id,
+        status=next_status,
+        progress=83,
+        stage=stage,
+        error=None,
+        result=optimized,
+    )
+
+
+@router.post("/review/jobs/{job_id}/render-preview", response_model=ReviewDraftJob, tags=["review"])
+async def render_review_preview_job(job_id: str) -> ReviewDraftJob:
+    """Render a clearly labelled preview even while non-final QA issues remain."""
+
+    job = review_draft_jobs.get(job_id)
+    if not job or not job.result:
+        raise HTTPException(status_code=404, detail="Review job not found.")
+    if job.status in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="Review job is still processing.")
+    pending_result = job.result.model_copy(deep=True)
+    pending_result.final_evaluation = None
+    pending_result.output_file_path = None
+    pending_result.output_video_url = None
+    for stale_artifact in ("review_final", "review_preview", "final_evaluation"):
+        pending_result.artifact_paths.pop(stale_artifact, None)
+    updated = _update_review_job(
+        job_id,
+        status="processing",
+        progress=83,
+        stage="Đã nhận lệnh render bản xem trước",
+        error=None,
+        result=pending_result,
+    )
+    _start_review_task(job_id, _render_existing_review_job(job_id, allow_preview=True))
     return updated
 
 
@@ -1200,27 +1599,30 @@ async def patch_review_segment(
                 beat.candidates = decision.alternatives
 
     result.narration_script = " ".join(item.narration.strip() for item in result.beats if item.narration.strip())
+    # A small local edit has already been checked against its linked event.
+    # Do not call the expensive full-film narrative judge again for every
+    # keystroke/candidate selection; the next explicit optimization or final
+    # render is the appropriate full-review boundary.
     narrative_assessment = None
-    if narration is not None:
-        from app.services.ai.review_analysis import _judge_narrative_style
-
-        narrative_assessment = await _judge_narrative_style(
-            result.narration_segments,
-            result.events,
-            job.request.style,
-        )
-    result.quality_report = _recalculate_review_quality(
+    result.quality_report = _apply_review_hard_gate(_recalculate_review_quality(
         result,
         edited_segment_id=segment_id,
         style=job.request.style,
         narrative_assessment=narrative_assessment,
-    )
+    ))
     # Any accepted edit invalidates the previously rendered file. Keep the
     # file on disk for recovery, but never expose it as the output of the new
     # script/EDL; the user must render this revision again.
     result.output_file_path = None
     result.output_video_url = None
-    for stale_artifact in ("review_final", "review_draft", "post_render_quality"):
+    result.final_evaluation = None
+    for stale_artifact in (
+        "review_final",
+        "review_preview",
+        "review_draft",
+        "post_render_quality",
+        "final_evaluation",
+    ):
         result.artifact_paths.pop(stale_artifact, None)
     work_dir = Path(settings.storage_dir) / "review_jobs" / job_id
     if work_dir.exists():
@@ -1376,7 +1778,7 @@ def _recalculate_review_quality(
             )
         )
     passed = overall >= settings.review_quality_threshold and not any(issue.severity == "error" for issue in retained)
-    return previous.model_copy(
+    return _apply_review_hard_gate(previous.model_copy(
         update={
             "phase": "pre_render",
             "overall_score": round(overall, 2),
@@ -1389,7 +1791,7 @@ def _recalculate_review_quality(
             "passed": passed,
             "issues": retained,
         }
-    )
+    ))
 
 
 @router.get("/review/jobs/{job_id}/download", tags=["review"])
@@ -1448,6 +1850,67 @@ async def get_job(job_id: str) -> JobProgress:
     return job
 
 
+@router.post("/jobs/{job_id}/evaluate", response_model=JobProgress, tags=["jobs"])
+async def evaluate_job_output(job_id: str) -> JobProgress:
+    """Evaluate a completed dubbing job from retained artifacts, without rerendering."""
+
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.status != JobStatus.completed:
+        raise HTTPException(status_code=409, detail="Chỉ có thể chấm job đã hoàn tất.")
+    if not job.output_file_path:
+        raise HTTPException(status_code=404, detail="Job chưa có file video đầu ra để chấm.")
+    output_file = Path(job.output_file_path)
+    if not output_file.is_file() or output_file.stat().st_size <= 0:
+        raise HTTPException(status_code=404, detail="File video đầu ra không còn tồn tại.")
+
+    from app.services.ai.final_dubbing_evaluator import (
+        discover_dubbing_evaluation_artifacts,
+        dubbing_evaluation_stage,
+        emergency_dubbing_evaluation,
+        evaluate_final_dubbing_video,
+    )
+
+    work_dir = Path(settings.storage_dir) / "jobs" / job_id
+    try:
+        artifacts = discover_dubbing_evaluation_artifacts(work_dir)
+        evaluation = await evaluate_final_dubbing_video(
+            output_file,
+            work_dir,
+            subtitle_file=artifacts.subtitle_file,
+            source_subtitle_file=artifacts.source_subtitle_file,
+            narration_audio=artifacts.narration_audio,
+            source_video=artifacts.source_video,
+            subtitles_expected=job.request.hard_subtitles,
+            narration_expected=job.request.hard_subtitles,
+            target_subtitle_burned=(
+                job.request.hard_subtitles
+                and not job.request.source_has_hard_subtitles
+            ),
+            translation_expected=(
+                settings.translation_engine.lower() != "passthrough"
+                and (
+                    job.request.source_language == "auto"
+                    or job.request.source_language.lower() != settings.target_language.lower()
+                )
+            ),
+            source_language=job.request.source_language,
+            target_language=settings.target_language,
+            video_speed=job.request.video_speed,
+        )
+    except Exception as exc:
+        # Return and persist an explicit fallback scorecard. The completed
+        # video/status must survive an evaluator implementation error.
+        evaluation = emergency_dubbing_evaluation(str(exc))
+
+    return job_store.update(
+        job_id,
+        stage=dubbing_evaluation_stage(evaluation),
+        final_evaluation=evaluation,
+    )
+
+
 @router.post("/jobs/{job_id}/retry", response_model=JobCreateResponse, tags=["jobs"])
 async def retry_job(
     job_id: str,
@@ -1500,6 +1963,10 @@ async def retry_job(
             }
         )
     request = DubbingRequest.model_validate({**job.request.model_dump(), **request_updates})
+    try:
+        (Path(settings.storage_dir) / "jobs" / job_id / "final_evaluation.json").unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"Cannot remove stale dubbing evaluation before retry: {exc}")
     job = job_store.update(
         job_id,
         request=request,
@@ -1508,6 +1975,7 @@ async def retry_job(
         error=None,
         output_video_url=None,
         output_file_path=None,
+        final_evaluation=None,
         completed_at=None,
     )
     import asyncio

@@ -6,6 +6,15 @@ from pydantic import BaseModel, Field
 
 
 StoryArcRole = Literal["hook", "context", "conflict", "climax", "resolution"]
+FinalReviewCriterionKey = Literal[
+    "content_fidelity",
+    "translation_accuracy",
+    "av_subtitle_sync",
+    "narrative_coherence",
+    "technical_quality",
+    "safety_compliance",
+]
+FinalReviewVerdict = Literal["excellent", "good", "needs_improvement", "poor"]
 
 
 class ReviewEvidence(BaseModel):
@@ -119,6 +128,32 @@ class ReviewQualityReport(BaseModel):
     issues: list[QualityIssue] = Field(default_factory=list)
 
 
+class FinalReviewCriterion(BaseModel):
+    key: FinalReviewCriterionKey
+    label: str
+    score: float = Field(default=0.0, ge=0.0, le=100.0)
+    weight_percent: float = Field(default=0.0, ge=0.0, le=100.0)
+    passed: bool = False
+    feedback: str = ""
+    findings: list[str] = Field(default_factory=list)
+
+
+class FinalReviewEvaluation(BaseModel):
+    """Independent, advisory scorecard for the actual final rendered video."""
+
+    phase: Literal["final_evaluation"] = "final_evaluation"
+    overall_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    verdict: FinalReviewVerdict = "poor"
+    passed: bool = False
+    summary: str = ""
+    strengths: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    criteria: list[FinalReviewCriterion] = Field(default_factory=list)
+    model: str = ""
+    fallback_used: bool = False
+    evaluated_at: str = ""
+
+
 class VerifiedReviewPackage(BaseModel):
     title: str
     target_minutes: int
@@ -132,4 +167,5 @@ class VerifiedReviewPackage(BaseModel):
     narration_segments: list[NarrationSegment] = Field(default_factory=list)
     edit_decision_list: list[EditDecision] = Field(default_factory=list)
     quality_report: ReviewQualityReport
+    final_evaluation: FinalReviewEvaluation | None = None
     artifact_paths: dict[str, str] = Field(default_factory=dict)

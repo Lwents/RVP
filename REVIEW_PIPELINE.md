@@ -11,8 +11,9 @@ Luồng Review phim không còn dựng trực tiếp từ transcript. Mỗi job 
 7. Gemini chấm lại độ liền mạch, quan hệ chuyển đoạn và mức bám phong cách đã chọn (`Kể chuyện`, `Nhanh gọn`, `Cảm xúc`, `Duyên hài`). Nếu chưa đạt, kịch bản được yêu cầu viết lại tối đa hai lần theo đúng phản hồi và vẫn bị chặn QA nếu còn lỗi.
 8. Chấm visual-semantic bằng nhiều keyframe, tạo top 3 ứng viên và `edit_decision_list.json`. Timestamp cảnh được chọn không được đi lùi so với câu trước.
 9. Chặn render khi QA dưới 90/100, sai thời lượng, thiếu mạch truyện/phong cách, thiếu phủ timeline hoặc bất kỳ câu nào khớp cảnh dưới 0,75.
-10. Tạo giọng đọc rồi đo thời lượng file thật. Chỉ khi thời lượng nằm trong ±10% mục tiêu mới render theo đúng duration voice/EDL; tuyệt đối không kéo một voice 1 phút thành video 8 phút.
+10. Tạo giọng đọc rồi đo thời lượng file thật. Subtitle review bám `WordBoundary` của chính file TTS và được scale lại nếu voice đổi tempo; chỉ khi thời lượng nằm trong ±10% mục tiêu mới render theo đúng duration voice/EDL, tuyệt đối không kéo một voice 1 phút thành video 8 phút.
 11. Sau render, Gemini kiểm tra ba frame trong mỗi cửa sổ voice. Cảnh lỗi được thử phương án thay thế đủ điểm; không tạo `review_final.mp4` nếu post-render QA vẫn không đạt.
+12. Video cuối được một lượt AI giám khảo độc lập chấm theo độ đúng nội dung, độ chính xác bản dịch, đồng bộ hình–voice–subtitle, mạch kể, chất lượng kỹ thuật và an toàn nội dung. Scorecard này mang tính tư vấn, được lưu riêng và không ghi đè báo cáo QA dựng phim.
 
 ## Hợp đồng thời lượng và phong cách
 
@@ -49,6 +50,7 @@ Trong `backend/storage/review_jobs/<job_id>/`:
 - `quality_report.json`
 - `review_draft.mp4`
 - `quality_report_post_render.json`
+- `final_evaluation.json`
 - `review_final.mp4` (chỉ có khi QA đạt)
 
 Trên giao diện, mỗi câu có thumbnail, timestamp nguồn/voice, điểm/lý do khớp, ba cảnh thay thế và ô sửa lời. Câu dưới 75% được đánh đỏ. Lời sửa được Gemini kiểm chứng lại với event và keyframe trước khi lưu.

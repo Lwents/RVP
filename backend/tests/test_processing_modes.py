@@ -54,6 +54,7 @@ class ProcessingModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dubbing.processing_mode, "balanced")
         self.assertEqual(review.processing_mode, "balanced")
         self.assertEqual(review.style, "story")
+        self.assertTrue(review.blur_box_enabled)
 
         supported_review_styles = ("story", "fast", "emotional", "funny")
         self.assertEqual(
@@ -68,6 +69,8 @@ class ProcessingModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(balanced.whisper_beam_size, quality.whisper_beam_size)
         self.assertLess(fast.review_max_scenes, balanced.review_max_scenes)
         self.assertLess(balanced.review_max_scenes, quality.review_max_scenes)
+        self.assertLess(fast.review_keyframes_per_scene, balanced.review_keyframes_per_scene)
+        self.assertLess(balanced.review_keyframes_per_scene, quality.review_keyframes_per_scene)
         self.assertFalse(fast.use_demucs)
         self.assertTrue(balanced.use_demucs)
         self.assertTrue(quality.use_demucs)

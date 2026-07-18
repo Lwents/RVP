@@ -79,6 +79,41 @@ class StaticSubtitleBlurTests(unittest.TestCase):
         self.assertNotIn(".cleaned", " ".join(command))
         self.assertNotIn("T-", graph)
 
+    def test_review_render_disables_all_automatic_subtitle_wrapping(self) -> None:
+        request = DubbingRequest(
+            local_file_path="source.mp4",
+            hard_subtitles=True,
+            blur_box_enabled=True,
+            logo_enabled=False,
+            bgm_mode=BgmMode.none,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            subtitle_file = work_dir / "subtitles.srt"
+            subtitle_file.write_text(
+                "1\n00:00:00,000 --> 00:00:02,000\nMột dòng phụ đề review.\n\n",
+                encoding="utf-8",
+            )
+            command = _build_review_output_command(
+                "ffmpeg",
+                work_dir / "silent.mp4",
+                work_dir / "narration.mp3",
+                subtitle_file,
+                work_dir / "output.mp4",
+                work_dir,
+                2.0,
+                request,
+            )
+            ass_text = (work_dir / "review_subtitles.positioned.ass").read_text(encoding="utf-8")
+
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("wrap_unicode=0", graph)
+        self.assertIn("WrapStyle: 2", ass_text)
+        dialogue = next(line for line in ass_text.splitlines() if line.startswith("Dialogue:"))
+        self.assertIn(r"\q2", dialogue)
+        self.assertNotIn(r"\N", dialogue)
+
 
 if __name__ == "__main__":
     unittest.main()

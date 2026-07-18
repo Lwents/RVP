@@ -31,6 +31,14 @@ from app.models.review import (
     StoryEvent,
     VerifiedReviewPackage,
 )
+from app.services.ai.character_names import (
+    CharacterNameRegistry,
+    build_character_name_registry,
+    canonical_character_name,
+    canonicalize_character_text,
+    character_name_contract,
+)
+from app.services.ai.context import analyze_video_context
 from app.services.media.ffmpeg import find_ffmpeg, probe_video_duration
 from app.services.presets import get_processing_profile
 from app.services.subtitles.timing import SubtitleEvent, parse_srt
@@ -159,6 +167,12 @@ _GENERIC_SEQUENCE_TRANSITIONS = {
     "rồi",
 }
 
+_DIALOGUE_CLAIM_RE = re.compile(
+    r"\b(?:nói|kể|hỏi|trả\s+lời|giải\s+thích|tiết\s+lộ|đề\s+nghị|cảnh\s+báo|"
+    r"thông\s+báo|thừa\s+nhận|hứa|ra\s+lệnh|cho\s+biết|tranh\s+cãi|gọi|quyết\s+định)\b",
+    flags=re.IGNORECASE,
+)
+
 
 def _strip_redundant_generic_transitions(
     segments: list[NarrationSegment],
@@ -263,6 +277,12 @@ async def build_verified_review_package(
     events = parse_srt(transcript_file)
     profile = get_processing_profile(processing_mode)
     scene_dir = work_dir / "review_scenes"
+    # Subtitle translation usually creates this context first.  Source-language
+    # reviews do not, so start the same whole-film character pass here and let
+    # it run while OpenCV detects scenes.
+    context_task = asyncio.create_task(
+        analyze_video_context(video_path, events, work_dir)
+    )
     on_progress("Phát hiện shot và lấy keyframe toàn bộ phim", 53)
     scenes = await asyncio.to_thread(
         _detect_scenes_and_keyframes,
@@ -274,7 +294,15 @@ async def build_verified_review_package(
         profile.review_keyframes_per_scene,
     )
     if not scenes:
+        context_task.cancel()
         raise RuntimeError("Không phát hiện được scene/keyframe hợp lệ trong video.")
+
+    try:
+        film_context = await context_task
+    except Exception as exc:
+        print(f"Review character context fallback: {exc}")
+        film_context = {}
+    character_names = build_character_name_registry(film_context)
 
     on_progress("AI đa phương thức phân tích hình ảnh, thoại và chữ trên màn hình", 60)
     scenes = await _analyze_scene_batches(
@@ -283,11 +311,19 @@ async def build_verified_review_package(
         on_progress,
         batch_size=profile.review_scene_batch_size,
         concurrency=profile.review_ai_concurrency,
+        character_names=character_names,
     )
+    character_names = build_character_name_registry(
+        film_context,
+        (name for scene in scenes for name in scene.characters),
+    )
+    scenes = _canonicalize_scene_character_names(scenes, character_names)
     scenes = _reconcile_character_identities(scenes)
+    scenes = _canonicalize_scene_character_names(scenes, character_names)
 
     on_progress("Lập timeline sự kiện và kiểm tra danh tính nhân vật", 71)
     story_events = await _build_event_timeline(scenes, target_minutes, style)
+    story_events = _canonicalize_story_event_names(story_events, character_names)
     if not story_events:
         raise RuntimeError("Không tạo được timeline sự kiện có bằng chứng.")
 
@@ -298,7 +334,10 @@ async def build_verified_review_package(
         target_minutes,
         style,
         notes,
+        character_names=character_names,
     )
+    metadata = _canonicalize_review_metadata(metadata, character_names)
+    segments = _canonicalize_narration_names(segments, character_names)
     segments = _normalize_segments(segments, story_events, target_minutes)
     if not segments:
         raise RuntimeError("AI không tạo được câu review gắn với event hợp lệ.")
@@ -337,6 +376,13 @@ async def build_verified_review_package(
         target_minutes,
         narrative_assessment,
         batch_size=profile.review_scene_batch_size,
+        character_names=character_names,
+    )
+    segments = _canonicalize_narration_names(segments, character_names)
+    decisions = _canonicalize_edit_decision_names(
+        decisions,
+        segments,
+        character_names,
     )
     report = _quality_report(
         segments,
@@ -499,6 +545,7 @@ async def _analyze_scene_batches(
     *,
     batch_size: int | None = None,
     concurrency: int = 1,
+    character_names: CharacterNameRegistry | None = None,
 ) -> list[AnalyzedScene]:
     batch_size = max(1, min(8, batch_size or settings.review_scene_batch_size))
     batches = [scenes[index : index + batch_size] for index in range(0, len(scenes), batch_size)]
@@ -507,7 +554,11 @@ async def _analyze_scene_batches(
     async def analyze(index: int, batch: list[AnalyzedScene]) -> tuple[int, list[AnalyzedScene]]:
         async with semaphore:
             try:
-                analyzed = await _analyze_scene_batch(batch, transcript_events)
+                analyzed = await _analyze_scene_batch(
+                    batch,
+                    transcript_events,
+                    character_names=character_names,
+                )
             except Exception as exc:
                 print(f"Review scene analysis fallback for batch {index + 1}: {exc}")
                 analyzed = batch
@@ -530,6 +581,8 @@ async def _analyze_scene_batches(
 async def _analyze_scene_batch(
     scenes: list[AnalyzedScene],
     transcript_events: list[SubtitleEvent],
+    *,
+    character_names: CharacterNameRegistry | None = None,
 ) -> list[AnalyzedScene]:
     client = _client()
     prompt = (
@@ -540,6 +593,13 @@ async def _analyze_scene_batch(
         "characters, location, visible_actions, dialogue_summary, event_summary, important_objects, emotion, confidence, "
         "temporal_mode, credits, evidence:{visual:[],dialogue:[],subtitle:[]}. Evidence phải ngắn và cụ thể."
     )
+    if character_names:
+        prompt += (
+            " CHARACTER_NAME_CONTRACT dưới đây chỉ khóa cách viết tên, không phải bằng chứng rằng nhân vật có mặt. "
+            "Khi ảnh/thoại đủ chứng minh một nhân vật đã biết, characters và mọi câu mô tả phải chép đúng canonical_names; "
+            "không dịch nghĩa tên, không dùng alias. Nếu chưa đủ bằng chứng nhận dạng thì vẫn dùng UNKNOWN. "
+            f"CHARACTER_NAME_CONTRACT={json.dumps(character_name_contract(character_names), ensure_ascii=False)}"
+        )
     content: list[dict] = [{"type": "text", "text": prompt}]
     for scene in scenes:
         overlap = _subtitle_overlap(transcript_events, scene.start_time, scene.end_time)
@@ -566,7 +626,7 @@ async def _analyze_scene_batch(
             )
 
     response = await client.chat.completions.create(
-        model=settings.ai_model,
+        model=settings.review_ai_model,
         messages=[{"role": "user", "content": content}],
         response_format={"type": "json_object"},
         temperature=0.1,
@@ -586,8 +646,26 @@ async def _analyze_scene_batch(
         if original is None:
             continue
         visual = _string_list(_dict(item.get("evidence")).get("visual"))
-        dialogue = _string_list(_dict(item.get("evidence")).get("dialogue"))
-        subtitle = _string_list(_dict(item.get("evidence")).get("subtitle"))
+        # Keep the timestamped source transcript collected before the vision
+        # request. The model may return only a short paraphrase (or omit its
+        # dialogue evidence entirely); replacing the original here used to
+        # discard the exact subtitle needed by later narration/scene QA.
+        dialogue = list(
+            dict.fromkeys(
+                [
+                    *original.evidence.dialogue,
+                    *_string_list(_dict(item.get("evidence")).get("dialogue")),
+                ]
+            )
+        )
+        subtitle = list(
+            dict.fromkeys(
+                [
+                    *original.evidence.subtitle,
+                    *_string_list(_dict(item.get("evidence")).get("subtitle")),
+                ]
+            )
+        )
         analyzed.append(
             original.model_copy(
                 update={
@@ -649,7 +727,7 @@ async def _build_event_timeline(
     )
     try:
         response = await _client().chat.completions.create(
-            model=settings.ai_model,
+            model=settings.review_ai_model,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(compact, ensure_ascii=False)},
@@ -750,6 +828,158 @@ def _is_credits_only_scene(scene: AnalyzedScene) -> bool:
         or meaningful_subtitle_evidence
     )
     return not has_plot_evidence
+
+
+def _canonicalize_scene_character_names(
+    scenes: list[AnalyzedScene],
+    registry: CharacterNameRegistry | None,
+) -> list[AnalyzedScene]:
+    if not registry:
+        return scenes
+    normalized: list[AnalyzedScene] = []
+    for scene in scenes:
+        characters = _canonical_name_list(scene.characters, registry)
+        normalized.append(
+            scene.model_copy(
+                update={
+                    "characters": characters,
+                    "location": canonicalize_character_text(scene.location, registry),
+                    "visible_actions": _canonical_text_list(scene.visible_actions, registry),
+                    "dialogue_summary": canonicalize_character_text(scene.dialogue_summary, registry),
+                    "event_summary": canonicalize_character_text(scene.event_summary, registry),
+                    "important_objects": _canonical_text_list(scene.important_objects, registry),
+                    "emotion": canonicalize_character_text(scene.emotion, registry),
+                    "evidence": ReviewEvidence(
+                        visual=_canonical_text_list(scene.evidence.visual, registry),
+                        dialogue=_canonical_text_list(scene.evidence.dialogue, registry),
+                        subtitle=_canonical_text_list(scene.evidence.subtitle, registry),
+                    ),
+                }
+            )
+        )
+    return normalized
+
+
+def _canonicalize_story_event_names(
+    events: list[StoryEvent],
+    registry: CharacterNameRegistry | None,
+) -> list[StoryEvent]:
+    if not registry:
+        return events
+    return [
+        event.model_copy(
+            update={
+                "characters": _canonical_name_list(event.characters, registry),
+                "summary": canonicalize_character_text(event.summary, registry),
+                "cause": canonicalize_character_text(event.cause, registry),
+                "consequence": canonicalize_character_text(event.consequence, registry),
+            }
+        )
+        for event in events
+    ]
+
+
+def _canonicalize_narration_names(
+    segments: list[NarrationSegment],
+    registry: CharacterNameRegistry | None,
+) -> list[NarrationSegment]:
+    if not registry:
+        return segments
+    normalized: list[NarrationSegment] = []
+    for segment in segments:
+        narration = canonicalize_character_text(segment.narration, registry)
+        required = segment.required_visuals
+        normalized.append(
+            segment.model_copy(
+                update={
+                    "narration": narration,
+                    "required_visuals": RequiredVisuals(
+                        characters=_canonical_name_list(required.characters, registry),
+                        actions=_canonical_text_list(required.actions, registry),
+                        objects=_canonical_text_list(required.objects, registry),
+                        locations=_canonical_text_list(required.locations, registry),
+                    ),
+                    "forbidden_visuals": _canonical_text_list(segment.forbidden_visuals, registry),
+                    "purpose": canonicalize_character_text(segment.purpose, registry),
+                    "estimated_voice_duration": _estimated_voice_duration(narration),
+                }
+            )
+        )
+    return normalized
+
+
+def _canonicalize_edit_decision_names(
+    decisions: list[EditDecision],
+    segments: list[NarrationSegment],
+    registry: CharacterNameRegistry | None,
+) -> list[EditDecision]:
+    if not registry:
+        return decisions
+    narration_by_id = {segment.segment_id: segment.narration for segment in segments}
+
+    def normalize_candidate(candidate: SceneCandidate) -> SceneCandidate:
+        return candidate.model_copy(
+            update={
+                "match_reason": canonicalize_character_text(candidate.match_reason, registry)
+            }
+        )
+
+    return [
+        decision.model_copy(
+            update={
+                "narration": narration_by_id.get(
+                    decision.segment_id,
+                    canonicalize_character_text(decision.narration, registry),
+                ),
+                "source_clips": [normalize_candidate(item) for item in decision.source_clips],
+                "alternatives": [normalize_candidate(item) for item in decision.alternatives],
+            }
+        )
+        for decision in decisions
+    ]
+
+
+def _canonicalize_review_metadata(
+    metadata: dict,
+    registry: CharacterNameRegistry | None,
+) -> dict:
+    if not registry or not isinstance(metadata, dict):
+        return metadata
+    normalized = dict(metadata)
+    for key in ("title", "hook", "summary", "thumbnail_text"):
+        if key in normalized:
+            normalized[key] = canonicalize_character_text(str(normalized[key] or ""), registry)
+    tags = normalized.get("tags")
+    if isinstance(tags, list):
+        normalized["tags"] = [
+            canonical_character_name(str(tag), registry)
+            for tag in tags
+        ]
+    return normalized
+
+
+def _canonical_name_list(
+    values: list[str],
+    registry: CharacterNameRegistry,
+) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        canonical = canonical_character_name(value, registry)
+        if canonical and canonical not in result:
+            result.append(canonical)
+    return result
+
+
+def _canonical_text_list(
+    values: list[str],
+    registry: CharacterNameRegistry,
+) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        canonical = canonicalize_character_text(value, registry)
+        if canonical and canonical not in result:
+            result.append(canonical)
+    return result
 
 
 def _reconcile_character_identities(scenes: list[AnalyzedScene]) -> list[AnalyzedScene]:
@@ -1275,6 +1505,30 @@ def _narration_meets_budget(
     )
 
 
+def _narration_requires_dialogue_evidence(text: str) -> bool:
+    return bool(_DIALOGUE_CLAIM_RE.search(unicodedata.normalize("NFC", text or "")))
+
+
+def _scene_dialogue_evidence(scene: AnalyzedScene) -> list[str]:
+    values = [
+        scene.dialogue_summary,
+        *scene.evidence.dialogue,
+        *scene.evidence.subtitle,
+    ]
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = " ".join(value.split())
+        if not normalized or normalized.upper() in {"UNKNOWN", "[KHÔNG CÓ]"}:
+            continue
+        key = normalized.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(normalized)
+    return cleaned
+
+
 def _visual_atomicity_issues(
     segments: list[NarrationSegment],
     scenes: dict[str, AnalyzedScene] | list[AnalyzedScene],
@@ -1325,6 +1579,13 @@ def _visual_atomicity_issues(
             + scene.important_objects
             + [scene.location, scene.event_summary, scene.dialogue_summary]
         ).casefold()
+        if (
+            _narration_requires_dialogue_evidence(segment.narration)
+            and not _scene_dialogue_evidence(scene)
+        ):
+            issues.append(
+                f"segment {segment.sequence_index}: dialogue claim lacks source subtitle/dialogue evidence"
+            )
         missing_named_characters = [
             name
             for name in known_character_names
@@ -1452,6 +1713,8 @@ async def _repair_visual_atomic_segments(
     events: list[StoryEvent],
     scenes: list[AnalyzedScene],
     style: str,
+    *,
+    character_names: CharacterNameRegistry | None = None,
 ) -> list[NarrationSegment]:
     """Repair only invalid visual sentences instead of regenerating the script.
 
@@ -1466,7 +1729,7 @@ async def _repair_visual_atomic_segments(
     repaired = list(segments)
     for _ in range(2):
         invalid_indices = _visual_atomicity_invalid_indices(repaired, scene_by_id)
-        if not invalid_indices or len(invalid_indices) > 24:
+        if not invalid_indices:
             break
         changed = False
         for offset in range(0, len(invalid_indices), 8):
@@ -1536,6 +1799,7 @@ async def _repair_visual_atomic_segments(
                                 "location": scene.location,
                                 "emotion": scene.emotion,
                                 "dialogue": scene.dialogue_summary,
+                                "source_dialogue_subtitle": _scene_dialogue_evidence(scene),
                             }
                             for scene in linked
                         ],
@@ -1549,16 +1813,25 @@ async def _repair_visual_atomic_segments(
                 "{characters,actions,objects,locations}, candidate_scene_ids, confidence, purpose. "
                 "candidate_scene_ids phai co dung 1 scene_id; required_visuals.actions phai co dung 1 action "
                 "copy nguyen van tu scene do; moi required fact khac cung phai copy tu scene do. Narration chi "
-                "mo ta action trung tam nay, la mot cau, khong ke them action cu trong menh de sau-khi/truc-khi/"
+                "mo ta action trung tam nay, la mot cau, khong ke them action cu trong menh de sau-khi/truoc-khi/"
                 "trong-khi. Uu tien mo truc tiep bang chu the/dia diem/hanh dong; khong them 'Sau do' hay xoay vong "
-                "tu dong nghia. Chi dung quan he chuyen tiep neu scene_facts chung minh. So tu moi cau nam "
+                "tu dong nghia. Cam dung 'va/nhung/roi' de noi them chu the hoac hanh dong thu hai. "
+                "Chi dung quan he chuyen tiep neu scene_facts chung minh. So tu moi cau nam "
                 "trong target_words +/-3, giu dung selected_style, khong them chi tiet ngoai scene_facts. "
+                "Neu narration ke noi dung noi/hoi/giai thich/tiet lo/de nghi/canh bao/tranh cai/quyet dinh thi "
+                "dialogue hoac source_dialogue_subtitle cua CHINH scene do phai truc tiep xac nhan y nghia; "
+                "neu khong co sub/thoai phu hop thi viet lai thanh hanh dong nhin thay, cam suy dien loi noi. "
                 "Khong duoc lap lai cung scene/action cua previous_action hoac next_action; neu cau cu bi lap, "
                 "phai chon mot action khac co that trong scene_facts va van nam dung thu tu source."
             )
+            if character_names:
+                prompt += (
+                    " Moi ten nhan vat phai chep dung CHARACTER_NAME_CONTRACT, khong dich ten va khong dung alias: "
+                    + json.dumps(character_name_contract(character_names), ensure_ascii=False)
+                )
             try:
                 response = await _client().chat.completions.create(
-                    model=settings.ai_model,
+                    model=settings.review_ai_model,
                     messages=[
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
@@ -1601,6 +1874,10 @@ async def _repair_visual_atomic_segments(
                         "story_role": original.story_role,
                     }
                 )
+                candidate = _canonicalize_narration_names(
+                    [candidate],
+                    character_names,
+                )[0]
                 original_words = len(re.findall(r"\w+", original.narration, flags=re.UNICODE))
                 candidate_words = len(re.findall(r"\w+", candidate.narration, flags=re.UNICODE))
                 if abs(candidate_words - original_words) > 3:
@@ -1774,7 +2051,7 @@ async def _judge_narrative_style(
     )
     try:
         response = await _client().chat.completions.create(
-            model=settings.ai_model,
+            model=settings.review_ai_model,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(judge_input, ensure_ascii=False)},
@@ -1811,6 +2088,8 @@ async def _write_verified_narration(
     target_minutes: int,
     style: str,
     notes: str | None,
+    *,
+    character_names: CharacterNameRegistry | None = None,
 ) -> tuple[dict, list[NarrationSegment], NarrativeStyleAssessment]:
     scene_by_id = {scene.scene_id: scene for scene in scenes}
     budget = _review_narration_budget(target_minutes, style)
@@ -1871,7 +2150,11 @@ async def _write_verified_narration(
         "la list co DUNG 1 scene_id thuoc event, va narration chi duoc mo ta nguoi/hang dong/vat the/boi canh co "
         "trong scene_facts cua scene_id duy nhat do. Cam gop chuyen canh, cam ke hanh dong tu scene khac trong cung "
         "mot segment. required_visuals.actions bat buoc co DUNG 1 action copy nguyen van tu scene do; narration "
-        "chi xoay quanh action trung tam nay. Chi segment DAU TIEN cua event moi duoc lam cau chuyen doan. Ben trong "
+        "chi xoay quanh action trung tam nay. Neu narration ke noi dung noi/hoi/giai thich/tiet lo/de nghi/canh bao/"
+        "tranh cai/quyet dinh thi dialogue hoac evidence.dialogue/subtitle cua CHINH scene do phai truc tiep xac "
+        "nhan; neu khong co sub/thoai phu hop thi viet lai thanh hanh dong nhin thay, cam suy dien noi dung loi noi. "
+        "Cam dung 'va/nhung/roi' de noi them chu the hoac hanh dong thu hai. "
+        "Chi segment DAU TIEN cua event moi duoc lam cau chuyen doan. Ben trong "
         "cung event, mo cau truc tiep bang chu the/dia diem/hanh dong; khong lap 'Sau do', khong thay bang mot vong "
         "tu dong nghia. Tu noi nguyen nhan, doi lap, dong thoi chi duoc dung khi evidence chung minh va khong duoc "
         "ke them action khac trong menh de 'sau khi X', 'truoc khi X', 'trong khi X'. "
@@ -1881,10 +2164,17 @@ async def _write_verified_narration(
         "story_role,required_visuals{characters,actions,objects,locations},forbidden_visuals,candidate_scene_ids,"
         "confidence,purpose. Hook khong duoc tiet lo cao trao hoac ket phim. Summary phai tom tat dung thu tu cau chuyen."
     )
+    if character_names:
+        prompt += (
+            " CHARACTER_NAME_CONTRACT la bat buoc cho title, hook, summary, narration, purpose va required_visuals: "
+            "chi dung dung canonical_names, khong dich nghia ten rieng, khong viet alias. "
+            f"CHARACTER_NAME_CONTRACT={json.dumps(character_name_contract(character_names), ensure_ascii=False)}"
+        )
     if notes:
         prompt += f" Ghi chu nguoi dung, chi ap dung neu khong mau thuan evidence: {notes[:1500]}"
 
     best_segments: list[NarrationSegment] = []
+    best_candidate_data: dict = {}
     best_distance = float("inf")
     best_valid: tuple[dict, list[NarrationSegment], NarrativeStyleAssessment] | None = None
     best_judge_score = float("-inf")
@@ -1897,7 +2187,7 @@ async def _write_verified_narration(
     for attempt in range(4):
         try:
             response = await _client().chat.completions.create(
-                model=settings.ai_model,
+                model=settings.review_ai_model,
                 messages=[
                     {"role": "system", "content": prompt + correction},
                     {"role": "user", "content": json.dumps(event_data, ensure_ascii=False)},
@@ -1910,11 +2200,20 @@ async def _write_verified_narration(
             if not isinstance(candidate_data, dict):
                 candidate_data = {}
             candidate_segments = _segments_from_narration_payload(candidate_data, events)
+            candidate_segments = _canonicalize_narration_names(
+                candidate_segments,
+                character_names,
+            )
             candidate_segments = await _repair_visual_atomic_segments(
                 candidate_segments,
                 events,
                 scenes,
                 style,
+                character_names=character_names,
+            )
+            candidate_segments = _canonicalize_narration_names(
+                candidate_segments,
+                character_names,
             )
             candidate_segments = _strip_redundant_generic_transitions(candidate_segments)
             words = _narration_word_count(candidate_segments)
@@ -1930,6 +2229,7 @@ async def _write_verified_narration(
             distance += min(1.0, len(transition_issues) * 0.25)
             if distance < best_distance:
                 best_segments = candidate_segments
+                best_candidate_data = candidate_data
                 best_distance = distance
             if (
                 _narration_meets_budget(candidate_segments, events, budget)
@@ -1965,6 +2265,7 @@ async def _write_verified_narration(
                         "moi segment chi co DUNG MOT candidate_scene_id va DUNG MOT required_visuals.actions; "
                         "narration chi mo ta action trung tam cua scene do, required_visuals chi copy facts cua "
                         "chinh scene do, va khong them action cu trong menh de 'sau khi', 'truoc khi', 'trong khi'; "
+                        "neu ke noi dung loi noi thi subtitle/dialogue cua chinh scene phai xac nhan truc tiep; "
                         "chi dung chuyen tiep trung tinh ngan; loi mau: "
                         + "; ".join(visual_issues[:8])
                     )
@@ -1988,6 +2289,22 @@ async def _write_verified_narration(
         # report below blocks rendering when the narrative judge is <90 or the
         # selected-style score is <85.
         return best_valid
+
+    if best_segments:
+        # A nearly valid draft is still useful: the editor can deterministically
+        # repair its timeline/candidate choices, or show a preview with warnings.
+        # Failing the whole job here previously forced the user to re-run a long
+        # multimodal analysis just because one-sentence/one-scene validation was
+        # overly strict.
+        try:
+            assessment = await _judge_narrative_style(best_segments, events, style)
+        except Exception:
+            assessment = NarrativeStyleAssessment(
+                coherence_score=0.0,
+                style_score=0.0,
+                feedback="Không chạy được narrative QA cho bản nháp gần nhất.",
+            )
+        return best_candidate_data, best_segments, assessment
 
     words = _narration_word_count(best_segments)
     atomic_count = sum(len(_atomic_sentence_parts(item.narration)) for item in best_segments)
@@ -2420,6 +2737,18 @@ def _quality_report(
                     segment_id=decision.segment_id,
                 )
             )
+        elif atomic_issues := _visual_atomicity_issues([segment], scenes):
+            issues.append(
+                QualityIssue(
+                    severity="error",
+                    code="UNSUPPORTED_NARRATION",
+                    message=(
+                        "Câu kể chứa chi tiết không được chính cảnh/subtitle nguồn xác nhận: "
+                        + "; ".join(atomic_issues[:3])
+                    )[:500],
+                    segment_id=segment.segment_id,
+                )
+            )
     if chronology < 100:
         issues.append(
             QualityIssue(
@@ -2524,12 +2853,16 @@ async def _multimodal_rescore_selected_clips(
                 "type": "text",
                 "text": (
                     "Bạn chấm semantic scene matching trước render. Với từng segment, xem narration tiếng Việt, "
-                    "required_visuals và keyframe; chấm 0..1 xem cảnh có trực tiếp cho thấy đúng nhân vật, hành động, "
+                    "required_visuals, SOURCE DIALOGUE/SUBTITLE và keyframe; chấm 0..1 xem cảnh có trực tiếp cho "
+                    "thấy đúng nhân vật, hành động, "
                     "đồ vật và bối cảnh hay không. Cấm dùng kiến thức phim ngoài ảnh/evidence. "
                     "Trả JSON {segments:[{segment_id,direct_match,score,reason,best_keyframe_time}]}; "
                     "direct_match=true chỉ khi MỘT keyframe tốt nhất trực tiếp minh họa hành động trung tâm của câu; "
                     "không cộng dồn các hành động nằm ở nhiều keyframe cách xa nhau trong cùng scene. Nếu một keyframe "
                     "đã cho thấy đúng hành động trung tâm thì có thể true kể cả score thô hơi bảo thủ; "
+                    "Nếu narration kể nhân vật nói/hỏi/giải thích/tiết lộ/đề nghị/cảnh báo/tranh cãi/quyết định, "
+                    "SOURCE DIALOGUE/SUBTITLE của chính scene phải xác nhận trực tiếp ý nghĩa đó; nếu thiếu hoặc "
+                    "mâu thuẫn thì direct_match=false kể cả keyframe có đúng nhân vật. "
                     "direct_match=false nếu sai chủ thể/hành động. best_keyframe_time phải là timestamp keyframe "
                     "đã được ghi nhãn nơi bằng chứng rõ nhất."
                 ),
@@ -2550,6 +2883,7 @@ async def _multimodal_rescore_selected_clips(
                     "text": (
                         f"{decision.segment_id}\nNARRATION: {decision.narration}\n"
                         f"REQUIRED: {segment.required_visuals.model_dump_json()}\n"
+                        f"SOURCE DIALOGUE/SUBTITLE: {json.dumps(_scene_dialogue_evidence(scene), ensure_ascii=False)}\n"
                         f"SCENE FACTS: {scene.model_dump_json(exclude={'keyframes', 'thumbnail_path'})}"
                     ),
                 }
@@ -2571,7 +2905,7 @@ async def _multimodal_rescore_selected_clips(
         for request_attempt in range(2):
             try:
                 response = await _client().chat.completions.create(
-                    model=settings.ai_model,
+                    model=settings.review_ai_model,
                     messages=[{"role": "user", "content": content}],
                     response_format={"type": "json_object"},
                     temperature=0.0,
@@ -2806,6 +3140,7 @@ async def _repair_low_visual_until_stable(
     assessment: NarrativeStyleAssessment,
     *,
     batch_size: int | None = None,
+    character_names: CharacterNameRegistry | None = None,
 ) -> tuple[list[NarrationSegment], list[EditDecision], NarrativeStyleAssessment]:
     """Repair up to three small QA leftovers without rewriting good segments."""
 
@@ -2820,6 +3155,7 @@ async def _repair_low_visual_until_stable(
             scenes,
             current_decisions,
             style,
+            character_names=character_names,
         )
         if not changed:
             break
@@ -2830,7 +3166,11 @@ async def _repair_low_visual_until_stable(
         ):
             break
         local_assessment = await _judge_narrative_style(proposed, events, style)
-        if not local_assessment.logic_passed:
+        if (
+            local_assessment.contradictions
+            or local_assessment.early_spoilers
+            or local_assessment.coherence_score + 5.0 < current_assessment.coherence_score
+        ):
             break
         # A factual two-sentence repair cannot turn a previously accepted
         # 102-sentence style from 98 to 75.  The deterministic transition gate
@@ -2861,7 +3201,11 @@ async def _repair_low_visual_until_stable(
         )
         if reordered:
             reordered_assessment = await _judge_narrative_style(proposed, events, style)
-            if not reordered_assessment.logic_passed:
+            if (
+                reordered_assessment.contradictions
+                or reordered_assessment.early_spoilers
+                or reordered_assessment.coherence_score + 5.0 < proposed_assessment.coherence_score
+            ):
                 break
             proposed_assessment = NarrativeStyleAssessment(
                 coherence_score=min(proposed_assessment.coherence_score, reordered_assessment.coherence_score),
@@ -2887,6 +3231,8 @@ async def _repair_low_visual_narration(
     scenes: list[AnalyzedScene],
     decisions: list[EditDecision],
     style: str,
+    *,
+    character_names: CharacterNameRegistry | None = None,
 ) -> tuple[list[NarrationSegment], bool]:
     """Rewrite only sentences whose real keyframes cannot prove the claim."""
 
@@ -2898,7 +3244,7 @@ async def _repair_low_visual_narration(
         for index, decision in enumerate(decisions)
         if decision.source_clips and decision.source_clips[0].match_score < 0.75
     ]
-    if not low_decisions or len(low_decisions) > 12:
+    if not low_decisions:
         return segments, False
 
     proposed = list(segments)
@@ -2917,13 +3263,22 @@ async def _repair_low_visual_narration(
                     "cac fact khac cung phai copy nguyen van. Narration la mot cau, chi ke action trung tam do, "
                     "giu dung event/phong cach. TARGET_WORDS chi la moc tham khao: neu cau cu ke thua chi tiet khong "
                     "co trong hinh thi uu tien cau moi gon va dung keyframe (khoang 50%-110% so tu cu), khong duoc "
-                    "giu chi tiet sai chi de dem du tu. Khong suy dien hanh dong nam ngoai keyframe. "
+                    "giu chi tiet sai chi de dem du tu. Khong suy dien hanh dong nam ngoai keyframe; cam dung "
+                    "'va/nhung/roi' de noi them chu the hoac hanh dong thu hai. "
                     "Bat buoc DOI narration bi tu choi. Co the giu scene/action cu neu keyframe that su cho thay action "
                     "do va loi cu chi sai vi ke them chi tiet; khi ay cau moi chi duoc noi action nhin thay. Cam tra lai "
-                    "nguyen van narration cu hoac chi doi metadata."
+                    "nguyen van narration cu hoac chi doi metadata. Neu narration moi ke noi dung noi/hoi/giai thich/"
+                    "tiet lo/de nghi/canh bao/tranh cai/quyet dinh thi dialogue hoac evidence.dialogue/subtitle cua "
+                    "CHINH scene do phai truc tiep xac nhan; neu khong co sub/thoai phu hop thi chi mo ta hanh dong "
+                    "nhin thay, cam suy dien noi dung loi noi."
                 ),
             }
         ]
+        if character_names:
+            content[0]["text"] += (
+                " Moi ten nhan vat phai chep dung CHARACTER_NAME_CONTRACT; khong dich ten va khong dung alias. "
+                f"CHARACTER_NAME_CONTRACT={json.dumps(character_name_contract(character_names), ensure_ascii=False)}"
+            )
         valid_ids: set[str] = set()
         decision_context: dict[str, tuple[int, float, float, set[str]]] = {}
         for decision_index, decision in batch:
@@ -2931,14 +3286,34 @@ async def _repair_low_visual_narration(
             event = event_by_id.get(decision.event_id)
             if segment is None or event is None:
                 continue
-            candidates: list[SceneCandidate] = []
-            seen_scene_ids: set[str] = set()
+            candidate_by_scene: dict[str, SceneCandidate] = {}
             for candidate in decision.source_clips + decision.alternatives:
-                if candidate.scene_id in scene_by_id and candidate.scene_id not in seen_scene_ids:
-                    candidates.append(candidate)
-                    seen_scene_ids.add(candidate.scene_id)
-            if not candidates:
-                continue
+                if candidate.scene_id in scene_by_id:
+                    candidate_by_scene.setdefault(candidate.scene_id, candidate)
+            # The first EDL keeps only three candidates.  When all three are a
+            # poor fit, the repair pass must still be able to choose another
+            # verified scene from the same event instead of rewriting prose to
+            # match an unrelated visual.
+            for scene_id in event.scene_ids:
+                scene = scene_by_id.get(scene_id)
+                if scene is None or scene_id in candidate_by_scene:
+                    continue
+                score, reason = _scene_match_score(segment, event, scene)
+                clip_duration = min(7.0, max(2.0, segment.estimated_voice_duration))
+                start = min(
+                    max(scene.start_time, scene.start_time + 0.15),
+                    max(scene.start_time, scene.end_time - clip_duration),
+                )
+                end = min(scene.end_time, start + clip_duration)
+                candidate_by_scene[scene_id] = SceneCandidate(
+                    candidate_id=f"{segment.segment_id}:{scene_id}:repair",
+                    scene_id=scene_id,
+                    start_seconds=round(start, 3),
+                    end_seconds=round(max(start + 0.8, end), 3),
+                    thumbnail_path=scene.thumbnail_path,
+                    match_score=round(score, 4),
+                    match_reason=reason,
+                )
             previous_start = next(
                 (
                     earlier.source_clips[0].start_seconds
@@ -2957,12 +3332,23 @@ async def _repair_low_visual_narration(
             )
             candidates = [
                 item
-                for item in candidates
+                for item in candidate_by_scene.values()
                 if item.start_seconds + 0.25 >= previous_start
                 and item.start_seconds <= next_start + 0.25
             ]
             if not candidates:
                 continue
+            needs_dialogue = _narration_requires_dialogue_evidence(segment.narration)
+            candidates.sort(
+                key=lambda item: (
+                    bool(_scene_dialogue_evidence(scene_by_id[item.scene_id]))
+                    if needs_dialogue
+                    else False,
+                    item.match_score,
+                ),
+                reverse=True,
+            )
+            candidates = candidates[:6]
             valid_ids.add(segment.segment_id)
             decision_context[segment.segment_id] = (
                 decision_index,
@@ -3004,7 +3390,7 @@ async def _repair_low_visual_narration(
             continue
         try:
             response = await _client().chat.completions.create(
-                model=settings.ai_model,
+                model=settings.review_ai_model,
                 messages=[{"role": "user", "content": content}],
                 response_format={"type": "json_object"},
                 temperature=0.1,
@@ -3050,6 +3436,10 @@ async def _repair_low_visual_narration(
                     "purpose": _safe_text(item.get("purpose"), original.purpose),
                 }
             )
+            candidate = _canonicalize_narration_names(
+                [candidate],
+                character_names,
+            )[0]
             original_words = len(re.findall(r"\w+", original.narration, flags=re.UNICODE))
             candidate_words = len(re.findall(r"\w+", candidate.narration, flags=re.UNICODE))
             min_repair_words = max(6, math.floor(original_words * 0.45))
@@ -3281,7 +3671,7 @@ async def verify_rendered_review(
         for request_attempt in range(2):
             try:
                 response = await _client().chat.completions.create(
-                    model=settings.ai_model,
+                    model=settings.review_ai_model,
                     messages=[{"role": "user", "content": content}],
                     response_format={"type": "json_object"},
                     temperature=0.0,
@@ -3297,13 +3687,13 @@ async def verify_rendered_review(
                         segment_id = str(item.get("segment_id") or "")
                         if segment_id not in valid_ids:
                             continue
+                        score = _confidence(item.get("score"))
                         parsed_direct_match = _optional_bool(item.get("direct_match"))
                         direct_match = (
                             parsed_direct_match
                             if parsed_direct_match is not None
                             else score >= 0.75
                         )
-                        score = _confidence(item.get("score"))
                         if direct_match:
                             score = max(0.75, score)
                         else:
@@ -3462,7 +3852,7 @@ async def verify_edited_narration(
         )
     try:
         response = await _client().chat.completions.create(
-            model=settings.ai_model,
+            model=settings.review_ai_model,
             messages=[{"role": "user", "content": content}],
             response_format={"type": "json_object"},
             temperature=0.0,
