@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
+from app.models.review import FinalReviewEvaluation
+
 LanguageOption = Literal["auto", "en", "zh", "vi"]
 ProcessingMode = Literal["fast", "balanced", "quality"]
 
@@ -101,6 +103,7 @@ class JobProgress(BaseModel):
     seo_title: str | None = None
     seo_description: str | None = None
     seo_tags: list[str] | None = None
+    final_evaluation: FinalReviewEvaluation | None = None
     error: str | None = None
 
 

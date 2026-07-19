@@ -1,7 +1,9 @@
 import asyncio
+import json
+import re
 import subprocess
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypedDict
 
 from app.core import settings
 from app.models.job import VoiceGender
@@ -13,6 +15,12 @@ class VoiceError(RuntimeError):
     pass
 
 
+class VoiceWordTiming(TypedDict):
+    text: str
+    start: float
+    end: float
+
+
 class VoiceEngine:
     async def synthesize(
         self,
@@ -20,6 +28,7 @@ class VoiceEngine:
         output_file: Path,
         voice_gender: VoiceGender,
         progress: Callable[[str, int], None] | None = None,
+        timing_file: Path | None = None,
     ) -> Path:
         raise NotImplementedError
 
@@ -41,6 +50,7 @@ class DisabledVoiceEngine(VoiceEngine):
         output_file: Path,
         voice_gender: VoiceGender,
         progress: Callable[[str, int], None] | None = None,
+        timing_file: Path | None = None,
     ) -> Path:
         raise VoiceError("Voice engine chưa được cấu hình.")
 
@@ -66,6 +76,7 @@ class EdgeTtsVoiceEngine(VoiceEngine):
         output_file: Path,
         voice_gender: VoiceGender,
         progress: Callable[[str, int], None] | None = None,
+        timing_file: Path | None = None,
     ) -> Path:
         try:
             import edge_tts
@@ -79,11 +90,16 @@ class EdgeTtsVoiceEngine(VoiceEngine):
         output_file.parent.mkdir(parents=True, exist_ok=True)
         if output_file.exists():
             output_file.unlink()
+        if timing_file is not None:
+            timing_file.parent.mkdir(parents=True, exist_ok=True)
+            timing_file.unlink(missing_ok=True)
 
         chunks = _split_tts_chunks(normalized, settings.tts_chunk_chars)
         part_dir = output_file.parent / "tts_parts"
         part_dir.mkdir(parents=True, exist_ok=True)
         part_files: list[Path] = []
+        word_timings: list[VoiceWordTiming] = []
+        part_cursor = 0.0
 
         for index, chunk in enumerate(chunks, start=1):
             if progress:
@@ -92,7 +108,26 @@ class EdgeTtsVoiceEngine(VoiceEngine):
             part_file = part_dir / f"part_{index:04d}.mp3"
             if part_file.exists():
                 part_file.unlink()
-            await self._save_chunk(edge_tts, chunk, part_file, self.get_voice_for_text(chunk, voice_gender))
+            metadata_file = part_dir / f"part_{index:04d}.metadata.jsonl"
+            metadata_file.unlink(missing_ok=True)
+            await self._save_chunk(
+                edge_tts,
+                chunk,
+                part_file,
+                self.get_voice_for_text(chunk, voice_gender),
+                metadata_file=metadata_file if timing_file is not None else None,
+            )
+            part_duration = await _probe_audio_duration(part_file)
+            parsed_timings: list[VoiceWordTiming] = []
+            if timing_file is not None and metadata_file.is_file():
+                parsed_timings = _read_edge_word_timings(metadata_file, part_cursor)
+                word_timings.extend(parsed_timings)
+            metadata_duration = (
+                max(item["end"] for item in parsed_timings) - part_cursor
+                if parsed_timings
+                else 0.0
+            )
+            part_cursor += max(0.0, part_duration, metadata_duration)
             part_files.append(part_file)
 
         if progress:
@@ -104,6 +139,21 @@ class EdgeTtsVoiceEngine(VoiceEngine):
 
         if not output_file.exists() or output_file.stat().st_size == 0:
             raise VoiceError("TTS chạy xong nhưng không tạo được file audio giọng đọc.")
+        if timing_file is not None and word_timings:
+            final_duration = await _probe_audio_duration(output_file)
+            scale = final_duration / part_cursor if final_duration > 0 and part_cursor > 0 else 1.0
+            payload = {
+                "audio_duration": round(final_duration or part_cursor, 6),
+                "words": [
+                    {
+                        "text": item["text"],
+                        "start": round(item["start"] * scale, 6),
+                        "end": round(item["end"] * scale, 6),
+                    }
+                    for item in word_timings
+                ],
+            }
+            timing_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return output_file
 
     async def synthesize_srt(
@@ -119,10 +169,10 @@ class EdgeTtsVoiceEngine(VoiceEngine):
         except ImportError as exc:
             raise VoiceError("Thiếu edge-tts. Chạy pip install -r requirements.txt trong backend.") from exc
 
-        # Keep voice generation aligned with the exact subtitle events burned into the output.
-        raw_events = _group_events(normalize_events(parse_srt(subtitle_file)))
-
-        events = _clamp_events_to_duration(raw_events, duration)
+        # Keep one TTS request for every subtitle event that is burned into the
+        # output.  Grouping adjacent events lets Edge TTS read the text of a
+        # later subtitle before that subtitle's on-screen timecode begins.
+        events = _voice_timeline_events(parse_srt(subtitle_file), duration)
 
         if not events:
             raise VoiceError("Không có phụ đề hợp lệ để tạo giọng đọc theo thời gian.")
@@ -140,15 +190,10 @@ class EdgeTtsVoiceEngine(VoiceEngine):
         for old_file in aligned_dir.glob("*"):
             old_file.unlink()
 
-        cursor = 0.0
-        total = len(events)
-        event_specs: list[tuple[int, SubtitleEvent, float, float]] = []
-        for index, event in enumerate(events, start=1):
-            next_start = events[index].start if index < total else duration
-            available = max(0.4, min(event.end, next_start - 0.05, duration) - event.start)
-            gap = max(0.0, event.start - cursor)
-            event_specs.append((index, event, available, gap))
-            cursor = event.start + available
+        event_specs, cursor = _voice_timeline_specs(events, duration)
+        if not event_specs:
+            raise VoiceError("Không có khoảng thời gian phụ đề đủ dài để tạo giọng đọc.")
+        total = len(event_specs)
 
         semaphore = asyncio.Semaphore(4)
         completed_count = 0
@@ -176,6 +221,9 @@ class EdgeTtsVoiceEngine(VoiceEngine):
                     )
                     raw_duration = await _probe_audio_duration(raw_file)
                     speed = max(1.0, raw_duration / available) if raw_duration > 0 else 1.0
+                    # Cap speed to keep voice intelligible; atrim in
+                    # _convert_speech will clip any leftover audio.
+                    speed = min(speed, 1.5)
                     await _convert_speech(ffmpeg, raw_file, speech_file, speed=speed, max_duration=available)
                 files.append(speech_file)
 
@@ -200,14 +248,36 @@ class EdgeTtsVoiceEngine(VoiceEngine):
             raise VoiceError("Không tạo được timeline audio giọng đọc.")
         return output_file
 
-    async def _save_chunk(self, edge_tts, text: str, output_file: Path, voice: str) -> None:
+    async def _save_chunk(
+        self,
+        edge_tts,
+        text: str,
+        output_file: Path,
+        voice: str,
+        *,
+        metadata_file: Path | None = None,
+    ) -> None:
         last_error: Exception | None = None
         for attempt in range(1, settings.tts_chunk_retries + 1):
             if output_file.exists():
                 output_file.unlink()
-            communicate = edge_tts.Communicate(text, voice=voice, rate="+0%", volume="+0%")
+            if metadata_file is not None:
+                metadata_file.unlink(missing_ok=True)
+            communicate = edge_tts.Communicate(
+                text,
+                voice=voice,
+                rate="+0%",
+                volume="+0%",
+                boundary="WordBoundary" if metadata_file is not None else "SentenceBoundary",
+            )
             try:
-                await asyncio.wait_for(communicate.save(str(output_file)), timeout=settings.tts_chunk_timeout_seconds)
+                await asyncio.wait_for(
+                    communicate.save(
+                        str(output_file),
+                        str(metadata_file) if metadata_file is not None else None,
+                    ),
+                    timeout=settings.tts_chunk_timeout_seconds,
+                )
             except asyncio.TimeoutError as exc:
                 last_error = exc
             except Exception as exc:
@@ -237,6 +307,77 @@ def subtitle_text_for_tts(subtitle_file: Path) -> str:
     return "\n".join(event.text.strip() for event in events if event.text.strip())
 
 
+def load_voice_word_timings(
+    timing_file: Path,
+    target_duration: float | None = None,
+) -> list[VoiceWordTiming]:
+    """Load Edge word boundaries and scale them with any later tempo change."""
+
+    if not timing_file.is_file():
+        return []
+    try:
+        payload = json.loads(timing_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("words"), list):
+        return []
+    try:
+        source_duration = float(payload.get("audio_duration") or 0.0)
+    except (TypeError, ValueError):
+        source_duration = 0.0
+    scale = (
+        float(target_duration) / source_duration
+        if target_duration is not None and target_duration > 0 and source_duration > 0
+        else 1.0
+    )
+    result: list[VoiceWordTiming] = []
+    for item in payload["words"]:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        try:
+            start = max(0.0, float(item.get("start")) * scale)
+            end = max(start + 0.01, float(item.get("end")) * scale)
+        except (TypeError, ValueError):
+            continue
+        if target_duration is not None and target_duration > 0:
+            start = min(start, float(target_duration))
+            end = min(max(start + 0.01, end), float(target_duration))
+        if text and end > start:
+            result.append(VoiceWordTiming(text=text, start=start, end=end))
+    return sorted(result, key=lambda item: (item["start"], item["end"]))
+
+
+def _read_edge_word_timings(metadata_file: Path, part_start: float) -> list[VoiceWordTiming]:
+    result: list[VoiceWordTiming] = []
+    try:
+        lines = metadata_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return result
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict) or item.get("type") != "WordBoundary":
+            continue
+        text = str(item.get("text") or "").strip()
+        try:
+            offset = max(0.0, float(item.get("offset") or 0.0) / 10_000_000.0)
+            duration = max(0.01, float(item.get("duration") or 0.0) / 10_000_000.0)
+        except (TypeError, ValueError):
+            continue
+        if text:
+            result.append(
+                VoiceWordTiming(
+                    text=text,
+                    start=part_start + offset,
+                    end=part_start + offset + duration,
+                )
+            )
+    return result
+
+
 def get_voice_engine() -> VoiceEngine:
     if settings.voice_engine.lower() in {"edge", "edge-tts", "edge_tts"}:
         return EdgeTtsVoiceEngine()
@@ -253,6 +394,101 @@ def _clamp_events_to_duration(
         for event in events
         if event.start < duration - 0.1
     ]
+
+
+def _merge_voice_events(
+    events: list[SubtitleEvent],
+    max_gap: float = 0.3,
+    max_chars: int = 120,
+    max_duration: float = 8.0,
+) -> list[SubtitleEvent]:
+    """Merge adjacent subtitle events into single TTS groups for natural speech.
+
+    Subtitle files often split a sentence across multiple display cues (e.g.
+    word-level Whisper timestamps or YouTube auto-subs).  When each cue is
+    sent to the TTS engine as a separate request, the synthesiser restarts its
+    prosody, producing an audible cut mid-sentence.
+
+    This function merges consecutive cues whose gap is small and whose combined
+    text does not end a sentence, so the TTS engine reads the whole phrase in
+    one natural breath.
+    """
+    if not events:
+        return events
+
+    merged: list[SubtitleEvent] = []
+    cur_start = events[0].start
+    cur_end = events[0].end
+    cur_text = events[0].text.strip()
+
+    for event in events[1:]:
+        gap = event.start - cur_end
+        combined_text = f"{cur_text} {event.text.strip()}"
+        combined_duration = event.end - cur_start
+
+        can_merge = (
+            gap <= max_gap
+            and len(combined_text) <= max_chars
+            and combined_duration <= max_duration
+            and not _ends_sentence(cur_text)
+        )
+
+        if can_merge:
+            cur_end = event.end
+            cur_text = combined_text
+        else:
+            merged.append(SubtitleEvent(cur_start, cur_end, cur_text))
+            cur_start = event.start
+            cur_end = event.end
+            cur_text = event.text.strip()
+
+    merged.append(SubtitleEvent(cur_start, cur_end, cur_text))
+    return merged
+
+
+def _voice_timeline_events(
+    events: list[SubtitleEvent],
+    duration: float,
+) -> list[SubtitleEvent]:
+    """Merge adjacent cues into natural speech groups and clamp to video length."""
+
+    return _clamp_events_to_duration(
+        _merge_voice_events(normalize_events(events)),
+        duration,
+    )
+
+
+def _voice_timeline_specs(
+    events: list[SubtitleEvent],
+    duration: float,
+) -> tuple[list[tuple[int, SubtitleEvent, float, float]], float]:
+    """Allocate sequential speech without ever crossing the next cue or video end."""
+
+    minimum_slot = 0.03
+    boundary_gap = 0.05
+    cursor = 0.0
+    specs: list[tuple[int, SubtitleEvent, float, float]] = []
+    total = len(events)
+    for index, event in enumerate(events, start=1):
+        next_start = events[index].start if index < total else duration
+        slot_end = min(event.end, next_start, duration)
+        slot_duration = slot_end - event.start
+        if slot_duration < minimum_slot:
+            continue
+
+        # Leave a small pause only when this cue touches the next one.  The
+        # pause must come from the cue's real slot, never extend that slot.
+        touches_next = index < total and slot_end >= next_start - 1e-9
+        separator = (
+            min(boundary_gap, max(0.0, slot_duration - minimum_slot))
+            if touches_next
+            else 0.0
+        )
+        available = slot_duration - separator
+        gap = max(0.0, event.start - cursor)
+        specs.append((index, event, available, gap))
+        cursor = event.start + available
+    return specs, cursor
 
 
 def _normalize_tts_text(text: str) -> str:
@@ -284,60 +520,40 @@ def _tts_error_preview(text: str) -> str:
 
 def _split_tts_chunks(text: str, max_chars: int) -> list[str]:
     max_chars = max(500, max_chars)
+    sentence_units = [
+        unit.strip()
+        for line in text.splitlines()
+        for unit in re.split(r"(?<=[.!?…])\s+", line.strip())
+        if unit.strip()
+    ]
+    pieces: list[str] = []
+    for unit in sentence_units:
+        if len(unit) <= max_chars:
+            pieces.append(unit)
+            continue
+        current_words: list[str] = []
+        for word in unit.split():
+            candidate = " ".join([*current_words, word])
+            if current_words and len(candidate) > max_chars:
+                pieces.append(" ".join(current_words))
+                current_words = [word]
+            else:
+                current_words.append(word)
+        if current_words:
+            pieces.append(" ".join(current_words))
+
     chunks: list[str] = []
-    current: list[str] = []
-    current_length = 0
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        extra = len(line) + (1 if current else 0)
-        if current and current_length + extra > max_chars:
-            chunks.append("\n".join(current))
-            current = [line]
-            current_length = len(line)
+    current = ""
+    for piece in pieces:
+        candidate = f"{current} {piece}".strip()
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = piece
         else:
-            current.append(line)
-            current_length += extra
-
+            current = candidate
     if current:
-        chunks.append("\n".join(current))
+        chunks.append(current)
     return chunks
-
-
-def _group_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
-    grouped: list[SubtitleEvent] = []
-    current_start: float | None = None
-    current_end = 0.0
-    current_text: list[str] = []
-
-    for event in events:
-        text = _normalize_tts_text(event.text)
-        if not text:
-            continue
-        joined = " ".join(current_text + [text])
-        should_flush = (
-            current_start is not None
-            and (
-                event.start - current_end > 1.2
-                or len(joined) > 600
-                or event.end - current_start > 25
-            )
-        )
-        if should_flush and current_start is not None:
-            grouped.append(SubtitleEvent(current_start, current_end, " ".join(current_text)))
-            current_start = None
-            current_text = []
-
-        if current_start is None:
-            current_start = event.start
-        current_end = event.end
-        current_text.append(text)
-
-    if current_start is not None and current_text:
-        grouped.append(SubtitleEvent(current_start, current_end, " ".join(current_text)))
-    return grouped
 
 
 def _ends_sentence(text: str) -> bool:

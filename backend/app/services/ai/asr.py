@@ -19,6 +19,10 @@ class AsrError(RuntimeError):
     pass
 
 
+class FasterWhisperUnavailable(AsrError):
+    """The package is installed but one of its native dependencies cannot load."""
+
+
 # Prompt gợi ý cho Whisper theo từng ngôn ngữ
 # Giúp Whisper giữ nguyên tên riêng và không hallucinate
 _INITIAL_PROMPTS: dict[str, str] = {
@@ -73,15 +77,27 @@ class FasterWhisperAsr(AsrEngine):
             _load_nvidia_runtime_dlls()
             try:
                 from faster_whisper import WhisperModel
-            except ImportError as exc:
-                raise AsrError("Thiếu faster-whisper. Chạy pip install -r requirements.txt trong backend.") from exc
-
-            model = WhisperModel(
-                settings.whisper_model,
-                device=settings.whisper_device,
-                compute_type=settings.whisper_compute_type,
-                local_files_only=settings.whisper_local_files_only,
-            )
+                model = WhisperModel(
+                    settings.whisper_model,
+                    device=settings.whisper_device,
+                    compute_type=settings.whisper_compute_type,
+                    local_files_only=settings.whisper_local_files_only,
+                )
+            except ModuleNotFoundError as exc:
+                if exc.name == "faster_whisper":
+                    raise FasterWhisperUnavailable(
+                        "Chưa cài faster-whisper trong môi trường backend. "
+                        "Chạy .venv\\Scripts\\python.exe -m pip install -r requirements.txt."
+                    ) from exc
+                raise FasterWhisperUnavailable(
+                    "faster-whisper không tải được dependency native "
+                    f"'{exc.name or 'không xác định'}': {exc}."
+                ) from exc
+            except (ImportError, OSError) as exc:
+                raise FasterWhisperUnavailable(
+                    "faster-whisper đã được cài nhưng DLL native không tải được: "
+                    f"{exc}."
+                ) from exc
 
             whisper_language = None if language == "auto" else language
             initial_prompt = _INITIAL_PROMPTS.get(language, _INITIAL_PROMPTS["auto"])
@@ -118,7 +134,7 @@ class FasterWhisperAsr(AsrEngine):
                 )
                 segment_count += 1
 
-            print(f"[ASR] Whisper nhận diện được {segment_count} segment từ {audio_file.name}")
+            print(f"[ASR] Faster-Whisper produced {segment_count} segments from {audio_file.name}")
 
             if not events:
                 raise AsrError("Whisper không nhận diện được lời thoại để tạo phụ đề.")
@@ -127,8 +143,105 @@ class FasterWhisperAsr(AsrEngine):
         return await asyncio.to_thread(transcribe)
 
 
+class OpenAIWhisperAsr(AsrEngine):
+    """CPU-safe fallback when Windows policy blocks Faster-Whisper/PyAV DLLs."""
+
+    async def transcribe_to_srt(
+        self,
+        audio_file: Path,
+        output_file: Path,
+        language: str,
+        processing_mode: ProcessingMode | str | None = None,
+    ) -> Path:
+        import asyncio
+
+        profile = get_processing_profile(processing_mode)
+
+        def transcribe() -> Path:
+            try:
+                import torch
+                import whisper
+            except ImportError as exc:
+                raise AsrError(
+                    "Không thể chạy Whisper dự phòng; thiếu package whisper hoặc torch: " f"{exc}"
+                ) from exc
+
+            requested_device = settings.whisper_device
+            device = requested_device if requested_device != "cuda" or torch.cuda.is_available() else "cpu"
+            try:
+                model = whisper.load_model(settings.whisper_model, device=device)
+                result = model.transcribe(
+                    str(audio_file),
+                    language=None if language == "auto" else language,
+                    fp16=False,
+                    verbose=False,
+                    beam_size=profile.whisper_beam_size,
+                    word_timestamps=profile.whisper_word_timestamps,
+                    condition_on_previous_text=True,
+                    initial_prompt=_INITIAL_PROMPTS.get(language, _INITIAL_PROMPTS["auto"]),
+                )
+            except Exception as exc:
+                raise AsrError(f"Whisper dự phòng không nhận diện được audio: {exc}") from exc
+
+            events: list[SubtitleEvent] = []
+            for segment in result.get("segments", []):
+                text = str(segment.get("text") or "").strip()
+                if not text or (events and _is_repeated(text, events[-1].text)):
+                    continue
+                events.append(
+                    SubtitleEvent(
+                        start=_result_segment_time(segment, "start"),
+                        end=_result_segment_time(segment, "end"),
+                        text=text,
+                    )
+                )
+            if not events:
+                raise AsrError("Whisper dự phòng không nhận diện được lời thoại để tạo phụ đề.")
+            print(f"[ASR] OpenAI Whisper fallback produced {len(events)} segments from {audio_file.name}")
+            return write_srt(events, output_file)
+
+        return await asyncio.to_thread(transcribe)
+
+
+class ResilientAsr(AsrEngine):
+    """Prefer Faster-Whisper, but keep a job alive when its DLLs are blocked."""
+
+    async def transcribe_to_srt(
+        self,
+        audio_file: Path,
+        output_file: Path,
+        language: str,
+        processing_mode: ProcessingMode | str | None = None,
+    ) -> Path:
+        try:
+            return await FasterWhisperAsr().transcribe_to_srt(
+                audio_file, output_file, language, processing_mode
+            )
+        except FasterWhisperUnavailable as faster_error:
+            print("[ASR] Faster-Whisper unavailable; using OpenAI Whisper fallback.")
+            try:
+                return await OpenAIWhisperAsr().transcribe_to_srt(
+                    audio_file, output_file, language, processing_mode
+                )
+            except AsrError as fallback_error:
+                raise AsrError(
+                    "Faster-Whisper không khởi động được và Whisper dự phòng cũng thất bại. "
+                    f"Faster-Whisper: {faster_error} | Whisper dự phòng: {fallback_error}"
+                ) from fallback_error
+
+
 def get_asr_engine() -> AsrEngine:
-    return FasterWhisperAsr()
+    return ResilientAsr()
+
+
+def _result_segment_time(segment: dict, field: str) -> float:
+    words = segment.get("words") or []
+    candidates = words if field == "start" else reversed(words)
+    for word in candidates:
+        value = word.get(field) if isinstance(word, dict) else getattr(word, field, None)
+        if value is not None:
+            return float(value)
+    return float(segment.get(field) or 0.0)
 
 
 def _is_repeated(text: str, prev_text: str) -> bool:

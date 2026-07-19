@@ -53,6 +53,14 @@ class ProcessingModeTests(unittest.IsolatedAsyncioTestCase):
         review = ReviewDraftRequest(video_path="source.mp4")
         self.assertEqual(dubbing.processing_mode, "balanced")
         self.assertEqual(review.processing_mode, "balanced")
+        self.assertEqual(review.style, "story")
+        self.assertTrue(review.blur_box_enabled)
+
+        supported_review_styles = ("story", "fast", "emotional", "funny")
+        self.assertEqual(
+            [ReviewDraftRequest(video_path="source.mp4", style=style).style for style in supported_review_styles],
+            list(supported_review_styles),
+        )
 
         fast = get_processing_profile("fast")
         balanced = get_processing_profile("balanced")
@@ -61,12 +69,16 @@ class ProcessingModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(balanced.whisper_beam_size, quality.whisper_beam_size)
         self.assertLess(fast.review_max_scenes, balanced.review_max_scenes)
         self.assertLess(balanced.review_max_scenes, quality.review_max_scenes)
+        self.assertLess(fast.review_keyframes_per_scene, balanced.review_keyframes_per_scene)
+        self.assertLess(balanced.review_keyframes_per_scene, quality.review_keyframes_per_scene)
         self.assertFalse(fast.use_demucs)
         self.assertTrue(balanced.use_demucs)
         self.assertTrue(quality.use_demucs)
 
         with self.assertRaises(ValidationError):
             ReviewDraftRequest(video_path="source.mp4", processing_mode="best")
+        with self.assertRaises(ValidationError):
+            ReviewDraftRequest(video_path="source.mp4", style="dramatic")
 
     def test_review_translation_progress_is_real_and_monotonic(self) -> None:
         values = [

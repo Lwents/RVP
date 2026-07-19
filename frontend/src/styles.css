@@ -564,6 +564,40 @@ select.ios-input {
   margin-bottom: 16px;
 }
 
+.review-duration-input {
+  position: relative;
+  display: block;
+  margin: 0;
+}
+
+.review-duration-input .ios-input {
+  width: 100%;
+  padding-right: 58px;
+}
+
+.review-duration-input .review-input-suffix {
+  position: absolute;
+  top: 50%;
+  right: 34px;
+  margin: 0;
+  transform: translateY(-50%);
+  color: #6e6e73;
+  font-size: 0.82rem;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.review-field-help {
+  display: block;
+  color: #86868b;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.review-field-help strong {
+  color: #3a3a3c;
+}
+
 /* Segmented control styling */
 .segment-wrap {
   display: flex;
@@ -1138,6 +1172,30 @@ input[type="range"]:active::-moz-range-thumb {
   font-weight: 800;
 }
 
+.review-job-spec,
+.review-duration-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.review-job-spec > span,
+.review-duration-facts > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 9px;
+  border-radius: 999px;
+  background: #f2f2f7;
+  color: #636366;
+  font-size: 0.77rem;
+}
+
+.review-job-spec strong,
+.review-duration-facts strong {
+  color: #1c1c1e;
+}
+
 .review-retry-button {
   justify-self: start;
 }
@@ -1145,6 +1203,59 @@ input[type="range"]:active::-moz-range-thumb {
 .review-result {
   display: grid;
   gap: 14px;
+}
+
+.review-duration-summary {
+  display: grid;
+  gap: 11px;
+  padding: 14px;
+  border: 1px solid rgba(0, 122, 255, 0.22);
+  border-radius: 16px;
+  background: rgba(0, 122, 255, 0.045);
+}
+
+.review-duration-summary.warning {
+  border-color: rgba(211, 47, 47, 0.38);
+  background: linear-gradient(180deg, rgba(211, 47, 47, 0.07), #ffffff);
+}
+
+.review-duration-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.review-duration-head > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #3a3a3c;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.review-duration-head > strong {
+  color: #007aff;
+  font-size: 0.9rem;
+}
+
+.review-duration-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 11px;
+  border-radius: 11px;
+  background: rgba(211, 47, 47, 0.09);
+  color: #b42318;
+  font-size: 0.82rem;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.review-duration-warning svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
 }
 
 .review-qa-panel {
@@ -1294,9 +1405,40 @@ input[type="range"]:active::-moz-range-thumb {
   box-shadow: none;
 }
 
+.review-cancel-button {
+  margin-top: 11px;
+  min-height: 38px;
+  color: #b42318;
+  border-color: rgba(211, 47, 47, 0.32);
+}
+
+.review-automation-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.review-auto-optimize,
+.review-render-preview {
+  min-height: 46px;
+  border-radius: 13px;
+  font-size: 0.88rem;
+}
+
+.review-auto-optimize {
+  background: linear-gradient(135deg, #5856d6, #007aff);
+  box-shadow: 0 8px 18px rgba(88, 86, 214, 0.18);
+}
+
 .review-download {
   width: 100%;
   text-decoration: none;
+}
+
+@media (max-width: 620px) {
+  .review-automation-actions {
+    grid-template-columns: 1fr;
+  }
 }
 
 .review-block {

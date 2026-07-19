@@ -17,7 +17,15 @@ def subtitle_font_dir() -> Path:
     return SUBTITLE_FONT_DIR
 
 
-def srt_to_positioned_ass(srt_file: Path, ass_file: Path, width: int, height: int, request: DubbingRequest) -> Path:
+def srt_to_positioned_ass(
+    srt_file: Path,
+    ass_file: Path,
+    width: int,
+    height: int,
+    request: DubbingRequest,
+    *,
+    single_line: bool = False,
+) -> Path:
     x = round(width * request.subtitle_x_percent / 100)
     y = round(height * request.subtitle_y_percent / 100)
     # ASS font metrics have a smaller cap-height than CSS pixels. The 1.25
@@ -31,7 +39,7 @@ def srt_to_positioned_ass(srt_file: Path, ass_file: Path, width: int, height: in
 ScriptType: v4.00+
 PlayResX: {width}
 PlayResY: {height}
-WrapStyle: 0
+WrapStyle: {2 if single_line else 0}
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
@@ -47,9 +55,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     lines = [header]
     for event in events:
         normalized_text = unicodedata.normalize("NFC", event.text).upper()
-        safe_text = _ass_escape(_wrap_subtitle_text(normalized_text, max_chars))
+        display_text = (
+            " ".join(normalized_text.replace(r"\N", " ").split())
+            if single_line
+            else _wrap_subtitle_text(normalized_text, max_chars)
+        )
+        safe_text = _ass_escape(display_text)
+        wrap_override = r"\q2" if single_line else ""
         lines.append(
-            f"Dialogue: 0,{ass_time(event.start)},{ass_time(event.end)},Default,,0,0,0,,{{\\an2\\pos({x},{y})}}{safe_text}\n"
+            f"Dialogue: 0,{ass_time(event.start)},{ass_time(event.end)},Default,,0,0,0,,"
+            f"{{\\an2{wrap_override}\\pos({x},{y})}}{safe_text}\n"
         )
 
     ass_file.write_text("".join(lines), encoding="utf-8")

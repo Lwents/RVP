@@ -197,9 +197,9 @@ async def _prepare_target_subtitles(
     translation_progress_start: int = 68,
     translation_progress_end: int = 69,
 ) -> Path:
-    grouped_max_chars = min(settings.subtitle_group_max_chars, 42)
-    grouped_max_duration = min(settings.subtitle_group_max_duration, 3.2)
-    grouped_max_gap = min(settings.subtitle_group_max_gap, 0.45)
+    grouped_max_chars = max(settings.subtitle_group_max_chars, 42)
+    grouped_max_duration = max(settings.subtitle_group_max_duration, 3.2)
+    grouped_max_gap = max(settings.subtitle_group_max_gap, 0.45)
 
     events = group_subtitle_events(
         parse_srt(subtitle_file),

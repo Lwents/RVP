@@ -39,11 +39,14 @@ async def analyze_video_context(
         base_url=settings.ninerouter_api_url,
     )
     prompt = (
-        "Bạn là chuyên gia nhận diện ngữ cảnh phim/donghua Trung Quốc để hỗ trợ dịch phụ đề tiếng Việt.\n"
+        "Bạn là chuyên gia nhận diện ngữ cảnh phim thuộc mọi quốc gia để hỗ trợ dịch phụ đề và viết review tiếng Việt.\n"
         "Hãy xem frame và transcript ASR thô, rồi suy luận hồ sơ ngữ cảnh giúp dịch chuẩn hơn.\n\n"
         "Yêu cầu:\n"
         "- Nhận diện tên phim/series nếu thấy đủ dấu hiệu, nếu không chắc ghi null hoặc mô tả ngắn.\n"
-        "- Liệt kê nhân vật/biệt danh/tên Hán Việt nếu nhận ra, vai trò và quan hệ với nhau.\n"
+        "- Mỗi nhân vật phải có đúng một name chuẩn để hiển thị xuyên suốt video; tuyệt đối không dịch nghĩa tên riêng.\n"
+        "- Ưu tiên tên chính thức hoặc tên quen thuộc với khán giả Việt; ghi mọi tên gốc, phiên âm, biệt danh và lỗi ASR/OCR vào aliases.\n"
+        "- Với Doraemon, dùng chính xác Chaien (không dùng Gian/Jaian) và Suneo (không dùng Xeko/Xê-kô).\n"
+        "- characters ưu tiên dạng [{name, aliases, role, relationship}]; aliases luôn là danh sách, không trộn alias vào name.\n"
         "- Đưa quy tắc xưng hô tiếng Việt hợp bối cảnh: vua-thần, cha-con, huynh-đệ, sư đồ, nam-nữ.\n"
         "- Sửa các OCR/ASR tiếng Trung dễ sai thành glossary nguồn -> nghĩa Việt.\n"
         "- Chỉ kết luận quan hệ khi transcript hoặc hình ảnh có bằng chứng trực tiếp; hiểu cả từ đồng nghĩa và cách gọi đa ngôn ngữ, không phụ thuộc một danh sách từ khóa cố định.\n"

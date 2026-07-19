@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TypedDict
 
 from app.core import settings
 from app.models.job import DubbingRequest
 from app.services.media.ffmpeg import probe_video_duration, run_command, run_command_with_progress
-from app.services.media.renderer import _append_soft_box_blur
+from app.services.media.renderer import _append_soft_box_blur, _video_output_args
 from app.services.subtitles.ass import srt_to_positioned_ass, subtitle_font_dir, write_srt
 from app.services.subtitles.timing import SubtitleEvent
 
@@ -21,6 +23,21 @@ class ReviewSceneHint(TypedDict, total=False):
     voice_start: float | None
     voice_end: float | None
     duration_seconds: float | None
+
+
+class ReviewWordTiming(TypedDict):
+    text: str
+    start: float
+    end: float
+
+
+@dataclass(frozen=True)
+class ReviewScenePlan:
+    """One verified source window fitted to one narration time range."""
+
+    source_start: float
+    source_duration: float
+    output_duration: float
 
 
 def build_review_starts(source_duration: float, target_seconds: float, clip_count: int) -> list[float]:
@@ -37,17 +54,36 @@ def build_review_scenes(
     target_seconds: float,
     scene_hints: list[ReviewSceneHint] | int | None,
 ) -> list[tuple[float, float]]:
+    """Return the source start and output duration for compatibility.
+
+    Rendering needs both the short, verified source span and the longer voice
+    span, so :func:`build_review_scene_plans` is authoritative.  Keeping this
+    lightweight projection avoids breaking callers that only inspect the
+    output schedule.
+    """
+
+    return [
+        (plan.source_start, plan.output_duration)
+        for plan in build_review_scene_plans(source_duration, target_seconds, scene_hints)
+    ]
+
+
+def build_review_scene_plans(
+    source_duration: float,
+    target_seconds: float,
+    scene_hints: list[ReviewSceneHint] | int | None,
+) -> list[ReviewScenePlan]:
     if isinstance(scene_hints, int):
         starts = build_review_starts(source_duration, target_seconds, scene_hints)
         clip_seconds = target_seconds / max(len(starts), 1)
-        return [(start, clip_seconds) for start in starts]
+        return [ReviewScenePlan(start, clip_seconds, clip_seconds) for start in starts]
 
     hints = scene_hints or []
     if not hints:
         clip_count = max(8, min(24, math.ceil(target_seconds / 30)))
         starts = build_review_starts(source_duration, target_seconds, clip_count)
         clip_seconds = target_seconds / max(len(starts), 1)
-        return [(start, clip_seconds) for start in starts]
+        return [ReviewScenePlan(start, clip_seconds, clip_seconds) for start in starts]
 
     durations: list[float] = []
     for hint in hints:
@@ -73,7 +109,7 @@ def build_review_scenes(
         durations[-1] = max(0.8, durations[-1] + target_seconds - total_duration)
     fallback_starts = build_review_starts(source_duration, target_seconds, len(hints))
 
-    scenes: list[tuple[float, float]] = []
+    scenes: list[ReviewScenePlan] = []
     for index, hint in enumerate(hints):
         start = _coerce_seconds(hint.get("start_seconds"))
         end = _coerce_seconds(hint.get("end_seconds"))
@@ -85,17 +121,107 @@ def build_review_scenes(
         fallback_start = fallback_starts[min(index, len(fallback_starts) - 1)]
         start = fallback_start if start is None else start
         end = start + durations[index] if end is None else end
-        start = max(0.0, min(start, max(0.0, source_duration - 1.0)))
-        end = max(start + 0.8, min(end, source_duration))
-        duration = min(max(0.8, durations[index]), max(source_duration, 0.8))
-        # Keep the verified evidence near the middle of one continuous source
-        # window. Replaying slices from a 0.7-2.5s evidence window while a
-        # sentence is still being read creates the visible Doraemon loop.
-        evidence_center = (start + end) / 2
-        clip_start = evidence_center - duration / 2
-        clip_start = max(0.0, min(clip_start, max(0.0, source_duration - duration)))
-        scenes.append((clip_start, duration))
-    return scenes
+        output_duration = min(max(0.8, durations[index]), max(source_duration, 0.8))
+
+        # The EDL interval is centred on the exact keyframe that multimodal QA
+        # accepted.  Expanding a 2.5s verified interval to a 5s voice interval
+        # can cross two shot cuts and show an unrelated action at the beginning
+        # or end of the sentence.  Preserve that evidence window and fit it to
+        # the voice duration during encoding.  This is continuous slow motion,
+        # not a visible loop of the same slice.
+        safe_source_duration = max(0.01, source_duration)
+        requested_start = max(0.0, min(start, safe_source_duration))
+        requested_end = max(requested_start, min(end, safe_source_duration))
+        evidence_center = (requested_start + requested_end) / 2.0
+        evidence_duration = max(0.0, requested_end - requested_start)
+        source_clip_duration = min(
+            output_duration,
+            max(min(0.8, safe_source_duration), evidence_duration),
+        )
+        clip_start = evidence_center - source_clip_duration / 2.0
+        clip_start = max(
+            0.0,
+            min(clip_start, max(0.0, safe_source_duration - source_clip_duration)),
+        )
+        scenes.append(
+            ReviewScenePlan(
+                source_start=clip_start,
+                source_duration=source_clip_duration,
+                output_duration=output_duration,
+            )
+        )
+    scenes = _partition_repeated_verified_windows(scenes)
+    return _quantize_review_plan_durations(scenes, target_seconds)
+
+
+def _partition_repeated_verified_windows(
+    plans: list[ReviewScenePlan],
+) -> list[ReviewScenePlan]:
+    """Play an identical adjacent evidence window only once.
+
+    Two different atomic facts may be visible in the same verified keyframe.
+    Splitting that short source window into chronological pieces keeps both
+    sentences grounded without replaying the exact same frames twice.
+    """
+
+    result = list(plans)
+    index = 0
+    while index < len(result):
+        end = index + 1
+        while end < len(result):
+            first = result[index]
+            candidate = result[end]
+            if (
+                abs(candidate.source_start - first.source_start) > 0.05
+                or abs(candidate.source_duration - first.source_duration) > 0.05
+            ):
+                break
+            end += 1
+        count = end - index
+        if count > 1:
+            first = result[index]
+            slice_duration = first.source_duration / count
+            for offset in range(count):
+                original = result[index + offset]
+                result[index + offset] = ReviewScenePlan(
+                    source_start=first.source_start + offset * slice_duration,
+                    source_duration=slice_duration,
+                    output_duration=original.output_duration,
+                )
+        index = end
+    return result
+
+
+def _quantize_review_plan_durations(
+    plans: list[ReviewScenePlan],
+    target_seconds: float,
+    fps: int = 30,
+) -> list[ReviewScenePlan]:
+    """Align every cut boundary to the final CFR timeline without drift."""
+
+    if not plans:
+        return plans
+    result: list[ReviewScenePlan] = []
+    cumulative = 0.0
+    previous_frame = 0
+    final_frame = max(len(plans), math.ceil(max(0.0, target_seconds) * fps))
+    for index, plan in enumerate(plans):
+        cumulative += plan.output_duration
+        boundary_frame = (
+            final_frame
+            if index == len(plans) - 1
+            else max(previous_frame + 1, round(cumulative * fps))
+        )
+        output_duration = (boundary_frame - previous_frame) / fps
+        result.append(
+            ReviewScenePlan(
+                source_start=plan.source_start,
+                source_duration=plan.source_duration,
+                output_duration=output_duration,
+            )
+        )
+        previous_frame = boundary_frame
+    return result
 
 
 async def render_movie_review_video(
@@ -113,7 +239,7 @@ async def render_movie_review_video(
     narration_duration = await probe_video_duration(ffmpeg, narration_audio)
     target_seconds = narration_duration if narration_duration > 0 else max(1.0, float(target_minutes) * 60.0)
     source_duration = await probe_video_duration(ffmpeg, source_video)
-    scenes = build_review_scenes(source_duration, target_seconds, scene_hints)
+    scenes = build_review_scene_plans(source_duration, target_seconds, scene_hints)
 
     segment_dir = work_dir / "review_segments"
     segment_dir.mkdir(parents=True, exist_ok=True)
@@ -121,34 +247,32 @@ async def render_movie_review_video(
         old_file.unlink()
 
     segment_files: list[Path] = []
-    for index, (start, clip_seconds) in enumerate(scenes, start=1):
+    for index, plan in enumerate(scenes, start=1):
         percent = 84 + int(((index - 1) / max(len(scenes), 1)) * 8)
         on_progress(percent)
         segment = segment_dir / f"segment_{index:04d}.mp4"
+        tempo = plan.output_duration / max(plan.source_duration, 0.01)
+        output_frames = max(1, round(plan.output_duration * 30))
         video_filter = (
             "scale=1280:720:force_original_aspect_ratio=decrease,"
-            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
+            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+            f"setpts={tempo:.8f}*(PTS-STARTPTS),fps=30,"
+            f"tpad=stop_mode=clone:stop=-1,trim=end_frame={output_frames},"
+            "setpts=PTS-STARTPTS"
         )
         command = [
             ffmpeg,
             "-y",
             "-ss",
-            f"{start:.3f}",
+            f"{plan.source_start:.3f}",
             "-t",
-            f"{clip_seconds:.3f}",
+            f"{plan.source_duration:.3f}",
             "-i",
             str(source_video),
             "-an",
             "-vf",
             video_filter,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
+            *_video_output_args(),
             "-movflags",
             "+faststart",
             str(segment),
@@ -235,7 +359,7 @@ def _build_review_output_command(
                     None,
                 )],
                 "reviewstatic",
-                pad_boxes=False,
+                strong_subtitle=True,
             )
 
         if request.custom_blur_boxes:
@@ -266,10 +390,17 @@ def _build_review_output_command(
                 subtitle_filters.append(f"drawbox=x=0:y=ih-{bar_h}:w=iw:h={bar_h}:color=black:t=fill")
 
         if request.hard_subtitles:
-            ass_file = srt_to_positioned_ass(subtitle_file, work_dir / "review_subtitles.positioned.ass", width, height, request)
+            ass_file = srt_to_positioned_ass(
+                subtitle_file,
+                work_dir / "review_subtitles.positioned.ass",
+                width,
+                height,
+                request,
+                single_line=True,
+            )
             subtitle_filters.append(
                 f"subtitles='{_filter_path(ass_file)}':"
-                f"fontsdir='{_filter_path(subtitle_font_dir())}':wrap_unicode=1"
+                f"fontsdir='{_filter_path(subtitle_font_dir())}':wrap_unicode=0"
             )
 
         if subtitle_filters:
@@ -307,12 +438,7 @@ def _build_review_output_command(
         [
             "-t",
             f"{target_seconds:.3f}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
+            *_video_output_args(),
             "-c:a",
             "aac",
             "-b:a",
@@ -331,11 +457,35 @@ def write_review_subtitles(
     target_minutes: int,
     scene_hints: list[ReviewSceneHint] | None = None,
     target_seconds: float | None = None,
+    subtitle_font_size: int = 64,
+    word_timings: list[ReviewWordTiming] | None = None,
 ) -> Path:
     target_seconds = target_seconds if target_seconds and target_seconds > 0 else max(1.0, float(target_minutes) * 60.0)
-    chunks = _split_review_subtitle_chunks(narration_script)
+    max_chars = review_subtitle_single_line_max_chars(subtitle_font_size)
+    chunks = _split_review_subtitle_chunks(narration_script, max_chars=max_chars)
     if not chunks:
         chunks = ["Video review phim."]
+
+    timed_chunks = chunks
+    if scene_hints:
+        hinted_chunks = [
+            chunk
+            for hint in scene_hints
+            for chunk in _split_review_subtitle_chunks(
+                " ".join(str(hint.get("narration") or "").split()),
+                max_chars=max_chars,
+            )
+        ]
+        if hinted_chunks:
+            timed_chunks = hinted_chunks
+    if word_timings:
+        aligned_events = align_review_subtitle_chunks(
+            timed_chunks,
+            word_timings,
+            target_seconds,
+        )
+        if aligned_events:
+            return write_srt(aligned_events, output_file)
 
     if scene_hints and all(
         _coerce_seconds(hint.get("voice_start")) is not None
@@ -349,14 +499,10 @@ def write_review_subtitles(
                 continue
             start = float(hint.get("voice_start") or 0.0)
             end = float(hint.get("voice_end") or start + 0.8)
-            beat_chunks = _split_review_subtitle_chunks(narration)
+            beat_chunks = _split_review_subtitle_chunks(narration, max_chars=max_chars)
             if not beat_chunks:
                 continue
-            chunk_duration = max(0.15, (end - start) / len(beat_chunks))
-            for index, chunk in enumerate(beat_chunks):
-                chunk_start = start + index * chunk_duration
-                chunk_end = min(end, start + (index + 1) * chunk_duration)
-                events.append(SubtitleEvent(start=chunk_start, end=chunk_end, text=chunk))
+            events.extend(_weighted_subtitle_events(beat_chunks, start, end))
         return write_srt(events, output_file)
 
     if scene_hints:
@@ -397,6 +543,143 @@ def write_review_subtitles(
             events.append(SubtitleEvent(start=start, end=end, text=chunk))
 
     return write_srt(events, output_file)
+
+
+def review_subtitle_single_line_max_chars(
+    subtitle_font_size: int,
+    width: int = 1280,
+    height: int = 720,
+) -> int:
+    """Conservative character budget for one unwrapped ASS subtitle line."""
+
+    requested_size = max(16, min(120, int(subtitle_font_size)))
+    ass_font_size = max(16, round(requested_size * height / 1080 * 1.25))
+    return max(14, int((width * 0.78) / max(ass_font_size * 0.54, 1)))
+
+
+def align_review_subtitle_chunks(
+    chunks: list[str],
+    word_timings: list[ReviewWordTiming],
+    target_seconds: float,
+) -> list[SubtitleEvent]:
+    """Attach display chunks to the word boundaries emitted by the same TTS audio."""
+
+    aligned = _aligned_review_text_groups(chunks, word_timings)
+    if aligned is None:
+        return []
+    normalized_chunks, word_groups = aligned
+
+    raw: list[tuple[float, float, str]] = []
+    for chunk, covered in zip(normalized_chunks, word_groups):
+        start = max(0.0, float(covered[0]["start"]) - 0.08)
+        end = min(target_seconds, float(covered[-1]["end"]) + 0.18)
+        raw.append((start, end, chunk))
+
+    events: list[SubtitleEvent] = []
+    for index, (start, end, chunk) in enumerate(raw):
+        if index + 1 < len(raw):
+            next_start = raw[index + 1][0]
+            end = min(end, next_start) if next_start > start + 0.12 else max(end, next_start)
+        end = min(target_seconds, max(start + 0.12, end))
+        if end > start:
+            events.append(SubtitleEvent(start=start, end=end, text=chunk))
+    return events if len(events) == len(normalized_chunks) else []
+
+
+def align_review_narration_ranges(
+    narrations: list[str],
+    word_timings: list[ReviewWordTiming],
+    target_seconds: float,
+) -> list[tuple[float, float]]:
+    """Switch review scenes at the real start of each narrated segment."""
+
+    aligned = _aligned_review_text_groups(narrations, word_timings)
+    if aligned is None:
+        return []
+    _, word_groups = aligned
+    starts = [0.0]
+    for group in word_groups[1:]:
+        starts.append(max(starts[-1], min(target_seconds, float(group[0]["start"]) - 0.08)))
+    ranges = [
+        (
+            start,
+            starts[index + 1] if index + 1 < len(starts) else target_seconds,
+        )
+        for index, start in enumerate(starts)
+    ]
+    return ranges if all(end > start for start, end in ranges) else []
+
+
+def _aligned_review_text_groups(
+    texts: list[str],
+    word_timings: list[ReviewWordTiming],
+) -> tuple[list[str], list[list[ReviewWordTiming]]] | None:
+    normalized_texts = [" ".join(text.split()) for text in texts if text.strip()]
+    timed_words: list[tuple[ReviewWordTiming, str]] = []
+    for item in word_timings:
+        try:
+            valid_range = float(item.get("end") or 0.0) > float(item.get("start") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        key = _voice_alignment_key(str(item.get("text") or ""))
+        if valid_range and key:
+            timed_words.append((item, key))
+    text_keys = [_voice_alignment_key(text) for text in normalized_texts]
+    if (
+        not normalized_texts
+        or not timed_words
+        or any(not key for key in text_keys)
+        or "".join(text_keys) != "".join(key for _, key in timed_words)
+    ):
+        return None
+
+    word_spans: list[tuple[int, int, ReviewWordTiming]] = []
+    cursor = 0
+    for item, key in timed_words:
+        word_spans.append((cursor, cursor + len(key), item))
+        cursor += len(key)
+
+    groups: list[list[ReviewWordTiming]] = []
+    cursor = 0
+    for key in text_keys:
+        text_start, text_end = cursor, cursor + len(key)
+        covered = [
+            item
+            for word_start, word_end, item in word_spans
+            if word_end > text_start and word_start < text_end
+        ]
+        if not covered:
+            return None
+        groups.append(covered)
+        cursor = text_end
+    return normalized_texts, groups
+
+
+def _voice_alignment_key(text: str) -> str:
+    normalized = unicodedata.normalize("NFC", text).casefold()
+    return "".join(char for char in normalized if char.isalnum())
+
+
+def _weighted_subtitle_events(
+    chunks: list[str],
+    start: float,
+    end: float,
+) -> list[SubtitleEvent]:
+    """Fallback timing that follows spoken text length instead of equal slices."""
+
+    if not chunks or end <= start:
+        return []
+    weights = [max(1.0, _narration_weight(chunk)) for chunk in chunks]
+    total = sum(weights)
+    cursor = start
+    events: list[SubtitleEvent] = []
+    cumulative = 0.0
+    for index, (chunk, weight) in enumerate(zip(chunks, weights)):
+        cumulative += weight
+        chunk_end = end if index == len(chunks) - 1 else start + (end - start) * cumulative / total
+        events.append(SubtitleEvent(start=cursor, end=chunk_end, text=chunk))
+        cursor = chunk_end
+    return events
 
 
 def _split_review_subtitle_chunks(text: str, max_chars: int = 38) -> list[str]:

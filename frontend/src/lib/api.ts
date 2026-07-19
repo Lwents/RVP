@@ -27,21 +27,38 @@ export interface UploadProgress {
   bytesPerSecond: number | null;
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...options?.headers,
-    },
-    ...options,
-  });
+type ApiRequestInit = RequestInit & { timeoutMs?: number };
 
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(detail || `Request failed with status ${response.status}`);
+async function request<T>(path: string, options?: ApiRequestInit): Promise<T> {
+  const controller = new AbortController();
+  const timeoutMs = options?.timeoutMs ?? 180_000;
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  const { timeoutMs: _timeoutMs, ...fetchOptions } = options ?? {};
+
+  try {
+    const response = await fetch(`${API_URL}${path}`, {
+      headers: {
+        "Content-Type": "application/json",
+        ...fetchOptions.headers,
+      },
+      ...fetchOptions,
+      signal: fetchOptions.signal ?? controller.signal,
+    });
+
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(detail || `Request failed with status ${response.status}`);
+    }
+
+    return response.json() as Promise<T>;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(`Yêu cầu quá thời gian ${Math.round(timeoutMs / 1000)} giây. Đã dừng chờ và sẽ đồng bộ lại trạng thái.`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
   }
-
-  return response.json() as Promise<T>;
 }
 
 export async function uploadWatermark(file: File): Promise<UploadResponse> {
@@ -136,6 +153,13 @@ export async function getJob(jobId: string): Promise<JobProgress> {
 export async function generateJobMetadata(jobId: string): Promise<JobProgress> {
   return request(`/api/jobs/${jobId}/metadata`, {
     method: "POST",
+  });
+}
+
+export async function evaluateJob(jobId: string): Promise<JobProgress> {
+  return request(`/api/jobs/${jobId}/evaluate`, {
+    method: "POST",
+    timeoutMs: 600_000,
   });
 }
 
@@ -283,17 +307,39 @@ export async function retryReviewDraftJob(jobId: string, processingMode: Process
   });
 }
 
+export async function cancelReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
+  return request(`/api/review/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+    timeoutMs: 30_000,
+  });
+}
+
 export async function listReviewDraftJobs(): Promise<ReviewDraftJob[]> {
   return request("/api/review/jobs");
 }
 
 export async function getReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
-  return request(`/api/review/jobs/${jobId}`);
+  return request(`/api/review/jobs/${jobId}`, { timeoutMs: 30_000 });
 }
 
 export async function renderReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
   return request(`/api/review/jobs/${encodeURIComponent(jobId)}/render`, {
     method: "POST",
+    timeoutMs: 30_000,
+  });
+}
+
+export async function optimizeReviewDraftJob(jobId: string): Promise<ReviewDraftJob> {
+  return request(`/api/review/jobs/${encodeURIComponent(jobId)}/optimize`, {
+    method: "POST",
+    timeoutMs: 120_000,
+  });
+}
+
+export async function renderReviewPreviewJob(jobId: string): Promise<ReviewDraftJob> {
+  return request(`/api/review/jobs/${encodeURIComponent(jobId)}/render-preview`, {
+    method: "POST",
+    timeoutMs: 30_000,
   });
 }
 
@@ -305,6 +351,7 @@ export async function updateReviewDraftSegment(
   return request(`/api/review/jobs/${encodeURIComponent(jobId)}/segments/${encodeURIComponent(segmentId)}`, {
     method: "PATCH",
     body: JSON.stringify(payload),
+    timeoutMs: 120_000,
   });
 }
 
