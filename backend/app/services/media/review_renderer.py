@@ -241,6 +241,10 @@ async def render_movie_review_video(
     narration_duration = await probe_video_duration(ffmpeg, narration_audio)
     target_seconds = narration_duration if narration_duration > 0 else max(1.0, float(target_minutes) * 60.0)
     source_duration = await probe_video_duration(ffmpeg, source_video)
+    if source_duration <= 0:
+        # 0.0 means "could not measure"; continuing would collapse every scene
+        # plan to a 0.8s clip stretched over the whole narration.
+        raise RuntimeError("Không đo được thời lượng phim gốc để cắt cảnh review.")
     scenes = build_review_scene_plans(source_duration, target_seconds, scene_hints)
     # Cùng một encoder đã được kiểm tra thật cho cả cắt cảnh lẫn bản render cuối.
     encoder = await resolve_video_encoder(ffmpeg)
@@ -534,8 +538,10 @@ def write_review_subtitles(
 
         duration_per_chunk = beat_duration / len(beat_chunks)
         for index, chunk in enumerate(beat_chunks):
-            start = cursor + index * duration_per_chunk
+            start = min(target_seconds, cursor + index * duration_per_chunk)
             end = min(target_seconds, cursor + (index + 1) * duration_per_chunk)
+            if end <= start:
+                continue
             events.append(SubtitleEvent(start=start, end=end, text=chunk))
         cursor += beat_duration
 
@@ -732,21 +738,35 @@ def _allocate_weighted_durations(weights: list[float], target_seconds: float) ->
     if not weights:
         return [target_seconds]
 
-    total_weight = sum(max(1.0, weight) for weight in weights)
-    if total_weight <= 0:
-        return [target_seconds / len(weights) for _ in weights]
+    normalized = [max(1.0, weight) for weight in weights]
+    count = len(normalized)
+    # The readability floor must stay affordable: floors summing past the
+    # narration length would walk the subtitle cursor beyond the audio and
+    # produce inverted (end < start) cues in the fallback writer.
+    floor = min(7.0, max(2.5, target_seconds / count * 0.45), target_seconds / count)
 
-    min_duration = min(7.0, max(2.5, target_seconds / len(weights) * 0.45))
-    durations = [max(min_duration, target_seconds * max(1.0, weight) / total_weight) for weight in weights]
-    total_duration = sum(durations)
-    if total_duration <= 0:
-        return [target_seconds / len(weights) for _ in weights]
-
-    scale = target_seconds / total_duration
-    fitted = [max(2.5, duration * scale) for duration in durations]
-    drift = target_seconds - sum(fitted)
-    fitted[-1] = max(2.5, fitted[-1] + drift)
-    return fitted
+    # Water-filling: pin every entry whose proportional share falls under the
+    # floor, then re-share the remainder by weight until stable. The floor is
+    # capped at target/count, so the result always sums to target_seconds.
+    durations = [0.0] * count
+    remaining_indices = list(range(count))
+    remaining_seconds = target_seconds
+    while remaining_indices:
+        remaining_weight = sum(normalized[i] for i in remaining_indices)
+        pinned = [
+            i for i in remaining_indices
+            if remaining_seconds * normalized[i] / remaining_weight < floor
+        ]
+        if not pinned:
+            for i in remaining_indices:
+                durations[i] = remaining_seconds * normalized[i] / remaining_weight
+            break
+        for i in pinned:
+            durations[i] = floor
+            remaining_seconds -= floor
+        pinned_set = set(pinned)
+        remaining_indices = [i for i in remaining_indices if i not in pinned_set]
+    return durations
 
 
 def _allocate_chunk_counts(total_chunks: int, durations: list[float]) -> list[int]:

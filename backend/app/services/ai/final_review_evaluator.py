@@ -128,14 +128,19 @@ async def _collect_final_signals(
 ) -> dict:
     ffmpeg = find_ffmpeg() or "ffmpeg"
     media_duration = await probe_video_duration(ffmpeg, rendered_video)
+    if media_duration <= 0:
+        # probe_video_duration returns 0.0 for "could not measure". Scoring that
+        # as maximum drift would zero the technical scores of a good render;
+        # raising here routes to _default_signals, which treats it as unknown.
+        raise RuntimeError("Không đo được thời lượng video render (ffprobe trả 0).")
     expected_voice_duration = max(
         (item.voice_end for item in package.edit_decision_list),
         default=0.0,
     )
     duration_drift = (
         abs(media_duration - expected_voice_duration)
-        if media_duration > 0 and expected_voice_duration > 0
-        else max(media_duration, expected_voice_duration)
+        if expected_voice_duration > 0
+        else media_duration
     )
     subtitle_events = _read_subtitles(subtitle_file)
     word_timings = _read_word_timings(

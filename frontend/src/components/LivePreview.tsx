@@ -423,6 +423,17 @@ export const LivePreview = React.memo(function LivePreview({
             key={index}
             ref={(el) => {
               customBoxNodeRefs.current[index] = el;
+              // A time-ranged box can unmount mid-drag (playhead passes end_seconds),
+              // so the pointer-up handler never fires; drop the drag here or every
+              // slider→preview sync stays blocked on the stale dragStartRef.
+              const drag = dragStartRef.current;
+              if (
+                el === null
+                && drag?.index === index
+                && (drag.type === "custom-blur-box" || drag.type === "custom-blur-resize")
+              ) {
+                dragStartRef.current = null;
+              }
             }}
             className="custom-blur-box-layer"
             style={{

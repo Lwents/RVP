@@ -201,10 +201,8 @@ export interface ReviewFinalEvaluation {
 export interface ReviewDraftResult {
   title: string;
   target_minutes: number;
-  estimated_duration_seconds?: number | null;
   narration_duration_seconds?: number | null;
   output_duration_seconds?: number | null;
-  actual_duration_seconds?: number | null;
   hook: string;
   summary: string;
   narration_script: string;

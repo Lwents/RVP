@@ -64,11 +64,11 @@ async function request<T>(path: string, options?: ApiRequestInit): Promise<T> {
 
   try {
     const response = await fetch(`${API_URL}${path}`, {
+      ...fetchOptions,
       headers: {
         "Content-Type": "application/json",
         ...fetchOptions.headers,
       },
-      ...fetchOptions,
       signal: fetchOptions.signal ?? controller.signal,
     });
 

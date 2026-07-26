@@ -351,7 +351,7 @@ async def build_verified_review_package(
     )
     metadata = _canonicalize_review_metadata(metadata, character_names)
     segments = _canonicalize_narration_names(segments, character_names)
-    segments = _normalize_segments(segments, story_events, target_minutes)
+    segments = _normalize_segments(segments, story_events, target_minutes, style)
     if not segments:
         raise RuntimeError("AI không tạo được câu review gắn với event hợp lệ.")
 
@@ -1067,7 +1067,10 @@ def _validate_event_timeline(raw_events: object, scenes: list[AnalyzedScene]) ->
     for item in raw_events:
         if not isinstance(item, dict):
             continue
-        ids = [value for value in _string_list(item.get("scene_ids")) if value in scene_by_id]
+        # An over-merged act can legitimately span far more than 20 scenes;
+        # truncating its scene list corrupts the event span and orphans real
+        # footage, so scene_ids must never be capped.
+        ids = [value for value in _string_list(item.get("scene_ids"), limit=None) if value in scene_by_id]
         if not ids:
             continue
         linked = sorted((scene_by_id[value] for value in ids), key=lambda scene: scene.start_time)
@@ -2340,6 +2343,7 @@ def _normalize_segments(
     segments: list[NarrationSegment],
     events: list[StoryEvent],
     target_minutes: int,
+    style: str = "story",
 ) -> list[NarrationSegment]:
     order = {event.event_id: event.order_index for event in events}
     story_roles = _event_story_roles(events)
@@ -2360,7 +2364,10 @@ def _normalize_segments(
                     }
                 )
             )
-    max_segments = max(12, target_minutes * 15)
+    # Cap with the same contract the generation gate enforced; a flat
+    # target_minutes*15 cap sat below the budget for fast/funny styles and
+    # silently chopped the end of an already-validated script.
+    max_segments = _review_narration_budget(target_minutes, style).max_segments
     return normalized[:max_segments]
 
 
@@ -2694,7 +2701,9 @@ def _quality_report(
     evidence = 100.0 * sum(event.verification_status == "verified" for event in events) / max(len(events), 1)
     named = [name for scene in scenes for name in scene.characters if name.upper() != "UNKNOWN"]
     unknown = [name for scene in scenes for name in scene.characters if name.upper() == "UNKNOWN"]
-    character_score = 100.0 if not unknown else max(60.0, 100.0 - 4.0 * len(unknown) / max(len(named) + len(unknown), 1))
+    # Penalize by the share of UNKNOWN mentions: an all-unknown cast bottoms out
+    # at the 60-point floor instead of scoring a near-perfect 96.
+    character_score = 100.0 if not unknown else max(60.0, 100.0 - 40.0 * len(unknown) / max(len(named) + len(unknown), 1))
     budget = _review_narration_budget(target_minutes, style)
     word_count = _narration_word_count(segments)
     word_error = abs(word_count - budget.target_words) / max(budget.target_words, 1)
@@ -3263,6 +3272,16 @@ async def _repair_low_visual_narration(
     proposed = list(segments)
     segment_index = {item.segment_id: index for index, item in enumerate(segments)}
     changed = False
+    # Clip start each decision currently points at, updated as repairs are
+    # accepted. Validating a repair against the ORIGINAL neighbors lets two
+    # adjacent repairs cross in time (each inside its own frozen window); the
+    # whole-list atomicity gate then rejects the round and every repair —
+    # including valid ones — is thrown away.
+    effective_starts = {
+        index: decision.source_clips[0].start_seconds
+        for index, decision in enumerate(decisions)
+        if decision.source_clips
+    }
     for offset in range(0, len(low_decisions), 3):
         batch = low_decisions[offset : offset + 3]
         content: list[dict] = [
@@ -3424,12 +3443,16 @@ async def _repair_low_visual_narration(
             context = decision_context.get(segment_id)
             if original is None or context is None:
                 continue
-            _, previous_start, next_start, allowed_scene_ids = context
+            decision_index, _, _, allowed_scene_ids = context
             scene_id = str(item.get("scene_id") or "")
             scene = scene_by_id.get(scene_id)
             event = event_by_id.get(original.event_id)
             if scene is None or event is None or scene_id not in allowed_scene_ids or scene_id not in event.scene_ids:
                 continue
+            earlier_indices = [idx for idx in effective_starts if idx < decision_index]
+            later_indices = [idx for idx in effective_starts if idx > decision_index]
+            previous_start = effective_starts[max(earlier_indices)] if earlier_indices else float("-inf")
+            next_start = effective_starts[min(later_indices)] if later_indices else float("inf")
             if scene.start_time + 0.25 < previous_start or scene.start_time > next_start + 0.25:
                 continue
             narration = unicodedata.normalize("NFC", _safe_text(item.get("narration"), ""))
@@ -3463,6 +3486,7 @@ async def _repair_low_visual_narration(
             if _visual_atomicity_issues([candidate], scene_by_id):
                 continue
             proposed[segment_index[segment_id]] = candidate
+            effective_starts[decision_index] = scene.start_time
             changed = True
     return proposed, changed
 
@@ -3623,8 +3647,13 @@ async def verify_rendered_review(
         qa_dir,
     )
     probed_duration = await probe_video_duration(find_ffmpeg() or "ffmpeg", rendered_video)
-    media_duration = probed_duration if probed_duration > 0 else decoded_duration
     expected_duration = max((item.voice_end for item in package.edit_decision_list), default=0.0)
+    # decoded_duration is only the last QA sample timestamp (voice_start + 0.8×window),
+    # always ~0.2 windows short of the real runtime, so using it as the measured
+    # duration fabricates VOICE_VIDEO_DRIFT on a perfect render. Without a working
+    # probe there is no real measurement: fall back to the planned voice timeline
+    # and leave duration enforcement to the synthesized-audio gate.
+    media_duration = probed_duration if probed_duration > 0 else max(decoded_duration, expected_duration)
     segment_by_id = {item.segment_id: item for item in package.narration_segments}
     scores: dict[str, float] = {}
     notes: dict[str, str] = {}
@@ -4213,7 +4242,7 @@ def _dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _string_list(value: object) -> list[str]:
+def _string_list(value: object, limit: int | None = 20) -> list[str]:
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list):
@@ -4223,7 +4252,7 @@ def _string_list(value: object) -> list[str]:
         text = unicodedata.normalize("NFC", str(item)).strip()
         if text and text not in result:
             result.append(text)
-    return result[:20]
+    return result if limit is None else result[:limit]
 
 
 def _safe_text(value: object, fallback: str) -> str:

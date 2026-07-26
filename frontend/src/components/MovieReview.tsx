@@ -148,6 +148,9 @@ export const MovieReview = React.memo(function MovieReview() {
   const didLoadInitialReviewJobRef = useRef(false);
   const segmentSaveInFlightRef = useRef(false);
   const reviewPollInFlightRef = useRef(false);
+  // Remembers the exact error text the status poll last showed, so the next
+  // successful tick can clear it without wiping unrelated messages.
+  const reviewPollErrorRef = useRef<string | null>(null);
   const reviewHistoryPollInFlightRef = useRef(false);
   const outputCacheIdentityRef = useRef<string | null>(null);
   const [videoPath, setVideoPath] = useState("");
@@ -244,15 +247,27 @@ export const MovieReview = React.memo(function MovieReview() {
       reviewPollInFlightRef.current = true;
       try {
         const nextJob = await getReviewDraftJob(jobId);
-        if (cancelled || nextJob.job_id !== jobId || isStaleReviewSnapshot(job, nextJob)) return;
+        if (cancelled) return;
+        if (reviewPollErrorRef.current) {
+          const staleError = reviewPollErrorRef.current;
+          reviewPollErrorRef.current = null;
+          setMessage((current) => (current === staleError ? null : current));
+        }
+        if (nextJob.job_id !== jobId || isStaleReviewSnapshot(job, nextJob)) return;
         if (nextJob.updated_at !== job.updated_at || nextJob.status !== job.status) {
           const outputBecameAvailable = !job.result?.output_video_url && Boolean(nextJob.result?.output_video_url);
           setJob((previous) => (isStaleReviewSnapshot(previous, nextJob) ? previous : nextJob));
-          setReviewJobs((items) => items.map((item) => item.job_id === nextJob.job_id ? nextJob : item));
+          setReviewJobs((items) => items.map((item) => (
+            item.job_id === nextJob.job_id && !isStaleReviewSnapshot(item, nextJob) ? nextJob : item
+          )));
           if (outputBecameAvailable) setPreviewMode("output");
         }
       } catch (error) {
-        if (!cancelled) setMessage(error instanceof Error ? error.message : "Không thể lấy trạng thái review job.");
+        if (!cancelled) {
+          const text = error instanceof Error ? error.message : "Không thể lấy trạng thái review job.";
+          reviewPollErrorRef.current = text;
+          setMessage(text);
+        }
       } finally {
         reviewPollInFlightRef.current = false;
       }
@@ -496,6 +511,7 @@ export const MovieReview = React.memo(function MovieReview() {
     && qualityReport?.passed
     && !reviewIsBusy
     && !isRenderingReview
+    && !isPreviewingReview
     && !isSavingAnySegment
     && !reviewConfigurationChanged,
   );
@@ -505,6 +521,7 @@ export const MovieReview = React.memo(function MovieReview() {
     && !reviewIsBusy
     && !isSavingAnySegment
     && !isRenderingReview
+    && !isPreviewingReview
     && !isOptimizingReview,
   );
   const canRenderPreviewReview = Boolean(
@@ -513,6 +530,7 @@ export const MovieReview = React.memo(function MovieReview() {
     && !reviewIsBusy
     && !isSavingAnySegment
     && !isRenderingReview
+    && !isPreviewingReview
     && !isOptimizingReview
     && !reviewConfigurationChanged,
   );
@@ -539,7 +557,6 @@ export const MovieReview = React.memo(function MovieReview() {
   const targetDurationSeconds = job ? normalizeTargetMinutes(job.request.target_minutes) * 60 : null;
   const plannedDurationSeconds = reviewPlannedDurationSeconds(result);
   const reportedOutputDurationSeconds = firstFinitePositive([
-    result?.actual_duration_seconds,
     result?.output_duration_seconds,
   ]);
   const actualOutputDurationSeconds = outputVideoUrl
@@ -569,40 +586,51 @@ export const MovieReview = React.memo(function MovieReview() {
     setOutputDurationSeconds(Number.isFinite(duration) && duration > 0 ? duration : null);
   }, []);
 
+  const seekSourcePreview = useCallback((seconds: number) => {
+    const el = previewRef.current;
+    if (!el) return;
+    const apply = () => {
+      el.currentTime = Math.max(0, seconds);
+      el.play().catch(() => undefined);
+    };
+    // Before metadata is loaded, setting currentTime is ignored by some browsers.
+    if (el.readyState >= 1) apply();
+    else el.addEventListener("loadedmetadata", apply, { once: true });
+  }, []);
+
+  // Seek requested while the preview was still on the output tab; applied once the
+  // source <video> has actually mounted (a fixed timeout can fire before commit).
+  const pendingSourceSeekRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (previewMode !== "source" || pendingSourceSeekRef.current == null) return;
+    const seconds = pendingSourceSeekRef.current;
+    pendingSourceSeekRef.current = null;
+    seekSourcePreview(seconds);
+  }, [previewMode, seekSourcePreview]);
+
   const jumpToBeat = useCallback((index: number) => {
     const beat = result?.beats[index];
-    if (!beat || !previewRef.current) return;
+    if (!beat) return;
     setSelectedBeatIndex(index);
+    if (beat.start_seconds == null) return;
     if (previewMode !== "source") {
+      pendingSourceSeekRef.current = Math.max(0, beat.start_seconds);
       setPreviewMode("source");
-      window.setTimeout(() => {
-        if (previewRef.current && beat.start_seconds != null) {
-          previewRef.current.currentTime = Math.max(0, beat.start_seconds);
-          previewRef.current.play().catch(() => undefined);
-        }
-      }, 80);
       return;
     }
-    if (beat.start_seconds != null) {
-      previewRef.current.currentTime = Math.max(0, beat.start_seconds);
-      previewRef.current.play().catch(() => undefined);
-    }
-  }, [previewMode, result]);
+    seekSourcePreview(beat.start_seconds);
+  }, [previewMode, result, seekSourcePreview]);
 
   const previewCandidate = useCallback((index: number, candidate: ReviewBeatCandidate) => {
     setSelectedBeatIndex(index);
-    const seek = () => {
-      if (!previewRef.current) return;
-      previewRef.current.currentTime = Math.max(0, candidate.start_seconds);
-      previewRef.current.play().catch(() => undefined);
-    };
     if (previewMode !== "source") {
+      pendingSourceSeekRef.current = Math.max(0, candidate.start_seconds);
       setPreviewMode("source");
-      window.setTimeout(seek, 80);
       return;
     }
-    seek();
-  }, [previewMode]);
+    seekSourcePreview(candidate.start_seconds);
+  }, [previewMode, seekSourcePreview]);
 
   const persistSegmentEdit = useCallback(async (
     beat: ReviewBeat,
@@ -1567,7 +1595,6 @@ function reviewPlannedDurationSeconds(result: ReviewDraftJob["result"]): number 
   if (!result) return null;
   const reported = firstFinitePositive([
     result.narration_duration_seconds,
-    result.estimated_duration_seconds,
   ]);
   if (reported != null) return reported;
 

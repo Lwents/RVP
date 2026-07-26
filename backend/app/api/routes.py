@@ -103,6 +103,8 @@ class ReviewDraftResult(BaseModel):
     subtitle_file_path: str | None = None
     output_video_url: str | None = None
     output_file_path: str | None = None
+    narration_duration_seconds: float | None = None
+    output_duration_seconds: float | None = None
     scenes: list[AnalyzedScene] = Field(default_factory=list)
     events: list[StoryEvent] = Field(default_factory=list)
     narration_segments: list[NarrationSegment] = Field(default_factory=list)
@@ -538,6 +540,8 @@ def _review_result_from_package(
     package: VerifiedReviewPackage,
     subtitle_file_path: str | None = None,
     output_file_path: str | None = None,
+    narration_duration_seconds: float | None = None,
+    output_duration_seconds: float | None = None,
 ) -> ReviewDraftResult:
     segment_by_id = {segment.segment_id: segment for segment in package.narration_segments}
     beats: list[ReviewBeatResponse] = []
@@ -577,6 +581,8 @@ def _review_result_from_package(
         subtitle_file_path=subtitle_file_path,
         output_video_url=f"/api/review/jobs/{job_id}/download" if output_file_path else None,
         output_file_path=output_file_path,
+        narration_duration_seconds=narration_duration_seconds,
+        output_duration_seconds=output_duration_seconds,
         scenes=package.scenes,
         events=package.events,
         narration_segments=package.narration_segments,
@@ -773,14 +779,17 @@ def _auto_optimize_review_result(
 def _review_scene_hints(decisions: list[EditDecision]) -> list[dict]:
     hints: list[dict] = []
     for decision in decisions:
-        if not decision.source_clips:
-            continue
-        selected = decision.source_clips[0]
+        # A decision without a clip (preview render before the NO_CLIP gate)
+        # must still occupy its voice span in the plan: the renderer tiles
+        # scene durations from zero, so dropping the hint would shift every
+        # later scene against the narration audio and subtitles. Null source
+        # times route the renderer to its fallback-start path instead.
+        selected = decision.source_clips[0] if decision.source_clips else None
         hints.append(
             {
-                "time_hint": _format_review_time_hint(selected.start_seconds, selected.end_seconds),
-                "start_seconds": selected.start_seconds,
-                "end_seconds": selected.end_seconds,
+                "time_hint": _format_review_time_hint(selected.start_seconds, selected.end_seconds) if selected else "",
+                "start_seconds": selected.start_seconds if selected else None,
+                "end_seconds": selected.end_seconds if selected else None,
                 "voice_start": decision.voice_start,
                 "voice_end": decision.voice_end,
                 "duration_seconds": max(0.8, decision.voice_end - decision.voice_start),
@@ -1135,11 +1144,14 @@ async def _process_review_draft_job(job_id: str) -> None:
             evaluation_error = str(exc)
             print(f"[review] Chấm điểm video cuối thất bại cho job {job_id}: {exc}")
 
+        measured_output_duration = await probe_video_duration(ffmpeg, output_file)
         result = _review_result_from_package(
             job_id,
             package,
             subtitle_file_path=str(review_subtitle_file),
             output_file_path=str(output_file),
+            narration_duration_seconds=narration_duration if narration_duration > 0 else None,
+            output_duration_seconds=measured_output_duration if measured_output_duration > 0 else None,
         )
         if package.final_evaluation is not None:
             stage = f"Hoàn tất bản review phim · AI chấm {package.final_evaluation.overall_score:.1f}/100"
@@ -1339,6 +1351,7 @@ async def _render_existing_review_job(job_id: str, *, allow_preview: bool = Fals
         final_file = work_dir / ("review_preview.mp4" if is_warning_preview else "review_final.mp4")
         await asyncio.to_thread(shutil.copy2, draft_file, final_file)
         package.artifact_paths["review_preview" if is_warning_preview else "review_final"] = str(final_file)
+        final_duration = await probe_video_duration(ffmpeg, final_file)
         _update_review_job(job_id, progress=99, stage="AI giám khảo đang chấm video vừa render")
         # The rendered file already exists; a scoring failure must not mark the
         # job failed and hide it behind a 404 on the download route.
@@ -1377,6 +1390,8 @@ async def _render_existing_review_job(job_id: str, *, allow_preview: bool = Fals
                 package,
                 subtitle_file_path=str(subtitle_file),
                 output_file_path=str(final_file),
+                narration_duration_seconds=duration if duration > 0 else None,
+                output_duration_seconds=final_duration if final_duration > 0 else None,
             ),
         )
     except Exception as exc:
