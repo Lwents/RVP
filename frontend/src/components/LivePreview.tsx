@@ -414,7 +414,8 @@ export const LivePreview = React.memo(function LivePreview({
         {custom_blur_boxes?.map((box, index) => {
           const hasTimeRange = typeof box.start_seconds === "number" && typeof box.end_seconds === "number";
           if (hasTimeRange && (previewTime < box.start_seconds! || previewTime > box.end_seconds!)) {
-            customBoxNodeRefs.current[index] = null;
+            // Do not mutate customBoxNodeRefs here: writing a ref during render is unsafe
+            // under StrictMode. React already calls the ref callback with null on unmount.
             return null;
           }
           return (

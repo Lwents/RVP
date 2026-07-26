@@ -11,6 +11,11 @@ from app.services.media.ffmpeg import find_ffmpeg, probe_video_duration
 from app.services.subtitles.timing import SubtitleEvent, normalize_events, parse_srt
 
 
+# Per-cue FFmpeg work finishes in seconds; the concat of a full timeline is the
+# slowest command. The cap only exists so a wedged process cannot hang the job.
+AUDIO_COMMAND_TIMEOUT_SECONDS = 600.0
+
+
 class VoiceError(RuntimeError):
     pass
 
@@ -233,7 +238,9 @@ class EdgeTtsVoiceEngine(VoiceEngine):
                     progress(f"Tạo giọng đọc khớp phụ đề ({completed_count}/{total})", percent)
                 return files
 
-        rendered_groups = await asyncio.gather(*(render_event(spec) for spec in event_specs))
+        rendered_groups = await _gather_cancel_on_error(
+            render_event(spec) for spec in event_specs
+        )
         timeline_files = [path for group in rendered_groups for path in group]
 
         if duration > cursor + 0.03:
@@ -641,9 +648,41 @@ async def _probe_audio_duration(path: Path) -> float:
     return await probe_video_duration(ffmpeg, path)
 
 
-async def _run_audio_command(command: list[str], error_message: str) -> None:
+async def _gather_cancel_on_error(coroutines) -> list:
+    """Gather that never leaves siblings running (and unawaited) after a failure."""
+    tasks = [asyncio.ensure_future(coroutine) for coroutine in coroutines]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        # Awaiting the cancelled siblings stops them from writing into
+        # tts_aligned/ after the job failed and retrieves their exceptions.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def _run_audio_command(
+    command: list[str],
+    error_message: str,
+    timeout: float = AUDIO_COMMAND_TIMEOUT_SECONDS,
+) -> None:
     def run() -> None:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        # synthesize_srt issues one command per subtitle cue; without a timeout a
+        # single wedged FFmpeg would stall the whole dubbing job forever.
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # subprocess.run kills the child before re-raising.
+            raise VoiceError(
+                f"{error_message} FFmpeg không phản hồi trong {int(timeout)} giây nên đã bị dừng."
+            ) from exc
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise VoiceError(f"{error_message} {detail}")

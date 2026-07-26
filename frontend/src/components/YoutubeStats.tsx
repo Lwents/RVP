@@ -26,26 +26,33 @@ export const YoutubeStats = React.memo(function YoutubeStats() {
     return errMessage;
   };
 
+  // Set to true on unmount so async callbacks stop calling setState.
+  const cancelledRef = useRef(false);
+
   useEffect(() => {
+    cancelledRef.current = false;
+
     // Check if we are returning from OAuth callback
     const urlParams = new URLSearchParams(window.location.search);
     const code = urlParams.get("code");
-    
+
     if (code) {
       if (!oauthExchangeInitiated) {
         oauthExchangeInitiated = true;
         setLoading(true);
-        
+
         // Clean URL immediately
         window.history.replaceState({}, document.title, window.location.pathname);
-        
+
         sendYoutubeCallbackCode(code, redirectUri)
           .then(() => {
             oauthExchangeInitiated = false;
+            if (cancelledRef.current) return;
             fetchStats();
           })
           .catch(err => {
             oauthExchangeInitiated = false;
+            if (cancelledRef.current) return;
             setError(parseErrorMessage(err.message || "Failed to authenticate with YouTube"));
             setLoading(false);
           });
@@ -55,20 +62,27 @@ export const YoutubeStats = React.memo(function YoutubeStats() {
         fetchStats();
       }
     }
+
+    return () => {
+      cancelledRef.current = true;
+    };
   }, []);
 
   const fetchStats = async () => {
+    if (cancelledRef.current) return;
     setLoading(true);
     setError(null);
     try {
       const data = await getYoutubeStats();
+      if (cancelledRef.current) return;
       setChannel(data.channel);
       setVideos(data.videos || []);
     } catch (err: any) {
+      if (cancelledRef.current) return;
       const rawMsg = err.message || "Lỗi tải dữ liệu. Vui lòng xác thực kênh Youtube.";
       setError(parseErrorMessage(rawMsg));
     } finally {
-      setLoading(false);
+      if (!cancelledRef.current) setLoading(false);
     }
   };
 

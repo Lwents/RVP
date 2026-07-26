@@ -80,8 +80,9 @@ storage_videos = Path(settings.storage_dir) / "uploads" / "videos"
 storage_videos.mkdir(parents=True, exist_ok=True)
 app.mount("/api/uploads/video", StaticFiles(directory=str(storage_videos)), name="videos")
 
-storage_watermarks = Path(settings.storage_dir)
-app.mount("/api/uploads/watermark", StaticFiles(directory=str(storage_watermarks)), name="watermarks")
+# Watermarks live in the storage root next to youtube_credentials.json and the
+# job index files, so they are served by an explicit allow-listed route in
+# app.api.routes rather than a StaticFiles mount over the whole directory.
 
 
 @app.get("/health", tags=["system"])

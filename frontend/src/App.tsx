@@ -14,7 +14,7 @@ import {
   Wand2,
   Youtube,
 } from "lucide-react";
-import { cancelJob, clearJobs, createJob, detectBlurRegions, evaluateJob, fetchUrlPreview, generateJobMetadata, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
+import { API_BASE_URL, ApiError, cancelJob, clearJobs, createJob, detectBlurRegions, evaluateJob, fetchUrlPreview, generateJobMetadata, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
 import type { UploadProgress } from "./lib/api";
 import type { BgmMode, DubbingRequest, JobProgress, VoiceGender } from "./types/api";
 import { YoutubeStats } from "./components/YoutubeStats";
@@ -119,6 +119,52 @@ function isRunningJob(job: JobProgress): boolean {
   return job.status === "queued" || job.status === "processing";
 }
 
+/**
+ * True when `next` is an older snapshot of the job we already hold, so a slow/out-of-order
+ * response cannot overwrite fresher state.
+ */
+function isStaleJobSnapshot(previous: JobProgress | null, next: JobProgress): boolean {
+  if (!previous || previous.job_id !== next.job_id) return false;
+  const previousTime = new Date(previous.updated_at).getTime();
+  const nextTime = new Date(next.updated_at).getTime();
+  if (!Number.isFinite(previousTime) || !Number.isFinite(nextTime)) return false;
+  return nextTime < previousTime;
+}
+
+/**
+ * Copies text without ever throwing. `navigator.clipboard` is undefined on insecure
+ * origins (http:// on a LAN IP), so fall back to the legacy execCommand path.
+ */
+async function copyTextToClipboard(value: string): Promise<boolean> {
+  if (!value) return false;
+
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // Fall through to the legacy path below.
+  }
+
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return copied;
+  } catch {
+    return false;
+  }
+}
+
+const COPY_FAILED_MESSAGE = "Không thể copy tự động (trình duyệt chặn clipboard). Hãy bôi đen nội dung và nhấn Ctrl+C.";
+
 interface DebouncedInputProps extends Omit<React.InputHTMLAttributes<HTMLInputElement>, "onChange"> {
   value: string;
   onChange: (val: string) => void;
@@ -132,6 +178,12 @@ function DebouncedInput({ value, onChange, debounceMs = 300, ...props }: Debounc
   useEffect(() => {
     setLocalValue(value);
   }, [value]);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) window.clearTimeout(timerRef.current);
+    };
+  }, []);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value;
@@ -163,6 +215,11 @@ export function App() {
   const [activeTab, setActiveTab] = useState<AppTab>(() => readInitialTab());
 
   const videoInputRef = useRef<HTMLInputElement | null>(null);
+  const jobPollInFlightRef = useRef(false);
+  const jobPollSequenceRef = useRef(0);
+  const historyPollInFlightRef = useRef(false);
+  const metadataInFlightJobIdRef = useRef<string | null>(null);
+  const metadataFailedJobIdsRef = useRef<Set<string>>(new Set());
 
   const trackActiveJobId = useCallback((jobId: string | null) => {
     setActiveJobId(jobId);
@@ -220,7 +277,15 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     refreshJobs().then((nextJobs) => {
-      if (cancelled || nextJobs.length === 0) return;
+      if (cancelled) return;
+
+      if (nextJobs.length === 0) {
+        // Backend has no jobs left (cleared history / fresh install): stop tracking a
+        // stale persisted job id, otherwise the status poll 404s forever.
+        setActiveJob(null);
+        if (activeJobId) trackActiveJobId(null);
+        return;
+      }
 
       const storedJob = activeJobId ? nextJobs.find((item) => item.job_id === activeJobId) : null;
       const runningJob = nextJobs.find(isRunningJob);
@@ -243,58 +308,108 @@ export function App() {
     if (!activeJobId || activeJobFinished) return;
 
     let cancelled = false;
+    let timer = 0;
+
     const poll = async () => {
+      // Only one status request (and one metadata generation) may be in flight at a time,
+      // otherwise a slow tick stacks requests every 1.3s.
+      if (cancelled || jobPollInFlightRef.current) return;
+      jobPollInFlightRef.current = true;
+      const sequence = ++jobPollSequenceRef.current;
+
       try {
         let job = await getJob(activeJobId);
-        if (needsYoutubeMetadata(job)) {
-          job = await generateJobMetadata(job.job_id);
+
+        if (
+          needsYoutubeMetadata(job)
+          && metadataInFlightJobIdRef.current === null
+          && !metadataFailedJobIdsRef.current.has(job.job_id)
+        ) {
+          metadataInFlightJobIdRef.current = job.job_id;
+          try {
+            job = await generateJobMetadata(job.job_id);
+          } catch (metadataError) {
+            // Do not retry an expensive AI call on every tick when it keeps failing.
+            metadataFailedJobIdsRef.current.add(job.job_id);
+            if (!cancelled) {
+              setMessage(
+                metadataError instanceof Error
+                  ? `Không thể tạo metadata YouTube: ${metadataError.message}`
+                  : "Không thể tạo metadata YouTube.",
+              );
+            }
+          } finally {
+            metadataInFlightJobIdRef.current = null;
+          }
         }
-        if (cancelled) return;
-        setActiveJob(job);
-        setJobs((previous) =>
-          [job, ...previous.filter((item) => item.job_id !== job.job_id)]
+
+        // Drop responses that arrived out of order or after the tracked job changed.
+        if (cancelled || sequence !== jobPollSequenceRef.current || job.job_id !== activeJobId) return;
+
+        setActiveJob((previous) => (isStaleJobSnapshot(previous, job) ? previous : job));
+        setJobs((previous) => {
+          const known = previous.find((item) => item.job_id === job.job_id) ?? null;
+          if (isStaleJobSnapshot(known, job)) return previous;
+          return [job, ...previous.filter((item) => item.job_id !== job.job_id)]
             .sort((a, b) => {
               const aTime = new Date(a.completed_at || a.updated_at).getTime();
               const bTime = new Date(b.completed_at || b.updated_at).getTime();
               return bTime - aTime;
             })
-            .slice(0, 8),
-        );
+            .slice(0, 8);
+        });
       } catch (error) {
-        if (!cancelled) setMessage(error instanceof Error ? error.message : "Không thể lấy trạng thái job.");
+        if (cancelled) return;
+        if (error instanceof ApiError && error.status === 404) {
+          // The tracked job is gone on the backend: stop polling instead of spamming errors.
+          cancelled = true;
+          window.clearInterval(timer);
+          setActiveJob(null);
+          trackActiveJobId(null);
+          setMessage("Job đang theo dõi không còn tồn tại trên máy chủ. Đã ngừng theo dõi job này.");
+          return;
+        }
+        setMessage(error instanceof Error ? error.message : "Không thể lấy trạng thái job.");
+      } finally {
+        jobPollInFlightRef.current = false;
       }
     };
 
     poll();
-    const timer = window.setInterval(poll, 1300);
+    timer = window.setInterval(poll, 1300);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeJobFinished, activeJobId]);
+  }, [activeJobFinished, activeJobId, trackActiveJobId]);
 
   useEffect(() => {
     if (!hasRunningJobs) return;
 
     let cancelled = false;
     const refreshRunningHistory = async () => {
+      if (cancelled || historyPollInFlightRef.current) return;
+      historyPollInFlightRef.current = true;
       try {
         const nextJobs = await refreshJobs();
         if (cancelled) return;
 
         const selectedJob = activeJobId ? nextJobs.find((item) => item.job_id === activeJobId) : null;
         if (selectedJob) {
-          setActiveJob(selectedJob);
+          // The dedicated poll owns the freshest snapshot; never step back to a staler one.
+          setActiveJob((previous) => (isStaleJobSnapshot(previous, selectedJob) ? previous : selectedJob));
           return;
         }
 
         const runningJob = nextJobs.find(isRunningJob);
         if (runningJob) {
-          setActiveJob(runningJob);
+          setActiveJob((previous) => (isStaleJobSnapshot(previous, runningJob) ? previous : runningJob));
           trackActiveJobId(runningJob.job_id);
         }
       } catch {
         // History refresh is best-effort; the active job poll still reports hard errors.
+      } finally {
+        historyPollInFlightRef.current = false;
       }
     };
 
@@ -556,7 +671,7 @@ export function App() {
           >
             Workspace
           </button>
-          <a className="nav-tab nav-doc-link ios-button ios-button-secondary" href="http://127.0.0.1:8000/docs" target="_blank" rel="noreferrer">
+          <a className="nav-tab nav-doc-link ios-button ios-button-secondary" href={`${API_BASE_URL}/docs`} target="_blank" rel="noreferrer">
             Tài liệu API
             <ChevronRight size={16} />
           </a>
@@ -1005,6 +1120,12 @@ const RangeField = React.memo(function RangeField({
     setLocalVal(value);
   }, [value]);
 
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) window.clearTimeout(timerRef.current);
+    };
+  }, []);
+
   const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const num = Number(event.target.value);
     setLocalVal(num);
@@ -1091,12 +1212,20 @@ const StatusPanel = React.memo(function StatusPanel({
   const [etaText, setEtaText] = useState<string | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [evaluationError, setEvaluationError] = useState<string | null>(null);
+  const [copyNotice, setCopyNotice] = useState<string | null>(null);
   const lastProgressRef = useRef<{ progress: number; time: number; stage: string } | null>(null);
 
   useEffect(() => {
     setIsEvaluating(false);
     setEvaluationError(null);
+    setCopyNotice(null);
   }, [job?.job_id]);
+
+  useEffect(() => {
+    if (!copyNotice) return;
+    const timer = window.setTimeout(() => setCopyNotice(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [copyNotice]);
 
   useEffect(() => {
     if (!job || job.status !== "processing" || job.progress >= 100) {
@@ -1147,7 +1276,8 @@ const StatusPanel = React.memo(function StatusPanel({
 
   const copyToClipboard = useCallback(async (value: string) => {
     if (!value) return;
-    await navigator.clipboard.writeText(value);
+    const copied = await copyTextToClipboard(value);
+    setCopyNotice(copied ? "Đã copy vào clipboard." : COPY_FAILED_MESSAGE);
   }, []);
 
   const handleEvaluate = useCallback(async () => {
@@ -1251,6 +1381,11 @@ const StatusPanel = React.memo(function StatusPanel({
           {job.seo_title && <SeoCopyBlock label="Tiêu đề" value={job.seo_title} onCopy={copyToClipboard} />}
           {job.seo_description && <SeoCopyBlock label="Mô tả" value={job.seo_description} onCopy={copyToClipboard} multiline />}
           {seoTags && <SeoCopyBlock label="Hashtag" value={seoTags} onCopy={copyToClipboard} />}
+          {copyNotice && (
+            <p role="status" style={{ margin: 0, fontSize: "0.82rem", color: copyNotice === "Đã copy vào clipboard." ? "#1d7a45" : "#b42318" }}>
+              {copyNotice}
+            </p>
+          )}
         </div>
       )}
       {job.status === "completed" && job.created_at && job.updated_at && (

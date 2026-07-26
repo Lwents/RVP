@@ -2,23 +2,50 @@ import type { DubbingRequest, JobProgress, ProcessingMode, ReviewDraftJob, Revie
 
 const ENV_API_URL = import.meta.env.VITE_API_URL?.trim();
 
+const DEFAULT_LOCAL_API_URL = "http://127.0.0.1:8000";
+const DEFAULT_API_PORT = "8000";
+
 function resolveApiUrl(): string {
   if (typeof window === "undefined") {
-    return ENV_API_URL || "http://127.0.0.1:8000";
+    return ENV_API_URL || DEFAULT_LOCAL_API_URL;
   }
 
-  const hostname = window.location.hostname;
-  const isLocalFrontend = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  const { hostname, protocol, port, origin } = window.location;
+  const isLocalFrontend =
+    hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
 
   // Local development should not be blocked by an expired Cloudflare quick tunnel in .env.local.
   if (isLocalFrontend) {
-    return "http://127.0.0.1:8000";
+    return DEFAULT_LOCAL_API_URL;
   }
 
-  return ENV_API_URL || "http://127.0.0.1:8000";
+  if (ENV_API_URL) {
+    return ENV_API_URL;
+  }
+
+  // Served from a tunnel / docker host / LAN IP: 127.0.0.1 would point at the viewer's
+  // machine, so derive the backend from the page origin instead.
+  if (port && port !== "80" && port !== "443") {
+    return `${protocol}//${hostname}:${DEFAULT_API_PORT}`;
+  }
+  return origin || DEFAULT_LOCAL_API_URL;
 }
 
 const API_URL = resolveApiUrl();
+
+/** Base URL every API call is issued against (also used for links such as /docs). */
+export const API_BASE_URL = API_URL;
+
+/** Error carrying the HTTP status so callers can react to 404 / 5xx specifically. */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
 
 export interface UploadProgress {
   loaded: number;
@@ -46,8 +73,8 @@ async function request<T>(path: string, options?: ApiRequestInit): Promise<T> {
     });
 
     if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(detail || `Request failed with status ${response.status}`);
+      const detail = await response.text().catch(() => "");
+      throw new ApiError(detail || `Request failed with status ${response.status}`, response.status);
     }
 
     return response.json() as Promise<T>;
@@ -87,8 +114,10 @@ export async function uploadVideo(
     let lastLoaded = 0;
     let lastTickAt = startedAt;
 
+    // NOTE: responseType must stay "" (text) — reading xhr.responseText with
+    // responseType="json" throws InvalidStateError inside onload and leaves the
+    // promise pending forever (upload button locks up).
     xhr.open("POST", `${API_URL}/api/uploads/video`);
-    xhr.responseType = "json";
 
     xhr.upload.onprogress = (event) => {
       if (!onProgress) return;
@@ -115,24 +144,54 @@ export async function uploadVideo(
       reject(new Error("Không thể upload video. Vui lòng kiểm tra kết nối."));
     };
 
+    xhr.onabort = () => {
+      reject(new Error("Upload video đã bị hủy."));
+    };
+
+    xhr.ontimeout = () => {
+      reject(new Error("Upload video quá thời gian chờ."));
+    };
+
     xhr.onload = () => {
-      if (xhr.status < 200 || xhr.status >= 300) {
-        const detail = typeof xhr.response === "string"
-          ? xhr.response
-          : xhr.response?.detail || xhr.responseText || `Request failed with status ${xhr.status}`;
-        reject(new Error(detail));
-        return;
+      // Every path below must call resolve or reject exactly once, even when the
+      // response body is HTML (502 / 413 from a proxy) or empty.
+      try {
+        const rawText = typeof xhr.responseText === "string" ? xhr.responseText : "";
+        let parsed: unknown = null;
+        if (rawText.trim()) {
+          try {
+            parsed = JSON.parse(rawText);
+          } catch {
+            parsed = null;
+          }
+        }
+
+        if (xhr.status < 200 || xhr.status >= 300) {
+          const parsedDetail =
+            parsed && typeof parsed === "object" && typeof (parsed as { detail?: unknown }).detail === "string"
+              ? (parsed as { detail: string }).detail
+              : "";
+          const detail = parsedDetail || rawText.trim().slice(0, 500) || `Request failed with status ${xhr.status}`;
+          reject(new Error(detail));
+          return;
+        }
+
+        if (!parsed || typeof parsed !== "object") {
+          reject(new Error("Backend trả về phản hồi không hợp lệ khi upload video."));
+          return;
+        }
+
+        onProgress?.({
+          loaded: file.size,
+          total: file.size,
+          percent: 100,
+          bytesPerSecond: file.size > 0 ? (file.size * 1000) / Math.max(Date.now() - startedAt, 1) : null,
+        });
+
+        resolve(parsed as UploadResponse);
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error("Upload video thất bại."));
       }
-
-      onProgress?.({
-        loaded: file.size,
-        total: file.size,
-        percent: 100,
-        bytesPerSecond: file.size > 0 ? (file.size * 1000) / Math.max(Date.now() - startedAt, 1) : null,
-      });
-
-      const payload = xhr.response ?? JSON.parse(xhr.responseText);
-      resolve(payload as UploadResponse);
     };
 
     xhr.send(formData);

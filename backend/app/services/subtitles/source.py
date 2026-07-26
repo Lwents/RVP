@@ -73,11 +73,45 @@ def _without_browser_cookies(command: list[str]) -> list[str]:
 
 
 def _run_ytdlp(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=timeout)
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=timeout,
+    )
     detail = completed.stderr.strip() or completed.stdout.strip()
     if completed.returncode != 0 and "--cookies-from-browser" in command and "could not copy chrome cookie database" in detail.lower():
-        return subprocess.run(_without_browser_cookies(command), capture_output=True, text=True, check=False, timeout=timeout)
+        return subprocess.run(
+            _without_browser_cookies(command),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout,
+        )
     return completed
+
+
+async def _cancel_and_collect(running_task: asyncio.Task) -> None:
+    """Cancel the ASR task and actually wait for it to stop.
+
+    Chỉ gọi ``cancel()`` là chưa đủ: task chưa được await thì lỗi của nó không
+    bao giờ được lấy ra và Whisper vẫn chạy tiếp ở background.
+    """
+
+    running_task.cancel()
+    try:
+        await asyncio.wait({running_task})
+    except asyncio.CancelledError:
+        pass
+    if running_task.done() and not running_task.cancelled():
+        error = running_task.exception()
+        if error:
+            print(f"ASR task dừng kèm lỗi: {error}")
 
 
 async def _run_with_heartbeat(
@@ -97,13 +131,13 @@ async def _run_with_heartbeat(
             await asyncio.sleep(5)
             elapsed += 1
             if elapsed * 5 >= timeout_seconds:
-                running_task.cancel()
+                await _cancel_and_collect(running_task)
                 raise SubtitleSourceError(
                     f"{stage} quá {timeout_seconds} giây. Kiểm tra model Whisper hoặc giảm độ dài video."
                 )
         return await running_task
     except asyncio.CancelledError:
-        running_task.cancel()
+        await _cancel_and_collect(running_task)
         raise
 
 

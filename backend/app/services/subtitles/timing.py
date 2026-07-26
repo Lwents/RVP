@@ -14,6 +14,16 @@ class SubtitleEvent:
     text: str
 
 
+class SubtitleTimestampError(ValueError):
+    """Raised when an SRT timecode cannot be parsed at all."""
+
+
+# Khoảng hở tối thiểu giữa hai dòng phụ đề liền nhau.
+_MIN_SUBTITLE_GAP = 0.04
+# Dòng ngắn hơn mức này coi như rác, bỏ đi thay vì tạo chồng lấn.
+_MIN_SUBTITLE_DURATION = 0.08
+
+
 def parse_srt(path: Path) -> list[SubtitleEvent]:
     content = unicodedata.normalize("NFC", path.read_text(encoding="utf-8-sig"))
     blocks = re.split(r"\n\s*\n", content.strip())
@@ -27,8 +37,16 @@ def parse_srt(path: Path) -> list[SubtitleEvent]:
             continue
         start_raw, end_raw = [part.strip() for part in lines[time_index].split("-->", 1)]
         text = " ".join(lines[time_index + 1 :])
-        if text:
-            events.append(SubtitleEvent(_timestamp_seconds(start_raw), _timestamp_seconds(end_raw), text))
+        if not text:
+            continue
+        try:
+            start = timestamp_seconds(start_raw)
+            end = timestamp_seconds(end_raw)
+        except SubtitleTimestampError as exc:
+            # Không im lặng quy về 0.0: dòng sai timecode sẽ nhảy về đầu video.
+            print(f"Cảnh báo phụ đề: bỏ qua block sai timecode trong {path.name}. {exc}")
+            continue
+        events.append(SubtitleEvent(start, end, text))
     return events
 
 
@@ -43,7 +61,11 @@ def normalize_events(events: list[SubtitleEvent]) -> list[SubtitleEvent]:
         if index + 1 < len(ordered):
             next_start = ordered[index + 1].start
             if next_start < end:
-                end = max(start + 0.6, next_start - 0.04)
+                # Không được kéo dài quá dòng kế tiếp: đó chính là chồng lấn mà
+                # hàm này sinh ra để loại bỏ. Dòng quá sát nhau thì bỏ hẳn.
+                end = min(end, next_start - _MIN_SUBTITLE_GAP)
+        if end - start < _MIN_SUBTITLE_DURATION:
+            continue
         normalized.append(SubtitleEvent(start, end, event.text))
     return normalized
 
@@ -152,7 +174,31 @@ def split_long_subtitle_events(
 
 
 def timestamp_seconds(value: str) -> float:
-    return _timestamp_seconds(value)
+    """Parse ``HH:MM:SS,mmm``, ``MM:SS,mmm`` or ``SS.mmm`` into seconds.
+
+    Raises :class:`SubtitleTimestampError` (a ``ValueError``) on genuinely
+    malformed input instead of silently returning ``0.0`` and dropping the line
+    to the start of the video.
+    """
+
+    text = value.strip().replace(",", ".")
+    if not text:
+        raise SubtitleTimestampError("Timecode phụ đề rỗng.")
+
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise SubtitleTimestampError(f"Timecode phụ đề không hợp lệ: {value!r}")
+
+    try:
+        seconds = float(parts[-1])
+        minutes = int(parts[-2]) if len(parts) >= 2 else 0
+        hours = int(parts[-3]) if len(parts) == 3 else 0
+    except ValueError as exc:
+        raise SubtitleTimestampError(f"Timecode phụ đề không hợp lệ: {value!r}") from exc
+
+    if seconds < 0 or minutes < 0 or hours < 0:
+        raise SubtitleTimestampError(f"Timecode phụ đề âm: {value!r}")
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def ass_time(value: float) -> str:
@@ -170,17 +216,6 @@ def srt_time(value: float) -> str:
     minutes, remainder = divmod(remainder, 60_000)
     seconds, millis = divmod(remainder, 1000)
     return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
-
-
-def _timestamp_seconds(value: str) -> float:
-    value = value.replace(",", ".")
-    parts = value.split(":")
-    if len(parts) != 3:
-        return 0
-    try:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-    except ValueError:
-        return 0
 
 
 def _split_text_for_subtitles(text: str, max_chars: int) -> list[str]:

@@ -15,6 +15,7 @@ from openai import AsyncOpenAI
 
 from app.core import settings
 from app.models.review import FinalReviewCriterion, FinalReviewCriterionKey, FinalReviewEvaluation
+from app.services.ai.openai_client import get_async_openai
 from app.services.media.ffmpeg import find_ffmpeg, probe_video_duration
 from app.services.subtitles.timing import SubtitleEvent, parse_srt
 
@@ -300,7 +301,9 @@ async def _collect_dubbing_signals(
         - max(0.0, max_reading_rate - 25.0) * 1.5
     )
 
-    cue_alignment_score, mean_source_target_offset = _source_target_timeline_score(
+    # O(source × target) scoring; keep it off the event loop for long films.
+    cue_alignment_score, mean_source_target_offset = await asyncio.to_thread(
+        _source_target_timeline_score,
         source_events,
         target_events,
     )
@@ -509,7 +512,10 @@ async def _ask_dubbing_judge(
     source_language: str,
     target_language: str,
 ) -> dict:
-    aligned_pairs = _aligned_semantic_pairs(source_events, target_events)
+    # O(source × target) alignment; keep it off the event loop for long films.
+    aligned_pairs = await asyncio.to_thread(
+        _aligned_semantic_pairs, source_events, target_events
+    )
     pairs = [aligned_pairs[index] for index in _sample_indices(len(aligned_pairs), 120)]
     evidence = {
         "rendered_video_name": rendered_video.name,
@@ -811,9 +817,11 @@ def _aligned_semantic_pairs(
             if _event_overlap(source, target) > 0.01
         ]
         if not indexed_matches:
-            nearest = _nearest_event(source, target_events)
-            if nearest is not None:
-                indexed_matches = [(target_events.index(nearest), nearest)]
+            # list.index() would return the first equal cue, not the matched
+            # one, whenever two cues share text and timing.
+            nearest_index = _nearest_event_index(source, target_events)
+            if nearest_index is not None:
+                indexed_matches = [(nearest_index, target_events[nearest_index])]
         for target_index, _ in indexed_matches:
             used_target_ids.add(target_index)
         matches = [item for _, item in indexed_matches]
@@ -856,51 +864,65 @@ def _nearest_event(
     event: SubtitleEvent,
     candidates: list[SubtitleEvent],
 ) -> SubtitleEvent | None:
+    index = _nearest_event_index(event, candidates)
+    return candidates[index] if index is not None else None
+
+
+def _nearest_event_index(
+    event: SubtitleEvent,
+    candidates: list[SubtitleEvent],
+) -> int | None:
     if not candidates:
         return None
     midpoint = (event.start + event.end) / 2.0
-    return min(candidates, key=lambda item: abs((item.start + item.end) / 2.0 - midpoint))
+    return min(
+        range(len(candidates)),
+        key=lambda index: abs(
+            (candidates[index].start + candidates[index].end) / 2.0 - midpoint
+        ),
+    )
 
 
 def _event_overlap(left: SubtitleEvent, right: SubtitleEvent) -> float:
     return max(0.0, min(left.end, right.end) - max(left.start, right.start))
 
 
-def _interval_union_duration(events: list[SubtitleEvent]) -> float:
-    if not events:
-        return 0.0
-    intervals = sorted((item.start, item.end) for item in events if item.end > item.start)
-    if not intervals:
-        return 0.0
-    total = 0.0
-    current_start, current_end = intervals[0]
-    for start, end in intervals[1:]:
-        if start <= current_end:
-            current_end = max(current_end, end)
+def _merged_intervals(events: list[SubtitleEvent]) -> list[tuple[float, float]]:
+    """Sorted, non-overlapping intervals covering the same time as ``events``."""
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted((item.start, item.end) for item in events if item.end > item.start):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
-            total += current_end - current_start
-            current_start, current_end = start, end
-    return total + current_end - current_start
+            merged.append((start, end))
+    return merged
+
+
+def _interval_union_duration(events: list[SubtitleEvent]) -> float:
+    return sum(end - start for start, end in _merged_intervals(events))
 
 
 def _interval_intersection_duration(
     left_events: list[SubtitleEvent],
     right_events: list[SubtitleEvent],
 ) -> float:
-    boundaries = sorted(
-        {
-            boundary
-            for item in [*left_events, *right_events]
-            for boundary in (item.start, item.end)
-        }
-    )
+    # Sort + sweep: the previous boundary scan re-tested every event at every
+    # boundary, which is O(boundaries × events) and blocked the event loop for
+    # seconds on a feature film with thousands of cues per side.
+    left = _merged_intervals(left_events)
+    right = _merged_intervals(right_events)
     total = 0.0
-    for start, end in zip(boundaries, boundaries[1:]):
-        midpoint = (start + end) / 2.0
-        in_left = any(item.start <= midpoint < item.end for item in left_events)
-        in_right = any(item.start <= midpoint < item.end for item in right_events)
-        if in_left and in_right:
-            total += end - start
+    left_index = right_index = 0
+    while left_index < len(left) and right_index < len(right):
+        left_start, left_end = left[left_index]
+        right_start, right_end = right[right_index]
+        overlap = min(left_end, right_end) - max(left_start, right_start)
+        if overlap > 0:
+            total += overlap
+        if left_end <= right_end:
+            left_index += 1
+        else:
+            right_index += 1
     return total
 
 
@@ -1073,7 +1095,13 @@ def _safe_string_list(value: object, limit: int) -> list[str]:
 
 
 def _client() -> AsyncOpenAI:
-    return AsyncOpenAI(
-        api_key=settings.ninerouter_api_key or "local-ninerouter",
-        base_url=settings.ninerouter_api_url,
+    # Shared instance: a per-request client also builds an httpx connection pool
+    # that is never closed, leaking one pool per evaluation request.
+    return get_async_openai(
+        settings.ninerouter_api_key or "local-ninerouter",
+        settings.ninerouter_api_url,
+        # The call site passes its own per-request timeout; these values only
+        # keep the previous SDK behaviour for anything that forgets to.
+        timeout=240.0,
+        max_retries=2,
     )

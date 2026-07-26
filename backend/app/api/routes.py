@@ -1,14 +1,18 @@
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 from uuid import uuid4
 from datetime import UTC, datetime
 import asyncio
+import os
 import re
 import shutil
+import threading
+import time
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import json
@@ -142,8 +146,19 @@ REVIEW_JOBS_INDEX_FILE = Path(settings.storage_dir) / "review_jobs_index.json"
 review_draft_jobs: dict[str, ReviewDraftJob] = {}
 review_tasks: dict[str, asyncio.Task[None]] = {}
 
+# Render progress callbacks mutate the review index from an ffmpeg worker
+# thread while the event loop serves API requests, so every read-modify-write
+# of review_draft_jobs is guarded and disk writes are throttled.
+_REVIEW_JOBS_LOCK = threading.RLock()
+REVIEW_SAVE_MIN_INTERVAL_SECONDS = 2.0
+_last_review_save_at = 0.0
+
 
 def _start_review_task(job_id: str, coroutine) -> None:
+    previous = review_tasks.get(job_id)
+    if previous is not None and not previous.done():
+        # Callers guard against this, but never orphan a task by overwriting it.
+        previous.cancel()
     task = asyncio.create_task(coroutine)
     review_tasks[job_id] = task
 
@@ -170,8 +185,17 @@ def _load_review_jobs() -> None:
             for job_id, job in review_draft_jobs.items()
         }
         _mark_interrupted_review_jobs()
-    except Exception:
+    except Exception as exc:
+        # Never discard the user's history silently: keep the unreadable file so
+        # it can be inspected or recovered instead of being overwritten on the
+        # next save.
         review_draft_jobs = {}
+        backup = REVIEW_JOBS_INDEX_FILE.with_suffix(f".corrupt-{uuid4().hex}.json")
+        try:
+            REVIEW_JOBS_INDEX_FILE.replace(backup)
+            print(f"[review] Không đọc được {REVIEW_JOBS_INDEX_FILE.name} ({exc}). Đã giữ bản lỗi tại {backup.name}.")
+        except OSError:
+            print(f"[review] Không đọc được {REVIEW_JOBS_INDEX_FILE.name}: {exc}")
 
 
 def _canonicalize_loaded_review_job_names(job: ReviewDraftJob) -> ReviewDraftJob:
@@ -221,10 +245,31 @@ def _mark_interrupted_review_jobs() -> None:
         _save_review_jobs()
 
 
-def _save_review_jobs() -> None:
-    REVIEW_JOBS_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = [job.model_dump(mode="json") for job in review_draft_jobs.values()]
-    REVIEW_JOBS_INDEX_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def _save_review_jobs(force: bool = True) -> None:
+    """Persist the review index atomically.
+
+    Progress callbacks run in the ffmpeg worker thread and used to trigger a
+    full serialize-and-truncate of every job several times per second, which
+    both stalled the event loop and could interleave two writes into a corrupt
+    file. Writes now go through a lock and a temp file, and non-terminal
+    updates are throttled.
+    """
+
+    global _last_review_save_at
+    with _REVIEW_JOBS_LOCK:
+        now = time.monotonic()
+        if not force and now - _last_review_save_at < REVIEW_SAVE_MIN_INTERVAL_SECONDS:
+            return
+        REVIEW_JOBS_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = [job.model_dump(mode="json") for job in review_draft_jobs.values()]
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        temp_file = REVIEW_JOBS_INDEX_FILE.with_suffix(f".{uuid4().hex}.tmp")
+        try:
+            temp_file.write_text(payload, encoding="utf-8")
+            os.replace(temp_file, REVIEW_JOBS_INDEX_FILE)
+        finally:
+            temp_file.unlink(missing_ok=True)
+        _last_review_save_at = now
 
 
 def _trash_review_jobs() -> list[str]:
@@ -277,28 +322,72 @@ def _encode_round_logo_png(image_bytes: bytes) -> bytes:
     return encoded.tobytes()
 
 
+WATERMARK_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+WATERMARK_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+MAX_WATERMARK_BYTES = 5 * 1024 * 1024
+
+
 @router.post("/uploads/watermark", response_model=UploadResponse, tags=["uploads"])
 async def upload_watermark(file: UploadFile = File(...)) -> UploadResponse:
     if file.content_type and not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Watermark must be an image.")
 
-    data = await file.read()
-    if len(data) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Watermark image must be smaller than 5MB.")
+    suffix = Path(file.filename or "watermark.png").suffix.lower() or ".png"
+    if suffix not in WATERMARK_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Watermark phải là file png, jpg, jpeg hoặc webp.")
 
     storage_dir = Path(settings.storage_dir)
     storage_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(file.filename or "watermark.png").suffix or ".png"
     safe_name = f"{uuid4()}{suffix}"
     destination = storage_dir / safe_name
-    destination.write_bytes(data)
+
+    # Stream to disk so an oversized body is rejected before it is fully buffered.
+    size = 0
+    try:
+        with destination.open("wb") as handle:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_WATERMARK_BYTES:
+                    raise HTTPException(status_code=400, detail="Watermark image must be smaller than 5MB.")
+                handle.write(chunk)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
 
     return UploadResponse(
         file_name=safe_name,
         content_type=file.content_type,
-        size=len(data),
+        size=size,
         url=f"/api/uploads/watermark/{safe_name}",
     )
+
+
+@router.get("/uploads/watermark/{file_name}", tags=["uploads"])
+async def get_watermark(file_name: str) -> FileResponse:
+    """Serve watermark images only.
+
+    Watermarks share the storage root with youtube_credentials.json, the OAuth
+    verifier and the job index files, so this route allow-lists a bare image
+    file name instead of exposing the directory through StaticFiles.
+    """
+
+    if file_name != Path(file_name).name or file_name.startswith("."):
+        raise HTTPException(status_code=404, detail="Không tìm thấy watermark.")
+    suffix = Path(file_name).suffix.lower()
+    if suffix not in WATERMARK_SUFFIXES:
+        raise HTTPException(status_code=404, detail="Không tìm thấy watermark.")
+
+    storage_dir = Path(settings.storage_dir).resolve()
+    destination = (storage_dir / file_name).resolve()
+    if destination.parent != storage_dir or not destination.is_file():
+        raise HTTPException(status_code=404, detail="Không tìm thấy watermark.")
+
+    return FileResponse(destination, media_type=WATERMARK_MEDIA_TYPES[suffix])
 
 
 @router.post("/uploads/video", response_model=UploadResponse, tags=["uploads"])
@@ -315,13 +404,17 @@ async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
     destination = storage_dir / safe_name
 
     size = 0
-    with destination.open("wb") as handle:
-        while chunk := await file.read(1024 * 1024):
-            size += len(chunk)
-            if size > 5 * 1024 * 1024 * 1024:
-                destination.unlink(missing_ok=True)
-                raise HTTPException(status_code=400, detail="Video file must be smaller than 5GB.")
-            handle.write(chunk)
+    try:
+        with destination.open("wb") as handle:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > 5 * 1024 * 1024 * 1024:
+                    raise HTTPException(status_code=400, detail="Video file must be smaller than 5GB.")
+                handle.write(chunk)
+    except BaseException:
+        # A client disconnect mid-upload used to leave a multi-GB orphan behind.
+        destination.unlink(missing_ok=True)
+        raise
 
     return UploadResponse(
         file_name=safe_name,
@@ -336,17 +429,36 @@ class UrlPreviewRequest(BaseModel):
     url: str
 
 
+def _validate_source_url(raw_url: str) -> str:
+    """Reject anything yt-dlp would treat as an option instead of a URL.
+
+    yt-dlp parses a leading "-" as a flag, so an unvalidated value could inject
+    arbitrary options (including --config-location) into the argv.
+    """
+
+    url = raw_url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Thiếu URL video.")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="URL phải bắt đầu bằng http:// hoặc https://.")
+    if not parsed.netloc:
+        raise HTTPException(status_code=400, detail="URL không hợp lệ.")
+    return url
+
+
 @router.post("/uploads/url_preview", response_model=UploadResponse, tags=["uploads"])
 async def upload_url_preview(request: UrlPreviewRequest) -> UploadResponse:
+    source_url = _validate_source_url(request.url)
     storage_dir = Path(settings.storage_dir) / "uploads" / "videos"
     storage_dir.mkdir(parents=True, exist_ok=True)
-    
+
     job_id = str(uuid4())
     work_dir = storage_dir / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
     
     try:
-        downloaded_path = await download_preview_video(request.url, work_dir)
+        downloaded_path = await download_preview_video(source_url, work_dir)
         safe_name = f"{job_id}{downloaded_path.suffix}"
         final_destination = storage_dir / safe_name
         downloaded_path.rename(final_destination)
@@ -385,16 +497,20 @@ def _resolve_video_path(video_path: str) -> Path:
 
 
 def _update_review_job(job_id: str, **changes: object) -> ReviewDraftJob:
-    current = review_draft_jobs.get(job_id)
-    if current is None:
-        raise RuntimeError("Review job đã bị xóa khỏi lịch sử.")
-    data = current.model_dump()
-    data.update(changes)
-    data["updated_at"] = datetime.now(UTC)
-    updated = ReviewDraftJob.model_validate(data)
-    review_draft_jobs[job_id] = updated
-    _save_review_jobs()
-    return updated
+    # Terminal or result-bearing changes must hit disk immediately; a pure
+    # progress tick can wait for the throttle window.
+    force_save = bool({"status", "result", "error"} & changes.keys())
+    with _REVIEW_JOBS_LOCK:
+        current = review_draft_jobs.get(job_id)
+        if current is None:
+            raise RuntimeError("Review job đã bị xóa khỏi lịch sử.")
+        data = current.model_dump()
+        data.update(changes)
+        data["updated_at"] = datetime.now(UTC)
+        updated = ReviewDraftJob.model_validate(data)
+        review_draft_jobs[job_id] = updated
+        _save_review_jobs(force=force_save)
+        return updated
 
 
 def _review_decisions_with_urls(job_id: str, decisions: list[EditDecision]) -> list[EditDecision]:
@@ -546,6 +662,11 @@ def _apply_review_hard_gate(report: ReviewQualityReport) -> ReviewQualityReport:
         issue.severity == "error" and issue.code in hard_codes
         for issue in normalized
     )
+    # This gate is the single authority on `passed`. Callers used to compute a
+    # `passed` of their own from settings.review_quality_threshold that was then
+    # discarded here, so the aggregate score never actually blocked a render and
+    # the UI message claiming "QA chưa đạt 90/100" was wrong. The blocking rule
+    # is deliberately hard-errors-only: see the docstring above.
     return report.model_copy(update={"passed": not has_hard_error, "issues": normalized})
 
 
@@ -742,7 +863,11 @@ async def _process_review_draft_job(job_id: str) -> None:
     from app.models.job import VoiceGender
     from app.services.subtitles.source import get_or_create_subtitles
 
-    job = review_draft_jobs[job_id]
+    # Reading this outside the try used to let a deleted job raise KeyError as an
+    # unretrieved task exception instead of a recorded failure.
+    job = review_draft_jobs.get(job_id)
+    if job is None:
+        return
     try:
         _update_review_job(job_id, status="processing", progress=5, stage="Kiem tra video")
         source_video = _resolve_video_path(job.request.video_path)
@@ -987,17 +1112,28 @@ async def _process_review_draft_job(job_id: str) -> None:
         package.artifact_paths["review_final"] = str(output_file)
 
         _update_review_job(job_id, progress=99, stage="AI giám khảo đang chấm video cuối")
-        package.final_evaluation = await evaluate_final_review_video(
-            output_file,
-            package,
-            work_dir,
-            review_subtitle_file=review_subtitle_file,
-            source_transcript_file=_review_source_transcript_file(work_dir),
-            word_timing_file=word_timing_file,
-        )
-        final_evaluation_artifact = work_dir / "final_evaluation.json"
-        if final_evaluation_artifact.is_file():
-            package.artifact_paths["final_evaluation"] = str(final_evaluation_artifact)
+        # The render already succeeded and review_final.mp4 exists on disk, so a
+        # failure while scoring it must not flip the job to "failed" — that used
+        # to leave the finished video unreachable behind a 404.
+        evaluation_error: str | None = None
+        try:
+            package.final_evaluation = await evaluate_final_review_video(
+                output_file,
+                package,
+                work_dir,
+                review_subtitle_file=review_subtitle_file,
+                source_transcript_file=_review_source_transcript_file(work_dir),
+                word_timing_file=word_timing_file,
+            )
+            final_evaluation_artifact = work_dir / "final_evaluation.json"
+            if final_evaluation_artifact.is_file():
+                package.artifact_paths["final_evaluation"] = str(final_evaluation_artifact)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            package.final_evaluation = None
+            evaluation_error = str(exc)
+            print(f"[review] Chấm điểm video cuối thất bại cho job {job_id}: {exc}")
 
         result = _review_result_from_package(
             job_id,
@@ -1005,12 +1141,17 @@ async def _process_review_draft_job(job_id: str) -> None:
             subtitle_file_path=str(review_subtitle_file),
             output_file_path=str(output_file),
         )
+        if package.final_evaluation is not None:
+            stage = f"Hoàn tất bản review phim · AI chấm {package.final_evaluation.overall_score:.1f}/100"
+        else:
+            stage = "Hoàn tất bản review phim · chưa chấm được điểm AI"
         _update_review_job(
             job_id,
             status="completed",
             progress=100,
-            stage=f"Hoàn tất bản review phim · AI chấm {package.final_evaluation.overall_score:.1f}/100",
+            stage=stage,
             result=result,
+            error=evaluation_error,
         )
     except Exception as exc:
         if job_id in review_draft_jobs:
@@ -1199,23 +1340,38 @@ async def _render_existing_review_job(job_id: str, *, allow_preview: bool = Fals
         await asyncio.to_thread(shutil.copy2, draft_file, final_file)
         package.artifact_paths["review_preview" if is_warning_preview else "review_final"] = str(final_file)
         _update_review_job(job_id, progress=99, stage="AI giám khảo đang chấm video vừa render")
-        package.final_evaluation = await evaluate_final_review_video(
-            final_file,
-            package,
-            work_dir,
-            review_subtitle_file=subtitle_file,
-            source_transcript_file=_review_source_transcript_file(work_dir),
-            word_timing_file=word_timing_file,
-        )
-        final_evaluation_artifact = work_dir / "final_evaluation.json"
-        if final_evaluation_artifact.is_file():
-            package.artifact_paths["final_evaluation"] = str(final_evaluation_artifact)
+        # The rendered file already exists; a scoring failure must not mark the
+        # job failed and hide it behind a 404 on the download route.
+        evaluation_error: str | None = None
+        try:
+            package.final_evaluation = await evaluate_final_review_video(
+                final_file,
+                package,
+                work_dir,
+                review_subtitle_file=subtitle_file,
+                source_transcript_file=_review_source_transcript_file(work_dir),
+                word_timing_file=word_timing_file,
+            )
+            final_evaluation_artifact = work_dir / "final_evaluation.json"
+            if final_evaluation_artifact.is_file():
+                package.artifact_paths["final_evaluation"] = str(final_evaluation_artifact)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            package.final_evaluation = None
+            evaluation_error = str(exc)
+            print(f"[review] Chấm điểm video render thất bại cho job {job_id}: {exc}")
+
+        if package.final_evaluation is not None:
+            stage = f"Hoàn tất video review · AI chấm {package.final_evaluation.overall_score:.1f}/100"
+        else:
+            stage = "Hoàn tất video review · chưa chấm được điểm AI"
         _update_review_job(
             job_id,
             status="completed",
             progress=100,
-            stage=f"Hoàn tất video review · AI chấm {package.final_evaluation.overall_score:.1f}/100",
-            error=None,
+            stage=stage,
+            error=evaluation_error,
             result=_review_result_from_package(
                 job_id,
                 package,
@@ -1357,15 +1513,40 @@ async def get_review_draft_job(job_id: str) -> ReviewDraftJob:
     return job
 
 
+def _ensure_review_job_idle(job_id: str, job: ReviewDraftJob) -> None:
+    """Reject a new run while the previous one is still alive.
+
+    Cancelling only marks the job failed; the ffmpeg call it started runs inside
+    a worker thread that task.cancel() cannot interrupt. Without this check a
+    cancel-then-render sequence let a second render wipe review_segments/ while
+    the first was still writing into it.
+    """
+
+    running = review_tasks.get(job_id)
+    if job.status in {"queued", "processing"} or (running and not running.done()):
+        raise HTTPException(status_code=409, detail="Review job đang chạy. Hãy đợi tiến trình trước kết thúc.")
+
+
+def _ensure_review_quality_passed(job: ReviewDraftJob) -> None:
+    report = job.result.quality_report if job.result else None
+    if report is None:
+        raise HTTPException(status_code=409, detail="Chưa có báo cáo QA cho bản duyệt này.")
+    if report.passed:
+        return
+    blockers = ", ".join(sorted({issue.code for issue in report.issues if issue.severity == "error"}))
+    detail = f"QA còn lỗi chặn render (điểm hiện tại {report.overall_score:.0f}/100)."
+    if blockers:
+        detail = f"{detail} Mã lỗi: {blockers}."
+    raise HTTPException(status_code=409, detail=detail)
+
+
 @router.post("/review/jobs/{job_id}/render", response_model=ReviewDraftJob, tags=["review"])
 async def render_review_draft_job(job_id: str) -> ReviewDraftJob:
     job = review_draft_jobs.get(job_id)
     if not job or not job.result:
         raise HTTPException(status_code=404, detail="Review job not found.")
-    if job.status in {"queued", "processing"}:
-        raise HTTPException(status_code=409, detail="Review job đang chạy.")
-    if not job.result.quality_report or not job.result.quality_report.passed:
-        raise HTTPException(status_code=409, detail="QA chưa đạt 90/100 hoặc vẫn còn câu dưới 75%.")
+    _ensure_review_job_idle(job_id, job)
+    _ensure_review_quality_passed(job)
     pending_result = job.result.model_copy(deep=True)
     pending_result.final_evaluation = None
     pending_result.output_file_path = None
@@ -1441,8 +1622,7 @@ async def render_review_preview_job(job_id: str) -> ReviewDraftJob:
     job = review_draft_jobs.get(job_id)
     if not job or not job.result:
         raise HTTPException(status_code=404, detail="Review job not found.")
-    if job.status in {"queued", "processing"}:
-        raise HTTPException(status_code=409, detail="Review job is still processing.")
+    _ensure_review_job_idle(job_id, job)
     pending_result = job.result.model_copy(deep=True)
     pending_result.final_evaluation = None
     pending_result.output_file_path = None
@@ -1598,7 +1778,13 @@ async def patch_review_segment(
                 beat.thumbnail_url = chosen.thumbnail_url
                 beat.candidates = decision.alternatives
 
-    result.narration_script = " ".join(item.narration.strip() for item in result.beats if item.narration.strip())
+    # Rebuild from narration_segments, not from beats: _review_result_from_package
+    # drops any decision that has no source_clips, so a beats-based script would
+    # silently lose that narration while the TTS/alignment code still counts it,
+    # desynchronising every subsequent subtitle and scene cut.
+    result.narration_script = " ".join(
+        item.narration.strip() for item in result.narration_segments if item.narration.strip()
+    )
     # A small local edit has already been checked against its linked event.
     # Do not call the expensive full-film narrative judge again for every
     # keystroke/candidate selection; the next explicit optimization or final
@@ -1777,7 +1963,8 @@ def _recalculate_review_quality(
                 message="Kịch bản chưa có điểm QA đạt cho phong cách đã chọn.",
             )
         )
-    passed = overall >= settings.review_quality_threshold and not any(issue.severity == "error" for issue in retained)
+    # _apply_review_hard_gate is the single authority on `passed`: it downgrades
+    # soft codes to warnings first, then applies the score threshold.
     return _apply_review_hard_gate(previous.model_copy(
         update={
             "phase": "pre_render",
@@ -1788,7 +1975,6 @@ def _recalculate_review_quality(
             "story_coherence_score": story_score,
             "source_coverage_score": source_coverage_score,
             "style_adherence_score": style_score,
-            "passed": passed,
             "issues": retained,
         }
     ))
@@ -1808,15 +1994,10 @@ async def download_review_output(job_id: str) -> FileResponse:
 from app.services import task_manager
 
 @router.post("/jobs", response_model=JobCreateResponse, tags=["jobs"])
-async def create_job(request: DubbingRequest, background_tasks: BackgroundTasks) -> JobCreateResponse:
+async def create_job(request: DubbingRequest) -> JobCreateResponse:
     job = job_store.create(request)
-    
-    import asyncio
     task = asyncio.create_task(process_job(job.job_id))
     task_manager.register_task(job.job_id, task)
-    
-    # We add a background task just to await it so it's not orphaned entirely if we wanted to
-    # but create_task is already enough. We'll just rely on create_task.
     return JobCreateResponse(job_id=job.job_id, status=job.status)
 
 
@@ -2045,21 +2226,27 @@ class YoutubeCallbackRequest(BaseModel):
 
 @router.post("/youtube/client-secret", tags=["youtube"])
 async def upload_client_secret(file: UploadFile = File(...)):
+    data = await file.read()
+    if len(data) > 64 * 1024:
+        raise HTTPException(status_code=400, detail="Tệp client_secret.json quá lớn.")
     try:
-        data = await file.read()
-        import json
         secret_data = json.loads(data)
-        if "web" not in secret_data and "installed" not in secret_data:
-            raise HTTPException(status_code=400, detail="Định dạng file client_secret.json không hợp lệ. Phải chứa khoá 'web' hoặc 'installed'.")
-        
-        dest = Path(settings.youtube_client_secrets_file)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
-        return {"status": "success", "message": "Đã lưu tệp client_secret.json thành công."}
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Tệp tải lên không phải là định dạng JSON hợp lệ.")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
+    if not isinstance(secret_data, dict) or ("web" not in secret_data and "installed" not in secret_data):
+        raise HTTPException(
+            status_code=400,
+            detail="Định dạng file client_secret.json không hợp lệ. Phải chứa khoá 'web' hoặc 'installed'.",
+        )
+
+    dest = Path(settings.youtube_client_secrets_file)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Không ghi được client_secret.json: {exc}") from exc
+    return {"status": "success", "message": "Đã lưu tệp client_secret.json thành công."}
 
 @router.get("/youtube/auth-url", tags=["youtube"])
 async def get_yt_auth_url(redirect_uri: str = "http://localhost:5173/youtube/callback"):
@@ -2125,8 +2312,10 @@ async def detect_blur_regions(req: DetectRegionsRequest):
     try:
         engine_used = "local"
         ai_error: str | None = None
-        # Tự động chèn logo kênh sang bên trái từ thư mục người dùng
-        logo_dir = Path(r"C:\Users\kirit\Pictures\logo")
+        # Tự động chèn logo kênh sang bên trái từ thư mục người dùng.
+        # Mặc định là storage/logo_source; đặt AUTO_TRANSLATE_AUTO_LOGO_DIR để
+        # trỏ sang thư mục khác.
+        logo_dir = Path(settings.auto_logo_dir).expanduser()
         auto_logo_data = None
         if logo_dir.exists() and logo_dir.is_dir():
             # Quét tìm ảnh đầu tiên
@@ -2156,8 +2345,10 @@ async def detect_blur_regions(req: DetectRegionsRequest):
                     print(f"Lỗi sao chép logo từ {logo_src}: {e}")
 
         if req.engine == "ai":
-            # Gọi trực tiếp vì hàm async
             try:
+                # The frame sampling inside auto_detect_blur_regions_ai runs on
+                # a worker thread (see app.services.ai.detect_regions) so this
+                # await does not freeze the event loop on a long video.
                 regions = await auto_detect_blur_regions_ai(
                     video_path,
                     detect_sub=req.detect_sub,
@@ -2173,25 +2364,19 @@ async def detect_blur_regions(req: DetectRegionsRequest):
                 if ai_error is None:
                     ai_error = "Gemini did not return any valid detection regions."
                 engine_used = "local_fallback"
-                loop = asyncio.get_event_loop()
-                regions = await loop.run_in_executor(
-                    None,
-                    lambda: auto_detect_blur_regions_local(
-                        video_path,
-                        detect_sub=req.detect_sub,
-                        detect_logo=req.detect_logo,
-                    )
-                )
-        else:
-            # Chạy local (đồng bộ) trong thread pool
-            loop = asyncio.get_event_loop()
-            regions = await loop.run_in_executor(
-                None,
-                lambda: auto_detect_blur_regions_local(
+                regions = await asyncio.to_thread(
+                    auto_detect_blur_regions_local,
                     video_path,
                     detect_sub=req.detect_sub,
                     detect_logo=req.detect_logo,
                 )
+        else:
+            # Chạy local (đồng bộ) trong thread pool
+            regions = await asyncio.to_thread(
+                auto_detect_blur_regions_local,
+                video_path,
+                detect_sub=req.detect_sub,
+                detect_logo=req.detect_logo,
             )
         checked = review_and_build_blur_config(regions)
         return {

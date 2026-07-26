@@ -10,7 +10,7 @@ from typing import Callable, TypedDict
 from app.core import settings
 from app.models.job import DubbingRequest
 from app.services.media.ffmpeg import probe_video_duration, run_command, run_command_with_progress
-from app.services.media.renderer import _append_soft_box_blur, _video_output_args
+from app.services.media.renderer import _append_soft_box_blur, _video_output_args, resolve_video_encoder
 from app.services.subtitles.ass import srt_to_positioned_ass, subtitle_font_dir, write_srt
 from app.services.subtitles.timing import SubtitleEvent
 
@@ -207,11 +207,13 @@ def _quantize_review_plan_durations(
     final_frame = max(len(plans), math.ceil(max(0.0, target_seconds) * fps))
     for index, plan in enumerate(plans):
         cumulative += plan.output_duration
-        boundary_frame = (
-            final_frame
-            if index == len(plans) - 1
-            else max(previous_frame + 1, round(cumulative * fps))
-        )
+        # Mỗi mốc cắt phải nằm trong timeline cuối và chừa tối thiểu 1 frame cho
+        # từng cảnh còn lại. Nếu không, tổng EDL dài hơn giọng đọc sẽ tạo ra
+        # output_duration âm -> tempo âm và một segment rác dài 1 frame.
+        remaining_scenes = len(plans) - index - 1
+        max_boundary_frame = final_frame - remaining_scenes
+        raw_boundary_frame = final_frame if index == len(plans) - 1 else round(cumulative * fps)
+        boundary_frame = max(previous_frame + 1, min(raw_boundary_frame, max_boundary_frame))
         output_duration = (boundary_frame - previous_frame) / fps
         result.append(
             ReviewScenePlan(
@@ -240,6 +242,8 @@ async def render_movie_review_video(
     target_seconds = narration_duration if narration_duration > 0 else max(1.0, float(target_minutes) * 60.0)
     source_duration = await probe_video_duration(ffmpeg, source_video)
     scenes = build_review_scene_plans(source_duration, target_seconds, scene_hints)
+    # Cùng một encoder đã được kiểm tra thật cho cả cắt cảnh lẫn bản render cuối.
+    encoder = await resolve_video_encoder(ffmpeg)
 
     segment_dir = work_dir / "review_segments"
     segment_dir.mkdir(parents=True, exist_ok=True)
@@ -272,7 +276,7 @@ async def render_movie_review_video(
             "-an",
             "-vf",
             video_filter,
-            *_video_output_args(),
+            *_video_output_args(encoder),
             "-movflags",
             "+faststart",
             str(segment),
@@ -311,6 +315,7 @@ async def render_movie_review_video(
         work_dir,
         target_seconds,
         render_request,
+        encoder,
     )
     await run_command_with_progress(
         command,
@@ -332,6 +337,7 @@ def _build_review_output_command(
     work_dir: Path,
     target_seconds: float,
     request: DubbingRequest | None,
+    encoder: str | None = None,
 ) -> list[str]:
     command = [ffmpeg, "-y", "-i", str(silent_video), "-i", str(narration_audio)]
     filter_parts: list[str] = ["[0:v]setpts=PTS-STARTPTS[vbase]"]
@@ -438,7 +444,7 @@ def _build_review_output_command(
         [
             "-t",
             f"{target_seconds:.3f}",
-            *_video_output_args(),
+            *_video_output_args(encoder),
             "-c:a",
             "aac",
             "-b:a",

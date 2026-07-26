@@ -4,6 +4,7 @@ Hỗ trợ cả thuật toán xử lý ảnh Cục bộ (Local) và Trí tuệ n
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import base64
 import json
@@ -12,8 +13,8 @@ from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
-from openai import AsyncOpenAI
 from app.core import settings
+from app.services.ai.openai_client import get_async_openai
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ SUBTITLE_SCAN_Y_END_RATIO   = 0.96   # dừng quét ở 96% để tránh thanh t
 SUBTITLE_SCAN_X_START_RATIO = 0.15   # bỏ qua 15% bên trái (tránh chữ dọc cảnh báo)
 SUBTITLE_SCAN_X_END_RATIO   = 0.85   # bỏ qua 15% bên phải (tránh logo góc)
 LOGO_CORNER_SIZE_RATIO      = 0.25   # quét vùng 25% ở các góc để tìm logo rộng
+AI_REQUEST_TIMEOUT_SECONDS  = 180.0  # tránh treo 10-30 phút khi gateway không phản hồi
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -43,6 +45,31 @@ def _to_float(value: object, default: float = 0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _frame_indices(value: object, frame_count: int) -> list[int]:
+    """Coerce AI-provided frame indices, tolerating JSON floats like 3.0.
+
+    ``str(3.0).isdigit()`` is False, so a naive digit check silently drops every
+    float index; the region then loses its start/end seconds and a briefly
+    visible watermark ends up blurred across the entire video.
+    """
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    indices: set[int] = set()
+    for item in value:
+        if isinstance(item, bool):
+            continue
+        try:
+            number = float(item)
+        except (TypeError, ValueError):
+            continue
+        if number != number or number in (float("inf"), float("-inf")):
+            continue
+        index = int(round(number))
+        if 0 <= index < frame_count:
+            indices.add(index)
+    return sorted(indices)
 
 
 def _target_subtitle_height(height: float) -> int:
@@ -499,11 +526,7 @@ def _track_missing_creator_watermark_samples(
         label = str(region.get("label", "")).lower()
         if not any(token in label for token in ("watermark", "creator", "logo")):
             continue
-        indices = sorted({
-            int(value)
-            for value in region.get("frame_indices", [])
-            if str(value).isdigit() and 0 <= int(value) < len(frames)
-        })
+        indices = _frame_indices(region.get("frame_indices", []), len(frames))
         if not indices:
             continue
 
@@ -800,6 +823,23 @@ def auto_detect_blur_regions_local(
 
 # ─── Multimodal AI Engine ─────────────────────────────────────────────────────
 
+def _encode_sample_frames(
+    samples: list[tuple[np.ndarray, float]],
+) -> list[tuple[str, float]]:
+    """Downscale and JPEG-encode sampled frames (blocking; run in a thread)."""
+    encoded: list[tuple[str, float]] = []
+    for frame, timestamp in samples:
+        h, w = frame.shape[:2]
+        if w > 640:
+            scale = 640 / w
+            frame = cv2.resize(frame, (640, int(h * scale)))
+
+        ok, buffer = cv2.imencode(".jpg", frame)
+        if ok:
+            encoded.append((base64.b64encode(buffer).decode("utf-8"), timestamp))
+    return encoded
+
+
 async def auto_detect_blur_regions_ai(
     video_path: str,
     detect_sub: bool = True,
@@ -808,27 +848,27 @@ async def auto_detect_blur_regions_ai(
     """
     Sử dụng Multimodal AI qua 9router để nhận diện vùng sub và logo từ các frame ảnh.
     """
-    samples, video_duration = _sample_frames_with_times(video_path, AI_SAMPLE_COUNT)
+    # Decoding ~32 frames, running Canny over all of them and JPEG-encoding them
+    # blocks for seconds; keep every OpenCV step off the event loop. This
+    # coroutine must stay awaitable from the running loop (routes.py awaits it
+    # directly) so the shared AsyncOpenAI client keeps its loop affinity.
+    samples, video_duration = await asyncio.to_thread(
+        _sample_frames_with_times, video_path, AI_SAMPLE_COUNT
+    )
     if not samples:
         return []
 
     persistent_logo_regions = (
-        _detect_persistent_edge_logos([frame for frame, _ in samples])
+        await asyncio.to_thread(
+            _detect_persistent_edge_logos, [frame for frame, _ in samples]
+        )
         if detect_logo
         else []
     )
 
-    base64_frames: list[tuple[str, float]] = []
-    for frame, timestamp in samples:
-        h, w = frame.shape[:2]
-        if w > 640:
-            scale = 640 / w
-            frame = cv2.resize(frame, (640, int(h * scale)))
-        
-        ok, buffer = cv2.imencode(".jpg", frame)
-        if ok:
-            base64_frames.append((base64.b64encode(buffer).decode("utf-8"), timestamp))
-
+    base64_frames: list[tuple[str, float]] = await asyncio.to_thread(
+        _encode_sample_frames, samples
+    )
     if not base64_frames:
         return []
 
@@ -870,9 +910,11 @@ async def auto_detect_blur_regions_ai(
         "}"
     )
 
-    client = AsyncOpenAI(
-        api_key=settings.ninerouter_api_key,
-        base_url=settings.ninerouter_api_url,
+    client = get_async_openai(
+        settings.ninerouter_api_key,
+        settings.ninerouter_api_url,
+        timeout=AI_REQUEST_TIMEOUT_SECONDS,
+        max_retries=1,
     )
 
     content = [{"type": "text", "text": prompt}]
@@ -893,6 +935,7 @@ async def auto_detect_blur_regions_ai(
         ],
         response_format={"type": "json_object"},
         temperature=0.2,
+        timeout=AI_REQUEST_TIMEOUT_SECONDS,
     )
 
     res_text = response.choices[0].message.content
@@ -932,7 +975,7 @@ async def auto_detect_blur_regions_ai(
                 r["label"] = "Sub chữ Trung (AI)"
             elif "logo" in r["label"].lower() or "watermark" in r["label"].lower():
                 r["label"] = "Logo/Watermark (AI)"
-            frame_indices = sorted({int(i) for i in r.pop("frame_indices", []) if str(i).isdigit() and 0 <= int(i) < len(sample_times)})
+            frame_indices = _frame_indices(r.pop("frame_indices", []), len(sample_times))
             if (
                 frame_indices
                 and len(frame_indices) < max(2, len(sample_times) - 2)

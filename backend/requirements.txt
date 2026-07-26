@@ -1,18 +1,22 @@
+# FastAPI/pydantic/uvicorn/faster-whisper are intentionally left on their
+# verified pins; bump them in a separate change where the test suite can run.
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 python-multipart==0.0.20
 pydantic==2.11.7
 pydantic-settings==2.10.1
-yt-dlp>=2025.6.30
+# Keep yt-dlp current: an outdated build is the most common cause of
+# YouTube/Douyin download failures.
+yt-dlp>=2026.7.4
 faster-whisper==1.1.1
 stable-ts==2.19.1
 openai-whisper==20250625
 nvidia-cublas-cu12==12.9.2.10
 nvidia-cuda-nvrtc-cu12==12.9.86
 nvidia-cudnn-cu12==9.24.0.43
-requests==2.32.5
+requests==2.34.2
 Send2Trash==1.8.3
-edge-tts==7.2.3
+edge-tts==7.2.8
 aiofiles>=23.2.1
 aiosqlite>=0.19.0
 gmssl>=3.2.2

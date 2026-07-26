@@ -60,7 +60,9 @@ async def process_dubbing_job(job_id: str) -> None:
         if job.request.clone_voice:
             raise PipelineError("Clone giọng cần cấu hình voice engine riêng trước khi chạy.")
         if job.request.auto_publish:
-            raise PipelineError("Auto publish cần cấu hình token YouTube/Facebook trước khi chạy.")
+            publish_error = _auto_publish_blocker(job.request.auto_publish)
+            if publish_error:
+                raise PipelineError(publish_error)
 
         source_video = await prepare_source_video(
             str(job.request.source_url) if job.request.source_url else None,
@@ -84,6 +86,8 @@ async def process_dubbing_job(job_id: str) -> None:
             )
 
         bgm_audio: Path | None = None
+        demucs_failed = False
+        demucs_warning: str | None = None
         if effective_request.bgm_mode != BgmMode.none:
             if effective_request.use_demucs:
                 progress("Tách nhạc nền và giọng nói gốc bằng Demucs", 45)
@@ -99,8 +103,15 @@ async def process_dubbing_job(job_id: str) -> None:
                         else await separate_background_with_demucs(demucs_audio, separated_dir)
                     )
                 except Exception as exc:
+                    # Không được im lặng trả về video gốc: người dùng yêu cầu bỏ
+                    # giọng gốc thì phải thấy rõ là Demucs đã hỏng.
                     print(f"Demucs warning/error: {exc}")
                     bgm_audio = None
+                    demucs_failed = True
+                    demucs_warning = (
+                        "Demucs tách nhạc nền/giọng gốc thất bại nên phần âm thanh chỉ được "
+                        f"xử lý ở chế độ dự phòng. Chi tiết: {exc}"
+                    )
             else:
                 bgm_audio = None # Fallback to ducking or keeping original mix
 
@@ -144,6 +155,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 narration_audio=narration_audio,
                 bgm_audio=bgm_audio,
                 progress_start=78,
+                demucs_failed=demucs_failed,
             )
         elif job.request.hard_subtitles:
             subtitle_file = await get_or_create_subtitles(
@@ -184,6 +196,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 narration_audio=narration_audio,
                 bgm_audio=bgm_audio,
                 progress_start=78,
+                demucs_failed=demucs_failed,
             )
         else:
             output_file = work_dir / "output_passthrough.mp4"
@@ -197,6 +210,7 @@ async def process_dubbing_job(job_id: str) -> None:
                 lambda percent: job_store.update(job_id, progress=percent),
                 subtitle_file=None,
                 bgm_audio=bgm_audio,
+                demucs_failed=demucs_failed,
             )
 
         seo_title = "Video đã được xử lý"
@@ -295,7 +309,7 @@ async def process_dubbing_job(job_id: str) -> None:
             seo_description=seo_description,
             seo_tags=seo_tags,
             final_evaluation=final_evaluation,
-            error=voice_warning,
+            error=_job_warning(voice_warning, demucs_warning),
         )
     except asyncio.CancelledError:
         job_store.update(job_id, status=JobStatus.failed, stage="Đã huỷ", error="Người dùng huỷ tiến trình.")
@@ -330,6 +344,41 @@ async def _try_synthesize_voice(
             raise
         progress("Edge TTS lỗi, tiếp tục render với âm thanh gốc", 76)
         return None, str(exc)
+
+
+def _job_warning(*warnings: str | None) -> str | None:
+    """Merge every non-fatal warning into the single field the UI shows."""
+
+    messages = [warning.strip() for warning in warnings if warning and warning.strip()]
+    return "\n".join(messages) if messages else None
+
+
+def _missing_youtube_credentials() -> str | None:
+    """Return a Vietnamese error when YouTube auto publish cannot possibly work."""
+
+    credentials_file = Path(settings.youtube_credentials_file)
+    if credentials_file.exists() and credentials_file.stat().st_size > 0:
+        return None
+
+    client_secrets_file = Path(settings.youtube_client_secrets_file)
+    if not client_secrets_file.exists():
+        return (
+            f"Auto publish YouTube cần file {settings.youtube_client_secrets_file} "
+            f"và {settings.youtube_credentials_file}. Hãy tạo OAuth client trên Google Cloud "
+            "Console rồi kết nối tài khoản YouTube trước khi chạy."
+        )
+    return (
+        f"Chưa xác thực YouTube ({settings.youtube_credentials_file} chưa có). "
+        "Hãy kết nối tài khoản YouTube trước khi bật auto publish."
+    )
+
+
+def _auto_publish_blocker(targets: list[PublishTarget]) -> str | None:
+    if PublishTarget.facebook in targets:
+        return "Auto publish Facebook chưa được hỗ trợ, hãy bỏ chọn Facebook."
+    if PublishTarget.youtube in targets:
+        return _missing_youtube_credentials()
+    return None
 
 
 def _completion_description(voice_warning: str | None) -> str:

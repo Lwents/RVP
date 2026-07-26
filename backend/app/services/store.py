@@ -54,7 +54,11 @@ class JobStore:
 
     def update(self, job_id: str, **changes: object) -> JobProgress:
         with self._lock:
-            job = self._jobs[job_id]
+            job = self._jobs.get(job_id)
+            if job is None:
+                # A deleted job used to surface as a bare KeyError from whichever
+                # worker happened to report progress next.
+                raise KeyError(f"Job đã bị xóa khỏi lịch sử: {job_id}")
             data = job.model_dump()
             data.update(changes)
             data["updated_at"] = datetime.now(UTC)
@@ -81,8 +85,16 @@ class JobStore:
                 if isinstance(item, dict) and item.get("job_id")
             }
             self._mark_interrupted_jobs()
-        except Exception:
+        except Exception as exc:
+            # Keep the unreadable index instead of silently discarding every job
+            # and overwriting it on the next save.
             self._jobs = {}
+            backup = self._index_file.with_suffix(f".corrupt-{uuid4().hex}.json")
+            try:
+                self._index_file.replace(backup)
+                print(f"[jobs] Không đọc được {self._index_file.name} ({exc}). Đã giữ bản lỗi tại {backup.name}.")
+            except OSError:
+                print(f"[jobs] Không đọc được {self._index_file.name}: {exc}")
 
     def _mark_interrupted_jobs(self) -> None:
         changed = False

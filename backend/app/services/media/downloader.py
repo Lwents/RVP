@@ -123,10 +123,26 @@ def _with_browser_cookies(command: list[str], browser: str) -> list[str]:
 
 
 def _run_ytdlp(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=timeout)
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=timeout,
+    )
     detail = _detail(completed)
     if completed.returncode != 0 and "--cookies-from-browser" in command and "could not copy chrome cookie database" in detail.lower():
-        return subprocess.run(_without_browser_cookies(command), capture_output=True, text=True, check=False, timeout=timeout)
+        return subprocess.run(
+            _without_browser_cookies(command),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout,
+        )
     return completed
 
 
@@ -226,11 +242,14 @@ def _download_with_douyin_tool(url: str, work_dir: Path, timeout: int) -> Path:
         check=False,
         timeout=timeout,
     )
-    matches = sorted(output_dir.rglob("*.mp4"), key=lambda item: item.stat().st_mtime, reverse=True)
-    if matches:
-        destination = work_dir / "source.douyin_tool.mp4"
-        shutil.copy2(matches[0], destination)
-        return destination
+    # Chỉ nhận file khi tool báo thành công: file .mp4 dang dở của lần chạy lỗi
+    # trước vẫn nằm trong thư mục và rất dễ bị coi nhầm là tải xong.
+    if completed.returncode == 0:
+        matches = sorted(output_dir.rglob("*.mp4"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if matches:
+            destination = work_dir / "source.douyin_tool.mp4"
+            shutil.copy2(matches[0], destination)
+            return destination
 
     detail = "\n".join(part for part in [(completed.stderr or "").strip(), (completed.stdout or "").strip()] if part)
     raise DownloadError(
@@ -252,6 +271,8 @@ def _run_ytdlp_with_cookie_fallback(command: list[str], url: str, timeout: int) 
             _with_browser_cookies(command, browser),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=timeout,
         )
@@ -450,22 +471,31 @@ def _download_with_douyin_external_services(url: str, work_dir: Path) -> Path:
                 continue
         for api_url in service_urls.get(service, []):
             try:
-                response = requests.get(
+                destination = work_dir / f"source.external.{service}.mp4"
+                with requests.get(
                     api_url,
                     headers=headers,
                     timeout=settings.douyin_external_downloader_timeout_seconds,
                     allow_redirects=True,
-                )
-                response.raise_for_status()
-                destination = work_dir / f"source.external.{service}.mp4"
-                if _looks_like_video_response(response, str(response.url)):
-                    destination.write_bytes(response.content)
-                    if destination.stat().st_size > 0:
-                        return destination
-                try:
-                    payload = response.json()
-                except json.JSONDecodeError:
-                    payload = {"raw": response.text}
+                    stream=True,
+                ) as response:
+                    response.raise_for_status()
+                    if _looks_like_video_response(response, str(response.url)):
+                        # Ghi thẳng ra đĩa, không giữ cả bộ phim trong RAM.
+                        destination.unlink(missing_ok=True)
+                        with destination.open("wb") as handle:
+                            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    handle.write(chunk)
+                        if destination.stat().st_size > 0:
+                            return destination
+                        destination.unlink(missing_ok=True)
+                        errors.append(f"{service} trả về file video rỗng.")
+                        continue
+                    try:
+                        payload = response.json()
+                    except json.JSONDecodeError:
+                        payload = {"raw": response.text}
                 for candidate in _candidate_urls_from_payload(payload):
                     try:
                         absolute = urljoin(api_url, candidate)
@@ -563,7 +593,9 @@ async def download_video(url: str, work_dir: Path, progress: Callable[[str, int]
     try:
         return await asyncio.to_thread(download)
     except subprocess.TimeoutExpired as exc:
-        raise DownloadError("yt-dlp quá thời gian chờ 180 giây khi tải video.") from exc
+        raise DownloadError(
+            f"yt-dlp quá thời gian chờ {settings.ytdlp_download_timeout_seconds} giây khi tải video."
+        ) from exc
 
 
 async def download_preview_video(url: str, work_dir: Path) -> Path:

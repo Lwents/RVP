@@ -39,12 +39,17 @@ from app.services.ai.character_names import (
     character_name_contract,
 )
 from app.services.ai.context import analyze_video_context
+from app.services.ai.openai_client import get_async_openai
 from app.services.media.ffmpeg import find_ffmpeg, probe_video_duration
 from app.services.presets import get_processing_profile
 from app.services.subtitles.timing import SubtitleEvent, parse_srt
 
 
 ProgressCallback = Callable[[str, int], None]
+
+# media/review_renderer.py encodes the final video at a constant 30 fps.
+RENDERER_FPS_ASSUMPTION = 30.0
+QA_FRAME_EXTRACT_TIMEOUT_SECONDS = 600.0
 
 
 _STORY_ROLE_ORDER = ("hook", "context", "conflict", "climax", "resolution")
@@ -283,25 +288,33 @@ async def build_verified_review_package(
     context_task = asyncio.create_task(
         analyze_video_context(video_path, events, work_dir)
     )
-    on_progress("Phát hiện shot và lấy keyframe toàn bộ phim", 53)
-    scenes = await asyncio.to_thread(
-        _detect_scenes_and_keyframes,
-        video_path,
-        scene_dir,
-        duration,
-        events,
-        profile.review_max_scenes,
-        profile.review_keyframes_per_scene,
-    )
-    if not scenes:
-        context_task.cancel()
-        raise RuntimeError("Không phát hiện được scene/keyframe hợp lệ trong video.")
-
+    # The context task is a paid multimodal request; every exit path below must
+    # cancel and await it instead of leaking a running task.
     try:
-        film_context = await context_task
-    except Exception as exc:
-        print(f"Review character context fallback: {exc}")
-        film_context = {}
+        on_progress("Phát hiện shot và lấy keyframe toàn bộ phim", 53)
+        scenes = await asyncio.to_thread(
+            _detect_scenes_and_keyframes,
+            video_path,
+            scene_dir,
+            duration,
+            events,
+            profile.review_max_scenes,
+            profile.review_keyframes_per_scene,
+        )
+        if not scenes:
+            raise RuntimeError("Không phát hiện được scene/keyframe hợp lệ trong video.")
+
+        try:
+            film_context = await context_task
+        except Exception as exc:
+            print(f"Review character context fallback: {exc}")
+            film_context = {}
+    finally:
+        context_task.cancel()
+        try:
+            await context_task
+        except (asyncio.CancelledError, Exception):
+            pass
     character_names = build_character_name_registry(film_context)
 
     on_progress("AI đa phương thức phân tích hình ảnh, thoại và chữ trên màn hình", 60)
@@ -4037,6 +4050,34 @@ def _qa_frame_batches(frame_indices: list[int], batch_size: int = 32) -> list[li
     return [frame_indices[index : index + size] for index in range(0, len(frame_indices), size)]
 
 
+def _render_fps(rendered_video: Path) -> float:
+    """Frame rate used to map QA timestamps to frame indices.
+
+    COUPLING: media/review_renderer.py renders the final timeline as CFR with a
+    hardcoded ``fps=30`` filter (and quantizes cut boundaries with the same
+    value), but it exports no constant to import. Probing the rendered file
+    keeps QA extraction correct if that renderer fps ever changes; the
+    documented assumption is only used when the container cannot be read.
+    """
+    capture = cv2.VideoCapture(str(rendered_video))
+    try:
+        probed = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    except Exception:
+        probed = 0.0
+    finally:
+        capture.release()
+    if not math.isfinite(probed) or not 1.0 <= probed <= 240.0:
+        return RENDERER_FPS_ASSUMPTION
+    if abs(probed - RENDERER_FPS_ASSUMPTION) > 0.5:
+        print(
+            "QA render fps khác giả định "
+            f"({probed:.3f} != {RENDERER_FPS_ASSUMPTION}); dùng fps đo được."
+        )
+        return probed
+    # 29.97 vs 30 and similar container rounding must not change behaviour.
+    return RENDERER_FPS_ASSUMPTION
+
+
 def _extract_render_qa_frames(
     rendered_video: Path,
     decisions: list[EditDecision],
@@ -4055,7 +4096,7 @@ def _extract_render_qa_frames(
 
     # The final concat MP4 may expose an inaccurate frame count to OpenCV on
     # Windows. Decode target frames with FFmpeg in one pass instead.
-    render_fps = 30.0
+    render_fps = _render_fps(rendered_video)
     frame_indices = sorted({max(0, round(timestamp * render_fps)) for timestamp, _, _ in targets})
     ffmpeg = find_ffmpeg()
     index_to_path: dict[int, Path] = {}
@@ -4071,22 +4112,32 @@ def _extract_render_qa_frames(
             break
         select_expression = "+".join(f"eq(n\\,{index})" for index in batch)
         output_pattern = output_dir / f"selected_{batch_index:03d}_%04d.jpg"
-        completed = subprocess.run(
-            [
-                ffmpeg,
-                "-y",
-                "-i",
-                str(rendered_video),
-                "-vf",
-                f"select={select_expression},scale=960:-2",
-                "-fps_mode",
-                "vfr",
-                str(output_pattern),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    str(rendered_video),
+                    "-vf",
+                    f"select={select_expression},scale=960:-2",
+                    "-fps_mode",
+                    "vfr",
+                    str(output_pattern),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=QA_FRAME_EXTRACT_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            # subprocess.run kills the child before re-raising, so a wedged
+            # FFmpeg cannot stall the QA step forever.
+            extraction_errors.append(
+                f"batch {batch_index}: FFmpeg không phản hồi trong "
+                f"{int(QA_FRAME_EXTRACT_TIMEOUT_SECONDS)} giây và đã bị dừng"
+            )
+            continue
         selected_files = sorted(output_dir.glob(f"selected_{batch_index:03d}_*.jpg"))
         if completed.returncode != 0 or len(selected_files) != len(batch):
             detail = completed.stdout.decode(errors="replace")[-600:] if completed.stdout else ""
@@ -4119,9 +4170,15 @@ def _extract_render_qa_frames(
 
 
 def _client() -> AsyncOpenAI:
-    return AsyncOpenAI(
-        api_key=settings.ninerouter_api_key or "local-ninerouter",
-        base_url=settings.ninerouter_api_url,
+    # Shared instance: a per-request client also builds an httpx connection pool
+    # that is never closed, leaking dozens of pools per review job.
+    return get_async_openai(
+        settings.ninerouter_api_key or "local-ninerouter",
+        settings.ninerouter_api_url,
+        # Every call site passes its own per-request timeout; these values only
+        # keep the previous SDK behaviour for anything that forgets to.
+        timeout=240.0,
+        max_retries=2,
     )
 
 

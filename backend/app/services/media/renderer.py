@@ -1,8 +1,17 @@
+import asyncio
+import re
+import subprocess
 from pathlib import Path
 
 from app.core import settings
 from app.models.job import BgmMode, DubbingRequest
-from app.services.media.ffmpeg import copy_mp4, probe_video_duration, probe_video_size, run_ffmpeg_with_progress
+from app.services.media.ffmpeg import (
+    copy_mp4,
+    probe_has_audio_stream,
+    probe_video_duration,
+    probe_video_size,
+    run_ffmpeg_with_progress,
+)
 from app.services.subtitles.ass import srt_to_positioned_ass, subtitle_font_dir
 
 async def render_video(
@@ -16,13 +25,15 @@ async def render_video(
     narration_audio: Path | None = None,
     bgm_audio: Path | None = None,
     progress_start: int = 72,
+    demucs_failed: bool = False,
 ) -> None:
-    if _can_stream_copy(request, subtitle_file, narration_audio, bgm_audio):
+    if _can_stream_copy(request, subtitle_file, narration_audio, bgm_audio, demucs_failed):
         await copy_mp4(ffmpeg, source_video, output_file)
         on_progress(98)
         return
 
     width, height = await probe_video_size(ffmpeg, source_video)
+    source_has_audio = await probe_has_audio_stream(ffmpeg, source_video)
     command = [ffmpeg, "-y", "-i", str(source_video)]
     next_input_index = 1
     video_label = "[vbase]"
@@ -136,6 +147,10 @@ async def render_video(
             # Demucs mode is used to remove the original voice. If separation
             # fails, keep narration only instead of mixing Chinese source audio.
             audio_label = f"{narration_index}:a"
+        elif bgm_index is None and not source_has_audio:
+            # Video nguồn không có audio stream: map [0:a] sẽ làm hỏng cả lệnh
+            # render, nên chỉ dùng giọng đọc.
+            audio_label = f"{narration_index}:a"
         else:
             # Mix background and narration
             bgm_volume = 1.0
@@ -150,7 +165,10 @@ async def render_video(
         if request.bgm_mode == BgmMode.demucs:
             audio_label = f"{bgm_index}:a" if bgm_index is not None else None
         elif request.bgm_mode != BgmMode.none:
-            audio_label = f"{bgm_index}:a" if bgm_index is not None else "0:a?"
+            if bgm_index is not None:
+                audio_label = f"{bgm_index}:a"
+            else:
+                audio_label = "0:a?" if source_has_audio else None
 
     if request.video_speed != 1.0:
         filter_parts.append(f"{video_label}setpts={1/request.video_speed:.4f}*PTS[vspeed]")
@@ -169,7 +187,7 @@ async def render_video(
     if audio_label:
         command.extend(["-map", audio_label])
 
-    command.extend(_video_output_args())
+    command.extend(_video_output_args(await resolve_video_encoder(ffmpeg)))
     command.extend(audio_args)
     command.extend(["-movflags", "+faststart", str(output_file)])
 
@@ -195,7 +213,17 @@ async def burn_subtitles(
     await render_video(ffmpeg, source_video, output_file, work_dir, request, on_progress, subtitle_file)
 
 
-def _can_stream_copy(request: DubbingRequest, subtitle_file: Path | None, narration_audio: Path | None, bgm_audio: Path | None) -> bool:
+def _can_stream_copy(
+    request: DubbingRequest,
+    subtitle_file: Path | None,
+    narration_audio: Path | None,
+    bgm_audio: Path | None,
+    demucs_failed: bool = False,
+) -> bool:
+    if demucs_failed:
+        # Người dùng yêu cầu bỏ giọng gốc. Nếu Demucs hỏng mà vẫn stream copy
+        # thì file đầu ra chính là video gốc kèm nguyên giọng gốc.
+        return False
     return subtitle_file is None and narration_audio is None and bgm_audio is None and not (request.watermark_file_name and request.logo_enabled) and not request.blur_box_enabled and not request.cinematic_bars_enabled and request.output_resolution == "original" and request.bgm_mode == BgmMode.demucs and request.video_speed == 1.0
 
 
@@ -300,8 +328,112 @@ def _audio_output_args(request: DubbingRequest, has_narration: bool) -> list[str
     return ["-c:a", "copy"]
 
 
-def _video_output_args() -> list[str]:
-    encoder = settings.video_encoder.lower()
+SOFTWARE_ENCODER = "libx264"
+# Thứ tự thử khi AUTO_TRANSLATE_VIDEO_ENCODER = "auto".
+_HARDWARE_ENCODER_CANDIDATES = ["h264_nvenc", "h264_qsv", "h264_amf"]
+_SOFTWARE_ENCODER_FALLBACKS = [SOFTWARE_ENCODER, "libopenh264"]
+_SOFTWARE_ALIASES = {"", "auto_software", "libx264", "x264", "software", "cpu", "none"}
+_RESOLVED_ENCODERS: dict[str, str] = {}
+
+
+async def resolve_video_encoder(ffmpeg: str) -> str:
+    """Return the encoder that this machine can really use.
+
+    ``h264_nvenc`` chỉ có ý nghĩa khi máy có GPU NVIDIA và driver còn chạy được.
+    Liệt kê ``-encoders`` là điều kiện cần chứ chưa đủ, nên phải thử encode thật
+    một đoạn testsrc rồi mới tin. Kết quả được cache theo tiến trình.
+    """
+
+    configured = (settings.video_encoder or "auto").strip().lower()
+    cache_key = f"{ffmpeg}|{configured}"
+    cached = _RESOLVED_ENCODERS.get(cache_key)
+    if cached:
+        return cached
+
+    resolved = await asyncio.to_thread(_probe_video_encoder, ffmpeg, configured)
+    _RESOLVED_ENCODERS[cache_key] = resolved
+    return resolved
+
+
+def _probe_video_encoder(ffmpeg: str, configured: str) -> str:
+    listed = _listed_encoder_names(ffmpeg)
+    software = _resolve_software_encoder(listed)
+    if configured in _SOFTWARE_ALIASES:
+        return software
+
+    candidates = _HARDWARE_ENCODER_CANDIDATES if configured == "auto" else [configured]
+    for candidate in candidates:
+        if candidate in _SOFTWARE_ENCODER_FALLBACKS:
+            return software
+        if listed and candidate not in listed:
+            continue
+        if _encoder_actually_works(ffmpeg, candidate):
+            return candidate
+        print(f"Encoder warning: {candidate} không khởi tạo được, chuyển sang {software}.")
+    return software
+
+
+def _resolve_software_encoder(listed: set[str]) -> str:
+    """Pick a software encoder that this FFmpeg build actually ships.
+
+    Một số bản dựng (ví dụ ffmpeg-free trên Fedora/RHEL) không có libx264, nên
+    fallback phần mềm phải chấp nhận libopenh264 thay vì render thất bại.
+    """
+
+    if not listed or SOFTWARE_ENCODER in listed:
+        return SOFTWARE_ENCODER
+    for candidate in _SOFTWARE_ENCODER_FALLBACKS[1:]:
+        if candidate in listed:
+            print(f"Encoder warning: FFmpeg này không có {SOFTWARE_ENCODER}, dùng {candidate}.")
+            return candidate
+    return SOFTWARE_ENCODER
+
+
+def _listed_encoder_names(ffmpeg: str) -> set[str]:
+    try:
+        completed = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    output = b"\n".join([completed.stdout or b"", completed.stderr or b""]).decode(errors="ignore")
+    return {match.group(1) for match in re.finditer(r"^\s*[VASFXBD.]{6}\s+(\S+)", output, re.MULTILINE)}
+
+
+def _encoder_actually_works(ffmpeg: str, encoder: str) -> bool:
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=25:duration=0.2",
+                "-frames:v",
+                "3",
+                "-c:v",
+                encoder,
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _video_output_args(encoder: str | None = None) -> list[str]:
+    encoder = (encoder or SOFTWARE_ENCODER).lower()
     if encoder == "h264_nvenc":
         return [
             "-c:v",
@@ -323,7 +455,56 @@ def _video_output_args() -> list[str]:
         return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", str(settings.video_crf), "-qp_p", str(settings.video_crf), "-pix_fmt", "yuv420p"]
     if encoder == "h264_qsv":
         return ["-c:v", "h264_qsv", "-global_quality", str(settings.video_crf), "-preset", _qsv_preset(settings.video_preset), "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-preset", settings.video_preset, "-crf", str(settings.video_crf), "-pix_fmt", "yuv420p"]
+    if encoder == "libopenh264":
+        # libopenh264 không có -crf/-preset nên quy đổi sang bitrate tương đương.
+        return ["-c:v", "libopenh264", "-b:v", _openh264_bitrate(settings.video_crf), "-pix_fmt", "yuv420p"]
+    # libx264 dùng -crf + tên preset x264, tương đương -cq/-b:v 0 của nvenc.
+    return [
+        "-c:v",
+        SOFTWARE_ENCODER,
+        "-preset",
+        _x264_preset(settings.video_preset),
+        "-crf",
+        str(settings.video_crf),
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+
+def _openh264_bitrate(crf: int) -> str:
+    if crf <= 20:
+        return "8M"
+    if crf <= 26:
+        return "5M"
+    return "3M"
+
+
+def _x264_preset(preset: str) -> str:
+    normalized = preset.lower().strip()
+    known = {
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+        "placebo",
+    }
+    if normalized in known:
+        return normalized
+    aliases = {
+        "p1": "ultrafast",
+        "p2": "veryfast",
+        "p3": "fast",
+        "p4": "medium",
+        "p5": "slow",
+        "p6": "slower",
+        "p7": "veryslow",
+    }
+    return aliases.get(normalized, "medium")
 
 
 def _nvenc_preset(preset: str) -> str:

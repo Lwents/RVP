@@ -21,7 +21,9 @@ class Settings(BaseSettings):
     voice_engine: str = "disabled"
     target_language: str = "vi"
     ffmpeg_path: str | None = None
-    video_encoder: str = "h264_nvenc"
+    # "auto" = dùng encoder phần cứng nếu máy thật sự chạy được, nếu không thì
+    # tự động quay về libx264. Có thể ép cứng h264_nvenc/h264_amf/h264_qsv/libx264.
+    video_encoder: str = "auto"
     video_crf: int = 23
     video_preset: str = "slow"
     ytdlp_format: str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best"
@@ -65,6 +67,8 @@ class Settings(BaseSettings):
     review_keyframes_per_scene: int = 3
     review_max_scenes: int = 240
     review_quality_threshold: int = 90
+    # Scanned for a channel logo to auto-apply in /analyze/detect-regions.
+    auto_logo_dir: str = str(BACKEND_DIR / "storage" / "logo_source")
     youtube_client_secrets_file: str = "client_secret.json"
     youtube_credentials_file: str = "storage/youtube_credentials.json"
 

@@ -79,6 +79,62 @@ function shouldPollReviewJob(job: ReviewDraftJob): boolean {
   return isRunningReviewJob(job) || job.status === "needs_review" || job.status === "ready_to_render";
 }
 
+function reviewSnapshotTime(job: ReviewDraftJob | null | undefined): number {
+  if (!job) return Number.NaN;
+  const time = new Date(job.updated_at).getTime();
+  return Number.isFinite(time) ? time : Number.NaN;
+}
+
+/** True when `next` is an older snapshot of the job we already hold. */
+function isStaleReviewSnapshot(previous: ReviewDraftJob | null | undefined, next: ReviewDraftJob): boolean {
+  if (!previous || previous.job_id !== next.job_id) return false;
+  const previousTime = reviewSnapshotTime(previous);
+  const nextTime = reviewSnapshotTime(next);
+  if (Number.isNaN(previousTime) || Number.isNaN(nextTime)) return false;
+  return nextTime < previousTime;
+}
+
+/** True when `next` is strictly newer than the job we already hold. */
+function isNewerReviewSnapshot(previous: ReviewDraftJob | null | undefined, next: ReviewDraftJob): boolean {
+  if (!previous || previous.job_id !== next.job_id) return false;
+  const previousTime = reviewSnapshotTime(previous);
+  const nextTime = reviewSnapshotTime(next);
+  if (Number.isNaN(previousTime) || Number.isNaN(nextTime)) return false;
+  return nextTime > previousTime;
+}
+
+/**
+ * Copies text without ever throwing. `navigator.clipboard` is undefined on insecure
+ * origins (http:// on a LAN IP), so fall back to the legacy execCommand path.
+ */
+async function copyTextToClipboard(value: string): Promise<boolean> {
+  if (!value) return false;
+
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // Fall through to the legacy path below.
+  }
+
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return copied;
+  } catch {
+    return false;
+  }
+}
+
 function pickInitialReviewJob(items: ReviewDraftJob[]): ReviewDraftJob | null {
   if (items.length === 0) return null;
   const storedJobId = typeof window === "undefined" ? null : window.localStorage.getItem(ACTIVE_REVIEW_JOB_STORAGE_KEY);
@@ -91,6 +147,9 @@ export const MovieReview = React.memo(function MovieReview() {
   const logoInputRef = useRef<HTMLInputElement | null>(null);
   const didLoadInitialReviewJobRef = useRef(false);
   const segmentSaveInFlightRef = useRef(false);
+  const reviewPollInFlightRef = useRef(false);
+  const reviewHistoryPollInFlightRef = useRef(false);
+  const outputCacheIdentityRef = useRef<string | null>(null);
   const [videoPath, setVideoPath] = useState("");
   const [sourceVideoUrl, setSourceVideoUrl] = useState<string | null>(null);
   const [videoName, setVideoName] = useState("Chưa có phim được import");
@@ -119,6 +178,10 @@ export const MovieReview = React.memo(function MovieReview() {
   const [narrationDrafts, setNarrationDrafts] = useState<Record<string, string>>({});
   const [savingSegmentId, setSavingSegmentId] = useState<string | null>(null);
   const [outputDurationSeconds, setOutputDurationSeconds] = useState<number | null>(null);
+  // Cache-busting token for the rendered output. It must only change when a new file is
+  // rendered — keying it off job.updated_at remounted the player on every job update and
+  // restarted playback from 0 mid-watch.
+  const [outputCacheToken, setOutputCacheToken] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
   const refreshReviewJobs = useCallback(async () => {
@@ -173,18 +236,25 @@ export const MovieReview = React.memo(function MovieReview() {
   useEffect(() => {
     if (!job || !shouldPollReviewJob(job)) return;
 
+    const jobId = job.job_id;
     let cancelled = false;
     const timer = window.setInterval(async () => {
+      // A slow request must not stack another one on the next tick.
+      if (cancelled || reviewPollInFlightRef.current) return;
+      reviewPollInFlightRef.current = true;
       try {
-        const nextJob = await getReviewDraftJob(job.job_id);
-        if (!cancelled && (nextJob.updated_at !== job.updated_at || nextJob.status !== job.status)) {
+        const nextJob = await getReviewDraftJob(jobId);
+        if (cancelled || nextJob.job_id !== jobId || isStaleReviewSnapshot(job, nextJob)) return;
+        if (nextJob.updated_at !== job.updated_at || nextJob.status !== job.status) {
           const outputBecameAvailable = !job.result?.output_video_url && Boolean(nextJob.result?.output_video_url);
-          setJob(nextJob);
+          setJob((previous) => (isStaleReviewSnapshot(previous, nextJob) ? previous : nextJob));
           setReviewJobs((items) => items.map((item) => item.job_id === nextJob.job_id ? nextJob : item));
           if (outputBecameAvailable) setPreviewMode("output");
         }
       } catch (error) {
         if (!cancelled) setMessage(error instanceof Error ? error.message : "Không thể lấy trạng thái review job.");
+      } finally {
+        reviewPollInFlightRef.current = false;
       }
     }, isRunningReviewJob(job) ? 1800 : 4000);
 
@@ -199,6 +269,8 @@ export const MovieReview = React.memo(function MovieReview() {
 
     let cancelled = false;
     const refreshRunningHistory = async () => {
+      if (cancelled || reviewHistoryPollInFlightRef.current) return;
+      reviewHistoryPollInFlightRef.current = true;
       try {
         const items = await refreshReviewJobs();
         if (cancelled) return;
@@ -206,8 +278,10 @@ export const MovieReview = React.memo(function MovieReview() {
         const selectedJob = selectedReviewJobId ? items.find((item) => item.job_id === selectedReviewJobId) : null;
         if (selectedJob) {
           // Background history polling must not overwrite duration/style/notes
-          // that the user is currently preparing for the next review.
-          setJob(selectedJob);
+          // that the user is currently preparing for the next review, and must never
+          // replace a newer local snapshot (that would revert a just-saved edit and
+          // restart the dedicated poll's interval every 2.5s).
+          setJob((previous) => (isNewerReviewSnapshot(previous, selectedJob) ? selectedJob : previous));
           return;
         }
 
@@ -217,6 +291,8 @@ export const MovieReview = React.memo(function MovieReview() {
         }
       } catch {
         // The selected review job poll will surface hard failures; history refresh stays quiet.
+      } finally {
+        reviewHistoryPollInFlightRef.current = false;
       }
     };
 
@@ -450,8 +526,15 @@ export const MovieReview = React.memo(function MovieReview() {
         ? "Hậu kiểm sau render chưa đạt. Mở các segment viền đỏ, sửa lời dẫn hoặc chọn cảnh phù hợp rồi lưu; lỗi không gắn segment được liệt kê trong bảng QA."
         : "QA trước render chưa đạt. Mở các segment viền đỏ, sửa lời dẫn hoặc chọn cảnh phù hợp rồi lưu.";
   const outputVideoBaseUrl = result?.output_video_url ? toAbsoluteApiUrl(result.output_video_url) : null;
+  // Identity of the rendered file itself. The backend clears output_video_url while a new
+  // render runs, so this flips to null and back whenever a genuinely new file is produced.
+  const outputIdentityKey = result?.output_video_url
+    ? `${result.output_video_url}::${result.output_file_path ?? ""}`
+    : null;
   const outputVideoUrl = outputVideoBaseUrl
-    ? `${outputVideoBaseUrl}${outputVideoBaseUrl.includes("?") ? "&" : "?"}v=${encodeURIComponent(job?.updated_at ?? "latest")}`
+    ? outputCacheToken
+      ? `${outputVideoBaseUrl}${outputVideoBaseUrl.includes("?") ? "&" : "?"}v=${encodeURIComponent(outputCacheToken)}`
+      : outputVideoBaseUrl
     : null;
   const targetDurationSeconds = job ? normalizeTargetMinutes(job.request.target_minutes) * 60 : null;
   const plannedDurationSeconds = reviewPlannedDurationSeconds(result);
@@ -470,6 +553,13 @@ export const MovieReview = React.memo(function MovieReview() {
     : selectedStyle;
   const activePreviewUrl = previewMode === "output" ? outputVideoUrl : sourceVideoUrl;
   const selectedBeat = result?.beats[selectedBeatIndex] ?? null;
+
+  useEffect(() => {
+    // The ref keeps StrictMode's double-invoked mount from minting two tokens.
+    if (outputCacheIdentityRef.current === outputIdentityKey) return;
+    outputCacheIdentityRef.current = outputIdentityKey;
+    setOutputCacheToken(outputIdentityKey ? String(Date.now()) : null);
+  }, [outputIdentityKey]);
 
   useEffect(() => {
     setOutputDurationSeconds(null);
@@ -649,7 +739,12 @@ export const MovieReview = React.memo(function MovieReview() {
 
   const copyText = useCallback(async (value: string) => {
     if (!value) return;
-    await navigator.clipboard.writeText(value);
+    const copied = await copyTextToClipboard(value);
+    setMessage(
+      copied
+        ? "Đã copy vào clipboard."
+        : "Không thể copy tự động (trình duyệt chặn clipboard). Hãy bôi đen nội dung và nhấn Ctrl+C.",
+    );
   }, []);
 
   return (

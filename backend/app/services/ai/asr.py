@@ -6,6 +6,7 @@ Cải tiến:
 - no_speech_threshold và compression_ratio_threshold để giảm hallucination
 - Log số segment nhận diện được để debug
 """
+import threading
 from pathlib import Path
 
 from app.core import settings
@@ -13,6 +14,10 @@ from app.models.job import ProcessingMode
 from app.services.presets import get_processing_profile
 from app.services.subtitles.ass import write_srt
 from app.services.subtitles.timing import SubtitleEvent
+
+
+# Transcriptions run in worker threads, so PATH must not be mutated concurrently.
+_NVIDIA_PATH_LOCK = threading.Lock()
 
 
 class AsrError(RuntimeError):
@@ -277,10 +282,24 @@ def _load_nvidia_runtime_dlls() -> None:
         except (AttributeError, OSError):
             pass
 
-    existing = os.environ.get("PATH", "")
-    prefixes = [str(path) for path in dll_dirs if str(path) not in existing]
-    if prefixes:
-        os.environ["PATH"] = ";".join(prefixes + [existing])
+    with _NVIDIA_PATH_LOCK:
+        # Compare real path components: substring containment false-positives on
+        # any directory whose path is a prefix of another entry.
+        existing = os.environ.get("PATH", "")
+        known = {
+            os.path.normcase(os.path.normpath(part))
+            for part in existing.split(os.pathsep)
+            if part
+        }
+        prefixes: list[str] = []
+        for path in dll_dirs:
+            key = os.path.normcase(os.path.normpath(str(path)))
+            if key in known:
+                continue
+            known.add(key)
+            prefixes.append(str(path))
+        if prefixes:
+            os.environ["PATH"] = os.pathsep.join([*prefixes, existing] if existing else prefixes)
 
 
 def _segment_start(segment) -> float:

@@ -12,6 +12,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 
 from app.core import settings
+from app.services.ai.openai_client import get_async_openai
 from app.models.review import (
     FinalReviewCriterion,
     FinalReviewCriterionKey,
@@ -785,7 +786,11 @@ def _safe_string_list(value: object, limit: int) -> list[str]:
 
 
 def _client() -> AsyncOpenAI:
-    return AsyncOpenAI(
-        api_key=settings.ninerouter_api_key or "local-ninerouter",
-        base_url=settings.ninerouter_api_url,
+    # Shared pool: a per-call client leaked an httpx connection pool per request.
+    # timeout/max_retries preserve the previous SDK behaviour for this module.
+    return get_async_openai(
+        settings.ninerouter_api_key or "local-ninerouter",
+        settings.ninerouter_api_url,
+        timeout=240.0,
+        max_retries=2,
     )

@@ -1,8 +1,12 @@
 import json
 import re
 from pydantic import BaseModel, Field
-from openai import AsyncOpenAI
 from app.core import settings
+from app.services.ai.openai_client import get_async_openai
+
+# Without an explicit timeout an unresponsive gateway can hold a request for
+# tens of minutes before metadata generation silently falls back.
+AI_REQUEST_TIMEOUT_SECONDS = 120.0
 
 class VideoDetails(BaseModel):
     title: str = Field(description="Tiêu đề YouTube tiếng Việt, hấp dẫn nhưng không sai sự thật.")
@@ -36,9 +40,11 @@ async def generate_movie_review_plan(
     custom_prompt: str | None = None,
 ) -> MovieReviewPlan:
     clean_transcript = _plain_transcript(transcript)
-    client = AsyncOpenAI(
-        api_key=settings.ninerouter_api_key,
-        base_url=settings.ninerouter_api_url,
+    client = get_async_openai(
+        settings.ninerouter_api_key,
+        settings.ninerouter_api_url,
+        timeout=AI_REQUEST_TIMEOUT_SECONDS,
+        max_retries=1,
     )
 
     style_map = {
@@ -91,6 +97,7 @@ async def generate_movie_review_plan(
             ],
             response_format={"type": "json_object"},
             temperature=0.75,
+            timeout=AI_REQUEST_TIMEOUT_SECONDS,
         )
         content = response.choices[0].message.content
         if not content:
@@ -143,9 +150,11 @@ async def generate_video_details(transcript: str, custom_prompt: str | None = No
     """
     clean_transcript = _plain_transcript(transcript)
 
-    client = AsyncOpenAI(
-        api_key=settings.ninerouter_api_key,
-        base_url=settings.ninerouter_api_url,
+    client = get_async_openai(
+        settings.ninerouter_api_key,
+        settings.ninerouter_api_url,
+        timeout=AI_REQUEST_TIMEOUT_SECONDS,
+        max_retries=1,
     )
 
     system_prompt = (
@@ -180,6 +189,7 @@ async def generate_video_details(transcript: str, custom_prompt: str | None = No
             ],
             response_format={"type": "json_object"},
             temperature=0.7,
+            timeout=AI_REQUEST_TIMEOUT_SECONDS,
         )
         
         content = response.choices[0].message.content

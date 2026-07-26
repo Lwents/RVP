@@ -94,13 +94,13 @@ class GeminiTranslation(TranslationEngine):
             )
 
         try:
-            from openai import AsyncOpenAI
+            from app.services.ai.openai_client import get_async_openai
         except ImportError as exc:
             raise TranslationError("Thiếu thư viện openai để gọi AI dịch phụ đề.") from exc
 
-        client = AsyncOpenAI(
-            api_key=settings.ninerouter_api_key,
-            base_url=settings.ninerouter_api_url,
+        client = get_async_openai(
+            settings.ninerouter_api_key,
+            settings.ninerouter_api_url,
             # Retry is controlled below so one failing batch cannot silently
             # multiply the SDK retries by the pipeline retries.
             max_retries=0,
@@ -152,9 +152,14 @@ class GeminiTranslation(TranslationEngine):
                 )
             elapsed = time.monotonic() - started_at
             if elapsed >= total_budget:
-                raise TranslationError(
-                    f"Dịch vượt quá ngân sách {int(total_budget)} giây; "
+                progress_detail = (
                     f"đã lưu checkpoint {completed_batches}/{len(ranges)} batch để chạy tiếp."
+                    if checkpoint_file is not None
+                    else f"mới dịch xong {completed_batches}/{len(ranges)} batch và không có "
+                    "checkpoint nên lần chạy sau phải dịch lại từ đầu."
+                )
+                raise TranslationError(
+                    f"Dịch vượt quá ngân sách {int(total_budget)} giây; {progress_detail}"
                 )
             batch = [
                 {"id": index + 1, "source": source_texts[index]}
@@ -183,20 +188,17 @@ class GeminiTranslation(TranslationEngine):
                 next_context,
                 retries=profile.translation_retries,
                 request_timeout_seconds=profile.translation_request_timeout_seconds,
+                # Cleaning and per-item validation run inside the retry loop so a
+                # single degenerate line is re-requested instead of hard-failing
+                # a multi-hour job.
+                finalize=lambda texts, batch=batch: _finalize_translated_batch(
+                    batch,
+                    texts,
+                    character_names,
+                    target_language,
+                ),
             )
-
-            for item, translated in zip(batch, batch_texts):
-                source = str(item["source"])
-                cleaned = _clean_polished_subtitle(translated, "")
-                cleaned = unicodedata.normalize("NFC", cleaned)
-                cleaned = canonicalize_character_text(cleaned, character_names)
-                if not cleaned or (
-                    target_language.lower() == "vi" and _looks_chinese(cleaned)
-                ):
-                    raise TranslationError(
-                        f"AI còn sót nội dung chưa dịch ở mục {item['id']}: {source[:120]}"
-                    )
-                translated_texts.append(cleaned)
+            translated_texts.extend(batch_texts)
 
             _merge_translation_memory(memory, memory_updates)
             memory["recent_translations"] = previous_context[-4:] + [
@@ -558,11 +560,12 @@ async def _translate_gemini_batch_with_retries(
     next_context: list[dict[str, object]],
     retries: int = 3,
     request_timeout_seconds: float = 150,
+    finalize: Callable[[list[str]], list[str]] | None = None,
 ) -> tuple[list[str], dict]:
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            return await asyncio.wait_for(
+            translated, updates = await asyncio.wait_for(
                 _translate_gemini_batch(
                     client,
                     batch,
@@ -576,6 +579,9 @@ async def _translate_gemini_batch_with_retries(
                 ),
                 timeout=request_timeout_seconds + 5,
             )
+            # Any validation error raised here retries the request instead of
+            # aborting the whole translation run.
+            return (finalize(translated) if finalize else translated), updates
         except TimeoutError as exc:
             last_error = TranslationError(
                 f"9router không phản hồi trong {int(request_timeout_seconds)} giây"
@@ -592,6 +598,32 @@ async def _translate_gemini_batch_with_retries(
     ) from last_error
 
 
+def _finalize_translated_batch(
+    batch: list[dict[str, object]],
+    batch_texts: list[str],
+    character_names,
+    target_language: str,
+) -> list[str]:
+    """Clean and validate one translated batch; raising here triggers a retry."""
+    if len(batch_texts) != len(batch):
+        raise TranslationError(
+            f"AI trả về {len(batch_texts)} câu dịch cho batch {len(batch)} câu."
+        )
+    cleaned_texts: list[str] = []
+    for item, translated in zip(batch, batch_texts):
+        cleaned = _clean_polished_subtitle(translated, "")
+        cleaned = unicodedata.normalize("NFC", cleaned)
+        cleaned = canonicalize_character_text(cleaned, character_names)
+        if not cleaned or (
+            target_language.lower() == "vi" and _looks_chinese(cleaned)
+        ):
+            raise TranslationError(
+                f"AI còn sót nội dung chưa dịch ở mục {item['id']}: {str(item['source'])[:120]}"
+            )
+        cleaned_texts.append(cleaned)
+    return cleaned_texts
+
+
 # ─── AI Vietnamese subtitle editor ───────────────────────────────────────────
 
 async def _polish_vietnamese_events_with_ai(
@@ -604,15 +636,18 @@ async def _polish_vietnamese_events_with_ai(
         return draft_events
 
     try:
-        from openai import AsyncOpenAI
+        from app.services.ai.openai_client import get_async_openai
     except ImportError:
         return draft_events
 
     polished: list[SubtitleEvent] = []
     failed_batches = 0
-    client = AsyncOpenAI(
-        api_key=settings.ninerouter_api_key,
-        base_url=settings.ninerouter_api_url,
+    client = get_async_openai(
+        settings.ninerouter_api_key,
+        settings.ninerouter_api_url,
+        # _polish_vietnamese_batch_with_retries already retries three times; SDK
+        # retries on top of that would make one bad batch cost ~13 minutes.
+        max_retries=0,
     )
 
     for batch in _ai_polish_batches(source_events, draft_events):
@@ -633,13 +668,22 @@ async def _polish_vietnamese_events_with_ai(
                 )
             )
 
-    if len(polished) != len(draft_events):
-        return draft_events
-    if failed_batches and _source_requires_ai_polish(source_events):
+    # The Chinese-leak gate must run before the length check: _ai_polish_batches
+    # zips source with draft, so a length mismatch used to return the raw drafts
+    # and ship unpolished output past this very gate.
+    requires_polish = _source_requires_ai_polish(source_events)
+    if failed_batches and requires_polish:
         raise TranslationError(
             "AI biên tập phụ đề không chạy được nên không dùng bản dịch thô. "
             "Hãy bật 9router/AI ở localhost:20128 rồi chạy lại."
         )
+    if len(polished) != len(draft_events):
+        if requires_polish:
+            raise TranslationError(
+                f"Số câu nguồn ({len(source_events)}) và bản dịch nháp ({len(draft_events)}) "
+                "không khớp nên AI không biên tập được toàn bộ phụ đề."
+            )
+        return draft_events
     return polished
 
 

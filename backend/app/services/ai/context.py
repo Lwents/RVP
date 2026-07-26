@@ -9,6 +9,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 
 from app.core import settings
+from app.services.ai.openai_client import get_async_openai
 from app.services.subtitles.timing import SubtitleEvent
 
 
@@ -30,13 +31,18 @@ async def analyze_video_context(
             pass
 
     transcript = _compact_transcript(events)
-    frames = _sample_video_frames(video_file)
+    # Seeking/decoding/encoding frames with OpenCV blocks for seconds; keep it
+    # off the event loop.
+    frames = await asyncio.to_thread(_sample_video_frames, video_file)
     if not transcript and not frames:
         return {}
 
-    client = AsyncOpenAI(
-        api_key=settings.ninerouter_api_key,
-        base_url=settings.ninerouter_api_url,
+    client = get_async_openai(
+        settings.ninerouter_api_key,
+        settings.ninerouter_api_url,
+        # _create_context_completion_with_retries already retries three times;
+        # SDK retries on top of that would triple every failing request.
+        max_retries=0,
     )
     prompt = (
         "Bạn là chuyên gia nhận diện ngữ cảnh phim thuộc mọi quốc gia để hỗ trợ dịch phụ đề và viết review tiếng Việt.\n"
