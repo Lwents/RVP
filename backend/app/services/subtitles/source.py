@@ -47,6 +47,10 @@ def _find_js_runtime() -> str | None:
     if settings.ytdlp_js_runtime:
         return settings.ytdlp_js_runtime
 
+    bundled_node = Path(__file__).resolve().parents[4] / "tools" / "node" / "node.exe"
+    if bundled_node.exists():
+        return f"node:{bundled_node.as_posix()}"
+
     node = shutil.which("node")
     if node:
         return f"node:{Path(node).as_posix()}"
@@ -126,7 +130,7 @@ async def get_or_create_subtitles(
 
     if source_url and settings.prefer_youtube_subtitles:
         try:
-            subtitle_file = await download_platform_subtitles(source_url, work_dir, progress)
+            subtitle_file = await download_platform_subtitles(source_url, work_dir, progress, source_language)
             return await _prepare_target_subtitles(
                 subtitle_file,
                 work_dir,
@@ -254,8 +258,9 @@ async def _prepare_target_subtitles(
     return write_srt(translated_events, work_dir / f"subtitles.{target_language}.srt")
 
 
-async def download_platform_subtitles(url: str, work_dir: Path, progress: Callable[[str, int], None]) -> Path:
+async def download_platform_subtitles(url: str, work_dir: Path, progress: Callable[[str, int], None], source_language: str = "auto") -> Path:
     progress(f"Tải phụ đề có sẵn từ {_platform_name(url)}", 55)
+    languages = [source_language] if source_language in {"en", "zh", "vi"} else ["en", "zh", "vi"]
     output_template = str(work_dir / "subtitles.%(ext)s")
     ffmpeg = find_ffmpeg()
     command = [
@@ -266,16 +271,16 @@ async def download_platform_subtitles(url: str, work_dir: Path, progress: Callab
         "--socket-timeout",
         "25",
         "--retries",
-        "1",
+        "5",
         "--skip-download",
         "--remote-components",
         "ejs:github",
         "--write-sub",
         "--write-auto-sub",
         "--sub-langs",
-        "vi,vi-orig,en,en-orig,zh,zh-Hans,zh-Hant",
+        ",".join(f"{language}.*" for language in languages),
         "--sub-format",
-        "srt",
+        "srt/vtt/best",
         "--convert-subs",
         "srt",
         "--output",
@@ -294,22 +299,23 @@ async def download_platform_subtitles(url: str, work_dir: Path, progress: Callab
 
     def download() -> Path:
         completed = _run_ytdlp(command, timeout=90)
-        for name in [
-            "subtitles.vi.srt",
-            "subtitles.vi-orig.srt",
-            "subtitles.en.srt",
-            "subtitles.en-orig.srt",
-            "subtitles.zh.srt",
-            "subtitles.zh-Hans.srt",
-            "subtitles.zh-Hant.srt",
-        ]:
-            candidate = work_dir / name
-            if candidate.exists() and candidate.stat().st_size > 0:
-                return candidate
-
-        matches = sorted(work_dir.glob("subtitles*.srt"), key=lambda item: item.stat().st_size, reverse=True)
-        if matches:
-            return matches[0]
+        matches = [p for p in work_dir.glob("subtitles*.srt") if p.stat().st_size > 0 and p.name not in {"subtitles.vi.srt", "subtitles.whisper.srt", "subtitles.grouped.srt"}]
+        # Vietnamese is a source track only when explicitly requested; never
+        # feed a platform's machine-translated Vietnamese track to English ASR.
+        if source_language == "vi":
+            matches.extend(p for p in work_dir.glob("subtitles.vi.srt") if p.stat().st_size > 0)
+        preferred_languages = languages
+        if source_language == "auto":
+            preferred_languages = sorted(languages, key=lambda language: not any(
+                p.name.startswith(f"subtitles.{language}") and p.stem.endswith("-orig")
+                for p in matches
+            ))
+        for language in preferred_languages:
+            candidates = [p for p in matches if p.name.startswith(f"subtitles.{language}.") or p.name.startswith(f"subtitles.{language}-")]
+            if candidates:
+                # Prefer a supplied locale track over automatic recognition;
+                # the original-language marker still guides auto detection.
+                return sorted(candidates, key=lambda p: (p.stem.endswith("-orig"), p.name))[0]
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise SubtitleSourceError(f"yt-dlp không tải được phụ đề. {detail}")

@@ -139,12 +139,16 @@ def split_long_subtitle_events(
 
         weights = [max(len(chunk.strip()), 1) for chunk in chunks]
         total_weight = sum(weights)
+        # Reserve time for every cue before distributing the remaining time.
+        # A short tail must not inherit a few milliseconds after a long cue.
+        minimum = min(0.6, duration / len(chunks))
+        remaining = max(0.0, duration - minimum * len(chunks))
         cursor = event.start
         for index, chunk in enumerate(chunks):
             if index == len(chunks) - 1:
                 end = event.end
             else:
-                end = min(event.end, cursor + max(0.35, duration * (weights[index] / total_weight)))
+                end = min(event.end, cursor + minimum + remaining * (weights[index] / total_weight))
             split_events.append(SubtitleEvent(cursor, end, chunk))
             cursor = end
 
@@ -237,6 +241,17 @@ def _split_by_words(text: str, max_chars: int) -> list[str]:
             current_length += extra
     if current:
         chunks.append(" ".join(current))
+    # Balance neighboring chunks so a final word does not become its own cue.
+    for index in range(len(chunks) - 1, 0, -1):
+        left, right = chunks[index - 1].split(), chunks[index].split()
+        while len(left) > 1:
+            candidate = " ".join([left[-1], *right])
+            before = abs(len(" ".join(left)) - len(" ".join(right)))
+            after = abs(len(" ".join(left[:-1])) - len(candidate))
+            if len(candidate) > max_chars or after >= before:
+                break
+            right.insert(0, left.pop())
+        chunks[index - 1], chunks[index] = " ".join(left), " ".join(right)
     return chunks
 
 

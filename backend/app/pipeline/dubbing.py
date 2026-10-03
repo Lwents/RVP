@@ -14,7 +14,6 @@ from app.services.media.separation import separate_background_with_demucs
 from app.services.presets import get_processing_profile
 from app.services.store import job_store
 from app.services.subtitles.source import asr_timeout_for_duration, get_or_create_subtitles
-from app.models.job import PublishTarget
 
 class PipelineError(RuntimeError):
     pass
@@ -59,8 +58,6 @@ async def process_dubbing_job(job_id: str) -> None:
 
         if job.request.clone_voice:
             raise PipelineError("Clone giọng cần cấu hình voice engine riêng trước khi chạy.")
-        if job.request.auto_publish:
-            raise PipelineError("Auto publish cần cấu hình token YouTube/Facebook trước khi chạy.")
 
         source_video = await prepare_source_video(
             str(job.request.source_url) if job.request.source_url else None,
@@ -263,26 +260,6 @@ async def process_dubbing_job(job_id: str) -> None:
             # already-created MP4 into a failed job.
             print(f"Final dubbing evaluator unavailable: {exc}")
         
-        if job.request.auto_publish and PublishTarget.youtube in job.request.auto_publish:
-            progress("Tự động đăng lên YouTube...", 92)
-            from app.services.youtube.upload import upload_video_to_youtube
-            try:
-                # We can run upload in an executor since it's a blocking sync function
-                loop = asyncio.get_running_loop()
-                yt_response = await loop.run_in_executor(
-                    None, 
-                    upload_video_to_youtube,
-                    str(output_file.absolute()),
-                    seo_title,
-                    seo_description,
-                    seo_tags,
-                    "public" # Hoặc private tuỳ ý
-                )
-                seo_description += f"\n\nĐã đăng lên YouTube thành công! Video ID: {yt_response['id']}"
-            except Exception as e:
-                print(f"Error uploading to YouTube: {e}")
-                seo_description += f"\n\nLỗi đăng YouTube: {e}"
-
         job_store.update(
             job_id,
             status=JobStatus.completed,

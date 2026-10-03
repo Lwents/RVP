@@ -103,7 +103,7 @@ class FasterWhisperAsr(AsrEngine):
             initial_prompt = _INITIAL_PROMPTS.get(language, _INITIAL_PROMPTS["auto"])
 
             segments_iter, info = model.transcribe(
-                str(audio_file),
+                _load_asr_audio(audio_file),
                 language=whisper_language,
                 vad_filter=settings.whisper_vad_filter,
                 beam_size=profile.whisper_beam_size,
@@ -232,6 +232,32 @@ class ResilientAsr(AsrEngine):
 
 def get_asr_engine() -> AsrEngine:
     return ResilientAsr()
+
+
+def _load_asr_audio(audio_file: Path):
+    """Feed 16 kHz samples directly to Whisper, avoiding PyAV API changes."""
+    import subprocess
+    import wave
+    import numpy as np
+    from app.services.media.ffmpeg import find_ffmpeg
+
+    try:
+        with wave.open(str(audio_file), "rb") as source:
+            if (source.getnchannels(), source.getsampwidth(), source.getframerate()) == (1, 2, 16000):
+                return np.frombuffer(source.readframes(source.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+    except (wave.Error, EOFError):
+        pass
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise AsrError("Không tìm thấy FFmpeg để đọc audio cho Whisper.")
+    decoded = subprocess.run(
+        [ffmpeg, "-v", "error", "-i", str(audio_file), "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1"],
+        capture_output=True, check=False, timeout=300,
+    )
+    if decoded.returncode or not decoded.stdout:
+        raise AsrError("FFmpeg không đọc được audio: " + decoded.stderr.decode("utf-8", errors="replace")[-1000:])
+    return np.frombuffer(decoded.stdout, dtype="<f4").copy()
 
 
 def _result_segment_time(segment: dict, field: str) -> float:

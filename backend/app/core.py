@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_AI_MODEL = "ag/gemini-3-flash-agent"
+DEFAULT_AI_MODEL = "ag/gemini-3.8-flash-medium"
 DEFAULT_REVIEW_AI_MODEL = "ag/gemini-pro-agent"
 
 
@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     cors_origins: list[str] = [
         "http://127.0.0.1:5173",
         "http://localhost:5173",
+        "http://127.0.0.1:5174",
+        "http://localhost:5174",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8100",
+        "http://localhost:8100",
         "http://127.0.0.1:4173",
         "http://localhost:4173",
     ]
@@ -24,7 +30,7 @@ class Settings(BaseSettings):
     video_encoder: str = "h264_nvenc"
     video_crf: int = 23
     video_preset: str = "slow"
-    ytdlp_format: str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo*+bestaudio/best"
+    ytdlp_format: str = "bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]/best"
     ytdlp_download_timeout_seconds: int = 1800
     ytdlp_js_runtime: str | None = None
     ytdlp_cookies_file: str | None = None
@@ -65,8 +71,6 @@ class Settings(BaseSettings):
     review_keyframes_per_scene: int = 3
     review_max_scenes: int = 240
     review_quality_threshold: int = 90
-    youtube_client_secrets_file: str = "client_secret.json"
-    youtube_credentials_file: str = "storage/youtube_credentials.json"
 
     model_config = SettingsConfigDict(
         env_file=BACKEND_DIR / ".env",

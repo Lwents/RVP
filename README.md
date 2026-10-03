@@ -1,10 +1,11 @@
 # Auto-Translate AI
 
-Full-stack demo for an AI video dubbing workflow.
+Video translation and Vietnamese dubbing with a React interface and a FastAPI backend.
 
 - Frontend: React, TypeScript, Vite
 - Backend: Python, FastAPI, Pydantic
-- Features: dubbing configuration form, watermark upload, background job simulation, progress polling, job history
+- Features: video import, translation, Vietnamese voiceover, subtitles, watermark, background processing and job history.
+- The interface currently exposes translation only. Movie review is hidden and YouTube publishing has been removed.
 
 ## Run Backend
 
@@ -62,7 +63,7 @@ docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
 
 ## Notes
 
-The current backend includes a clean mock processing pipeline so the whole app runs immediately. Replace `backend/app/services/processor.py` with real video steps when you are ready:
+The processing pipeline downloads or imports a video, transcribes speech, translates dialogue, and renders voiceover and subtitles. Configure your local AI provider and media tools before processing:
 
 1. Download or load source video.
 2. Extract audio with FFmpeg.
@@ -70,7 +71,34 @@ The current backend includes a clean mock processing pipeline so the whole app r
 4. Translate text.
 5. Generate Vietnamese TTS.
 6. Mix background audio and burn subtitles/watermark.
-7. Publish to configured channels.
-cd C:\Users\kirit\Documents\AI_Video\backend
-.\.venv\Scripts\Activate.ps1
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+7. Export the completed video.
+
+
+## Local configuration and private packages
+
+Copy `backend/.env.example` to `backend/.env` and configure your own local
+9router API key and FFmpeg path. The sample contains no account credentials.
+Model names must be available in your own 9router installation.
+
+To serve the built interface and API from a single port:
+
+```powershell
+cd frontend
+npm.cmd run build
+cd ../backend
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8100
+```
+
+Open http://127.0.0.1:8100. For this setup, omit `frontend/.env` or set
+`VITE_API_URL=http://127.0.0.1:8100` before building.
+
+`desktop_app.py`, `CHAY_APP.bat` and `build-portable.py` support personal Windows
+packages. Packaging requires the local launcher executable, Python, Node.js,
+FFmpeg and 9router runtimes described by the build script. These binaries are
+not included in Git.
+
+The packaging script copies the active 9router profile, including provider
+sign-ins and API keys, into `release/`. Treat that folder and its ZIP as private.
+Environment files, router profiles, databases, cookies, logs, generated media
+and personal release packages are excluded from Git and Docker build contexts.
+Credentials are configured separately on each fresh clone.

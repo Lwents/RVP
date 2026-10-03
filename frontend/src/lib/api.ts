@@ -3,19 +3,13 @@ import type { DubbingRequest, JobProgress, ProcessingMode, ReviewDraftJob, Revie
 const ENV_API_URL = import.meta.env.VITE_API_URL?.trim();
 
 function resolveApiUrl(): string {
-  if (typeof window === "undefined") {
-    return ENV_API_URL || "http://127.0.0.1:8000";
+  if (ENV_API_URL) {
+    return ENV_API_URL;
   }
-
-  const hostname = window.location.hostname;
-  const isLocalFrontend = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-
-  // Local development should not be blocked by an expired Cloudflare quick tunnel in .env.local.
-  if (isLocalFrontend) {
-    return "http://127.0.0.1:8000";
+  if (typeof window !== "undefined") {
+    return window.location.origin;
   }
-
-  return ENV_API_URL || "http://127.0.0.1:8000";
+  return "http://127.0.0.1:8000";
 }
 
 const API_URL = resolveApiUrl();
@@ -199,40 +193,6 @@ export async function fetchUrlPreview(url: string): Promise<UploadResponse> {
     throw new Error(errorData?.detail || `Lỗi tải preview: ${response.status}`);
   }
   return response.json() as Promise<UploadResponse>;
-}
-
-export async function getYoutubeAuthUrl(redirectUri: string): Promise<{url: string}> {
-  return request(`/api/youtube/auth-url?redirect_uri=${encodeURIComponent(redirectUri)}`);
-}
-
-export async function sendYoutubeCallbackCode(code: string, redirectUri: string): Promise<any> {
-  return request("/api/youtube/callback", {
-    method: "POST",
-    body: JSON.stringify({ code, redirect_uri: redirectUri })
-  });
-}
-
-export async function getYoutubeStats(): Promise<any> {
-  return request("/api/youtube/stats");
-}
-
-export async function uploadYoutubeClientSecret(file: File): Promise<{ status: string; message: string }> {
-  const formData = new FormData();
-  formData.append("file", file);
-  const response = await fetch(`${API_URL}/api/youtube/client-secret`, {
-    method: "POST",
-    body: formData,
-  });
-  if (!response.ok) {
-    const detail = await response.text();
-    try {
-      const parsed = JSON.parse(detail);
-      throw new Error(parsed.detail || "Upload client_secret failed");
-    } catch {
-      throw new Error(detail || "Upload client_secret failed");
-    }
-  }
-  return response.json() as Promise<{ status: string; message: string }>;
 }
 
 export interface DetectedBlurRegion {

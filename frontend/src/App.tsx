@@ -2,8 +2,6 @@ import React, { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState, us
 import {
   BadgeCheck,
   Check,
-  ChevronRight,
-  Copy,
   Download,
   FileImage,
   Loader2,
@@ -12,14 +10,11 @@ import {
   Upload,
   Video,
   Wand2,
-  Youtube,
 } from "lucide-react";
-import { cancelJob, clearJobs, createJob, detectBlurRegions, evaluateJob, fetchUrlPreview, generateJobMetadata, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
+import { cancelJob, clearJobs, createJob, detectBlurRegions, evaluateJob, fetchUrlPreview, getJob, listJobs, toAbsoluteApiUrl, uploadVideo, uploadWatermark } from "./lib/api";
 import type { UploadProgress } from "./lib/api";
 import type { BgmMode, DubbingRequest, JobProgress, VoiceGender } from "./types/api";
-import { YoutubeStats } from "./components/YoutubeStats";
 import { LivePreview } from "./components/LivePreview";
-import { MovieReview } from "./components/MovieReview";
 import { ProcessingModeSelector } from "./components/ProcessingModeSelector";
 import { ReviewFinalEvaluationPanel } from "./components/ReviewFinalEvaluation";
 
@@ -30,28 +25,7 @@ const languages = [
   { value: "vi", label: "Tiếng Việt" },
 ] as const;
 
-type AppTab = "workspace" | "youtube" | "review";
-
-const APP_TAB_STORAGE_KEY = "auto-translate-ai.activeTab";
 const ACTIVE_WORKSPACE_JOB_STORAGE_KEY = "auto-translate-ai.activeWorkspaceJobId";
-const appTabs: AppTab[] = ["workspace", "youtube", "review"];
-
-function isAppTab(value: string | null): value is AppTab {
-  return Boolean(value && appTabs.includes(value as AppTab));
-}
-
-function tabFromHash(hash: string): AppTab | null {
-  const value = hash.replace(/^#\/?/, "").trim();
-  return isAppTab(value) ? value : null;
-}
-
-function readInitialTab(): AppTab {
-  if (typeof window === "undefined") return "workspace";
-  const hashTab = tabFromHash(window.location.hash);
-  if (hashTab) return hashTab;
-  const storedTab = window.localStorage.getItem(APP_TAB_STORAGE_KEY);
-  return isAppTab(storedTab) ? storedTab : "workspace";
-}
 
 function readInitialActiveJobId(): string | null {
   if (typeof window === "undefined") return null;
@@ -66,7 +40,6 @@ const defaultForm: DubbingRequest = {
   bgm_mode: "demucs",
   use_demucs: true,
   video_speed: 1.0,
-  auto_publish: [],
   clone_voice: false,
   hard_subtitles: true,
   source_has_hard_subtitles: false,
@@ -106,13 +79,6 @@ function normalizeBlurBand(yPercent: number, heightPercent: number) {
 function suggestSubtitleFontSize(blurHeightPercent: number) {
   void blurHeightPercent;
   return 64;
-}
-
-function needsYoutubeMetadata(job: JobProgress): boolean {
-  if (job.status !== "completed") return false;
-  const title = job.seo_title?.trim();
-  const tags = job.seo_tags ?? [];
-  return !title || title === "Video đã được xử lý" || tags.length === 0;
 }
 
 function isRunningJob(job: JobProgress): boolean {
@@ -160,7 +126,6 @@ export function App() {
   const [videoName, setVideoName] = useState("Chưa có video được import");
   const [previewVideoUrl, setPreviewVideoUrl] = useState<string | null>(null);
   const [isPreviewLoading, setPreviewLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState<AppTab>(() => readInitialTab());
 
   const videoInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -173,25 +138,16 @@ export function App() {
     }
   }, []);
 
-  const goToTab = useCallback((tab: AppTab) => {
-    setActiveTab(tab);
-    window.localStorage.setItem(APP_TAB_STORAGE_KEY, tab);
-    const nextHash = `#${tab}`;
-    if (window.location.hash !== nextHash) {
-      window.history.pushState(null, "", nextHash);
-    }
-  }, []);
-
   useEffect(() => {
-    const syncTabFromHash = () => {
-      const nextTab = tabFromHash(window.location.hash);
-      if (!nextTab) return;
-      setActiveTab(nextTab);
-      window.localStorage.setItem(APP_TAB_STORAGE_KEY, nextTab);
+    const showTranslation = () => {
+      window.localStorage.removeItem("auto-translate-ai.activeTab");
+      if (window.location.hash) {
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      }
     };
-
-    window.addEventListener("hashchange", syncTabFromHash);
-    return () => window.removeEventListener("hashchange", syncTabFromHash);
+    showTranslation();
+    window.addEventListener("hashchange", showTranslation);
+    return () => window.removeEventListener("hashchange", showTranslation);
   }, []);
 
   useEffect(() => {
@@ -245,10 +201,7 @@ export function App() {
     let cancelled = false;
     const poll = async () => {
       try {
-        let job = await getJob(activeJobId);
-        if (needsYoutubeMetadata(job)) {
-          job = await generateJobMetadata(job.job_id);
-        }
+        const job = await getJob(activeJobId);
         if (cancelled) return;
         setActiveJob(job);
         setJobs((previous) =>
@@ -463,7 +416,6 @@ export function App() {
         setField("subtitle_box_enabled", false);
         setField("subtitle_box_opacity", 0);
         setField("subtitle_box_height_percent", 22);
-        setField("auto_publish", []);
 
         // 1. Cập nhật các vùng làm mờ mới
         if (result.config) {
@@ -515,7 +467,7 @@ export function App() {
         const engineMessage = result.engine_used === "ai"
           ? `Gemini (${result.ai_model}) đã phân tích trực tiếp video.`
           : `Gemini không trả về kết quả hợp lệ; đã dùng nhận diện local.${result.ai_error ? ` Chi tiết: ${result.ai_error}` : ""}`;
-        setMessage(`${engineMessage} Đã tự cấu hình đầy đủ: phụ đề, giọng đọc, Demucs, thanh mờ chữ gốc, logo và metadata YouTube. ${result.count} vùng hợp lý.${notes}`);
+        setMessage(`${engineMessage} Đã tự cấu hình đầy đủ: phụ đề, giọng đọc, Demucs, thanh mờ chữ gốc, logo. ${result.count} vùng hợp lý.${notes}`);
       }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "AI phân tích thất bại.");
@@ -538,43 +490,15 @@ export function App() {
             <BadgeCheck size={16} />
             Backend đang chạy
           </span>
-          <button
-            className={`nav-tab ios-button ios-button-secondary ${activeTab === 'youtube' ? 'active' : ''}`}
-            onClick={() => goToTab('youtube')}
-          >
-            <Youtube size={16} /> YouTube Stats
-          </button>
-          <button
-            className={`nav-tab ios-button ios-button-secondary ${activeTab === 'review' ? 'active' : ''}`}
-            onClick={() => goToTab('review')}
-          >
-            Review phim
-          </button>
-          <button
-            className={`nav-tab ios-button ios-button-secondary ${activeTab === 'workspace' ? 'active' : ''}`}
-            onClick={() => goToTab('workspace')}
-          >
-            Workspace
-          </button>
-          <a className="nav-tab nav-doc-link ios-button ios-button-secondary" href="http://127.0.0.1:8000/docs" target="_blank" rel="noreferrer">
-            Tài liệu API
-            <ChevronRight size={16} />
-          </a>
+          <span className="nav-tab ios-button ios-button-secondary active">Dịch phim</span>
         </div>
       </nav>
 
-      {activeTab === 'youtube' ? (
-        <div key="youtube" className="ios-view-transition">
-          <YoutubeStats />
-        </div>
-      ) : activeTab === 'review' ? (
-        <MovieReview />
-      ) : (
         <div key="workspace" className="ios-view-transition">
           <header className="page-heading">
             <div>
-              <h1>Video dubbing workspace</h1>
-              <p>Cấu hình, kéo vị trí phụ đề và render video trực quan</p>
+              <h1>Dịch phim sang tiếng Việt</h1>
+              <p>Dịch lời thoại, tạo giọng đọc và phụ đề cho phim</p>
             </div>
             <button className="ios-button" type="submit" form="dubbing-form" disabled={!canSubmit}>
               {isSubmitting ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
@@ -600,7 +524,7 @@ export function App() {
                           setPreviewVideoUrl(null);
                         }
                       }}
-                      placeholder="YouTube, TikTok hoặc Douyin"
+                      placeholder="Dán đường dẫn video cần dịch"
                     />
                     {form.source_url && !form.source_url.toLowerCase().endsWith(".mp4") && (
                       <button
@@ -770,14 +694,6 @@ export function App() {
                     checked={form.logo_enabled} 
                     label="Đóng dấu Logo Watermark" 
                     onChange={() => setField("logo_enabled", !form.logo_enabled)} 
-                  />
-                  <CheckBox 
-                    checked={form.auto_publish?.includes('youtube') ?? false} 
-                    label="Tự động đăng YouTube sau khi render" 
-                    onChange={() => {
-                      const isEnabled = form.auto_publish?.includes('youtube');
-                      setField('auto_publish', isEnabled ? (form.auto_publish || []).filter(t => t !== 'youtube') : [...(form.auto_publish || []), 'youtube' as any]);
-                    }} 
                   />
                 </div>
 
@@ -953,7 +869,6 @@ export function App() {
             </div>
           </form>
         </div>
-      )}
     </main>
   );
 }
@@ -1130,26 +1045,6 @@ const StatusPanel = React.memo(function StatusPanel({
     }
   }, [job]);
 
-  const seoTags = useMemo(() => {
-    return (job?.seo_tags ?? [])
-      .map((tag) => tag.trim())
-      .filter(Boolean)
-      .map((tag) => (tag.startsWith("#") ? tag : `#${tag.replace(/^#+/, "").replace(/\s+/g, "")}`))
-      .join(" ");
-  }, [job?.seo_tags]);
-
-  const youtubeUploadText = useMemo(() => {
-    if (!job) return "";
-    const description = job.seo_description ?? "";
-    const shouldAppendTags = seoTags && !description.includes("#");
-    return [job.seo_title, description, shouldAppendTags ? seoTags : ""].filter(Boolean).join("\n\n");
-  }, [job, seoTags]);
-
-  const copyToClipboard = useCallback(async (value: string) => {
-    if (!value) return;
-    await navigator.clipboard.writeText(value);
-  }, []);
-
   const handleEvaluate = useCallback(async () => {
     if (!job || isEvaluating) return;
     setIsEvaluating(true);
@@ -1239,20 +1134,6 @@ const StatusPanel = React.memo(function StatusPanel({
           <ReviewFinalEvaluationPanel evaluation={job.final_evaluation} />
         </div>
       )}
-      {job.status === "completed" && youtubeUploadText && (
-        <div style={{ marginTop: 16, display: "grid", gap: 10 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-            <h3 style={{ fontSize: "1rem", margin: 0 }}>Nội dung up YouTube</h3>
-            <button type="button" className="ios-button ios-button-secondary" style={{ padding: "6px 10px", fontSize: "0.82rem" }} onClick={() => copyToClipboard(youtubeUploadText)}>
-              <Copy size={15} />
-              Copy tất cả
-            </button>
-          </div>
-          {job.seo_title && <SeoCopyBlock label="Tiêu đề" value={job.seo_title} onCopy={copyToClipboard} />}
-          {job.seo_description && <SeoCopyBlock label="Mô tả" value={job.seo_description} onCopy={copyToClipboard} multiline />}
-          {seoTags && <SeoCopyBlock label="Hashtag" value={seoTags} onCopy={copyToClipboard} />}
-        </div>
-      )}
       {job.status === "completed" && job.created_at && job.updated_at && (
         <p className="muted" style={{ marginTop: 12, fontSize: "0.85rem" }}>
           Tổng thời gian xử lý:{" "}
@@ -1266,31 +1147,6 @@ const StatusPanel = React.memo(function StatusPanel({
         </p>
       )}
     </section>
-  );
-});
-
-const SeoCopyBlock = React.memo(function SeoCopyBlock({
-  label,
-  value,
-  onCopy,
-  multiline = false,
-}: {
-  label: string;
-  value: string;
-  onCopy: (value: string) => void;
-  multiline?: boolean;
-}) {
-  return (
-    <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: 12, padding: 12, background: "#f7f8fa" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 8 }}>
-        <strong style={{ fontSize: "0.88rem" }}>{label}</strong>
-        <button type="button" className="ios-button ios-button-secondary" style={{ padding: "4px 8px", fontSize: "0.78rem" }} onClick={() => onCopy(value)}>
-          <Copy size={14} />
-          Copy
-        </button>
-      </div>
-      <p style={{ whiteSpace: "pre-wrap", margin: 0, color: "#1d1d1f", fontSize: multiline ? "0.88rem" : "0.95rem", lineHeight: 1.45 }}>{value}</p>
-    </div>
   );
 });
 

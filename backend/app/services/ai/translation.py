@@ -487,6 +487,7 @@ async def _translate_gemini_batch(
         "không dùng alias và không đổi tên giữa các batch.\n"
         "- Chỉ xác định giới tính, vai vế hoặc quan hệ khi câu nguồn/ngữ cảnh có bằng chứng; chưa chắc thì dùng cách gọi trung tính.\n"
         "- PREVIOUS_CONTEXT và NEXT_CONTEXT chỉ giúp hiểu đại từ/người nói; tuyệt đối không dịch chúng vào items.\n"
+        "- Với câu rút gọn hoặc đại từ hồi chỉ, khôi phục đúng hành động/đối tượng đã nêu ở câu trước khi tiếng Việt cần để rõ nghĩa; không đổi chủ thể và không thêm thông tin ngoài nguồn.\n"
         "- Câu ngắn, tự nhiên, phù hợp thời lượng phụ đề/lồng tiếng; không để sót chữ Trung, pinyin hoặc chú thích.\n"
         "- memory_updates chỉ ghi thông tin nhân vật mới được CURRENT_ITEMS xác nhận, gồm characters, relationships, glossary, addressing_rules.\n"
     )
@@ -805,7 +806,7 @@ def _clean_polished_subtitle(text: str, fallback: str) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n\"'")
     cleaned = re.sub(r"\.{4,}", "...", cleaned)
     cleaned = re.sub(r"\s+([.,!?:;])", r"\1", cleaned)
-    cleaned = re.sub(r",([^\s])", r", \1", cleaned)
+    cleaned = re.sub(r",([^\s\d])", r", \1", cleaned)
     if not cleaned or _looks_chinese(cleaned):
         return fallback
     return cleaned
@@ -830,7 +831,7 @@ def _google_target(language: str) -> str:
 def _clean_translation(text: str | None) -> str:
     if not text:
         return ""
-    return " ".join(text.replace("\n", " ").split())
+    return re.sub(r"(?<=\d),\s+(?=\d)", ",", " ".join(text.replace("\n", " ").split()))
 
 
 def _request_google_translate(
@@ -1259,7 +1260,7 @@ def _fix_character_names(text: str) -> str:
         result = pattern.sub(replacement, result)
     result = re.sub(r"\b(làm theo)\s+\1\b", r"\1", result, flags=re.IGNORECASE)
     result = re.sub(r"\s+([.,!?:;])", r"\1", result)
-    result = re.sub(r",([^\s])", r", \1", result)
+    result = re.sub(r",([^\s\d])", r", \1", result)
     return result.strip()
 
 

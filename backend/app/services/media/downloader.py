@@ -24,6 +24,10 @@ def _find_js_runtime() -> str | None:
     if settings.ytdlp_js_runtime:
         return settings.ytdlp_js_runtime
 
+    bundled_node = Path(__file__).resolve().parents[4] / "tools" / "node" / "node.exe"
+    if bundled_node.exists():
+        return f"node:{bundled_node.as_posix()}"
+
     node = shutil.which("node")
     if node:
         return f"node:{Path(node).as_posix()}"
@@ -514,9 +518,9 @@ async def download_video(url: str, work_dir: Path, progress: Callable[[str, int]
         "--socket-timeout",
         "25",
         "--retries",
-        "1",
+        "5",
         "--fragment-retries",
-        "1",
+        "5",
         "--no-playlist",
         "--remote-components",
         "ejs:github",
@@ -577,12 +581,12 @@ async def download_preview_video(url: str, work_dir: Path) -> Path:
         "--socket-timeout",
         "15",
         "--retries",
-        "1",
+        "5",
         "--fragment-retries",
-        "1",
+        "5",
         "--no-playlist",
         "--format",
-        "mp4[height<=480]/worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]/worst",
+        "bestvideo[height<=480][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
         "--merge-output-format",
         "mp4",
         "--output",

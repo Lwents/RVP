@@ -17,6 +17,10 @@ ProgressCallback = Callable[[int], None]
 
 
 def find_ffmpeg() -> str | None:
+    bundled_project = Path(__file__).resolve().parents[4] / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe"
+    if bundled_project.exists():
+        return str(bundled_project)
+
     if settings.ffmpeg_path:
         configured = Path(settings.ffmpeg_path)
         if configured.exists():

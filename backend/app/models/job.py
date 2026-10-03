@@ -21,11 +21,6 @@ class BgmMode(str, Enum):
     none = "none"
 
 
-class PublishTarget(str, Enum):
-    youtube = "youtube"
-    facebook = "facebook"
-
-
 class CustomBlurBox(BaseModel):
     x_percent: float = Field(ge=0, le=100)
     y_percent: float = Field(ge=0, le=100)
@@ -49,7 +44,6 @@ class DubbingRequest(BaseModel):
     bgm_mode: BgmMode = BgmMode.demucs
     use_demucs: bool = True
     video_speed: float = Field(default=1.0, ge=0.5, le=2.0)
-    auto_publish: list[PublishTarget] = Field(default_factory=list)
     clone_voice: bool = False
     hard_subtitles: bool = True
     source_has_hard_subtitles: bool = False

@@ -162,21 +162,24 @@ def canonicalize_character_text(
     text = unicodedata.normalize("NFC", str(value or ""))
     if not text or not registry:
         return text
-    aliases = sorted(
-        (
-            (alias, canonical)
-            for alias, canonical in registry.items()
-            if alias and canonical and alias != canonical
-        ),
-        key=lambda item: len(item[0]),
-        reverse=True,
+    # Protect complete canonical names from aliases contained within them.
+    # Replace in one pass so successive cleanup calls are idempotent.
+    replacements = {alias: canonical for alias, canonical in registry.items() if alias and canonical}
+    replacements.update({canonical: canonical for canonical in registry.values() if canonical})
+    names = sorted(replacements, key=len, reverse=True)
+    patterns = []
+    for name in names:
+        escaped = re.escape(name).replace(r"\ ", r"\s+")
+        left = r"(?<!\w)" if name[0].isalnum() else ""
+        right = r"(?!\w)" if name[-1].isalnum() else ""
+        patterns.append(left + escaped + right)
+    if not patterns:
+        return text
+    return re.sub(
+        "|".join(f"(?P<n{index}>{pattern})" for index, pattern in enumerate(patterns)),
+        lambda match: replacements[names[int(match.lastgroup[1:])]],
+        text,
     )
-    for alias, canonical in aliases:
-        escaped = re.escape(alias).replace(r"\ ", r"\s+")
-        left = r"(?<!\w)" if alias[0].isalnum() else ""
-        right = r"(?!\w)" if alias[-1].isalnum() else ""
-        text = re.sub(left + escaped + right, canonical, text)
-    return text
 
 
 def character_name_contract(registry: Mapping[str, str] | None) -> dict[str, object]:

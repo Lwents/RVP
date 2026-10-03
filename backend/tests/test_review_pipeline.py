@@ -2313,6 +2313,7 @@ class NarrativeJudgeRetryTests(unittest.IsolatedAsyncioTestCase):
             start_time=0,
             end_time=8,
             event_summary="Nobita opens the door.",
+            keyframes=[ReviewKeyframe(time=4.0, path="verified.jpg")],
         )
         segment = NarrationSegment(
             segment_id="segment_0001",
@@ -2344,6 +2345,7 @@ class NarrativeJudgeRetryTests(unittest.IsolatedAsyncioTestCase):
                     "direct_match": True,
                     "score": 0.72,
                     "reason": "The frame directly shows the described action.",
+                    "best_keyframe_time": 4.0,
                 }
             ]
         }
@@ -2358,6 +2360,9 @@ class NarrativeJudgeRetryTests(unittest.IsolatedAsyncioTestCase):
             updated = await _multimodal_rescore_selected_clips([segment], [scene], [decision])
 
         self.assertEqual(updated[0].source_clips[0].match_score, 0.75)
+        self.assertAlmostEqual(updated[0].source_clips[0].start_seconds, 2.8)
+        self.assertAlmostEqual(updated[0].source_clips[0].end_seconds, 5.2)
+        self.assertIn("Verified keyframe time: 4.000s", updated[0].source_clips[0].match_reason)
 
     async def test_budget_valid_narration_retries_once_with_judge_feedback(self) -> None:
         events = ReviewTimelineTests._story_events()

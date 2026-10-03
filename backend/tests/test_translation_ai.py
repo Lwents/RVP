@@ -241,7 +241,7 @@ class GeminiTranslationTests(unittest.IsolatedAsyncioTestCase):
         app_dir = Path(__file__).resolve().parents[1] / "app"
         occurrences: list[Path] = []
         for source in app_dir.rglob("*.py"):
-            if "ag/gemini-3-flash-agent" in source.read_text(encoding="utf-8"):
+            if "ag/gemini-3.8-flash-medium" in source.read_text(encoding="utf-8"):
                 occurrences.append(source)
         self.assertEqual(occurrences, [app_dir / "core.py"])
 

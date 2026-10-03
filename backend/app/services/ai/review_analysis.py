@@ -2961,6 +2961,12 @@ async def _multimodal_rescore_selected_clips(
             best_time = _verified_keyframe_time_from_text(reason, scene)
         if scene is not None and best_time is not None and scene.start_time <= best_time <= scene.end_time:
             start_seconds, end_seconds = _verified_clip_window(scene, best_time)
+            # Keep the structured keyframe timestamp in the saved reason. The
+            # post-render retry uses it to trim a clip that changes shots after
+            # the verified frame; relying on free-form model wording made that
+            # repair silently unavailable when the model omitted the time.
+            if _verified_keyframe_time_from_text(reason, scene) is None:
+                reason = f"{reason.rstrip()} Verified keyframe time: {best_time:.3f}s."
         selected = selected.model_copy(
             update={
                 "start_seconds": round(start_seconds, 3),
@@ -3822,6 +3828,7 @@ async def verify_edited_narration(
     narration: str,
     event: StoryEvent,
     scenes: list[AnalyzedScene],
+    context_events: list[StoryEvent] | None = None,
 ) -> tuple[bool, str, RequiredVisuals | None]:
     """Reject manual narration edits that introduce claims outside evidence."""
 
@@ -3832,10 +3839,13 @@ async def verify_edited_narration(
             "text": (
                 "Kiểm tra câu review có được chứng minh trực tiếp bởi event, thoại/OCR và frame hay không. "
                 "Cấm chấp nhận tên, hành động, vật thể, quan hệ hoặc kết quả không có evidence. "
+                "Sự kiện kề trước chỉ được dùng để làm rõ chuyển tiếp thời gian/trạng thái mà diễn biến hiện tại bắt buộc suy ra; "
+                "không được lấy hành động của cảnh trước làm hành động chính của câu hiện tại. "
                 "Trả JSON {valid:boolean,confidence:number,reason:string,required_visuals:{characters:[],actions:[],objects:[],locations:[]}}. "
                 "required_visuals chỉ được chứa đúng người/hành động/vật thể/địa điểm mà CÂU REVIEW mới thực sự nhắc đến và evidence xác nhận; "
                 "không giữ hành động từ câu cũ, không thêm chi tiết chỉ xuất hiện ở cảnh nhưng không có trong câu.\n"
                 f"CÂU REVIEW: {narration}\nEVENT: {event.model_dump_json()}\n"
+                f"VERIFIED_PREVIOUS_EVENTS: {json.dumps([item.model_dump(mode='json') for item in (context_events or [])[-2:]], ensure_ascii=False)}\n"
                 f"SCENES: {json.dumps([scene.model_dump(exclude={'keyframes', 'thumbnail_path'}) for scene in linked], ensure_ascii=False)}"
             ),
         }

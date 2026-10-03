@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Auto-Translate AI API",
     version="1.0.0",
-    description="Backend for video dubbing, translation, subtitle, and publishing workflows.",
+    description="Backend for video dubbing, translation, subtitle, and review workflows.",
     lifespan=lifespan,
 )
 
@@ -87,3 +87,7 @@ app.mount("/api/uploads/watermark", StaticFiles(directory=str(storage_watermarks
 @app.get("/health", tags=["system"])
 async def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")

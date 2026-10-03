@@ -1,6 +1,5 @@
 export type VoiceGender = "female" | "male";
 export type BgmMode = "demucs" | "ducking" | "none";
-export type PublishTarget = "youtube" | "facebook";
 export type JobStatus = "queued" | "processing" | "completed" | "failed";
 export type ReviewJobStatus = JobStatus | "needs_review" | "ready_to_render";
 export type SourceLanguage = "auto" | "en" | "zh" | "vi";
@@ -23,7 +22,6 @@ export interface DubbingRequest {
   bgm_mode: BgmMode;
   use_demucs: boolean;
   video_speed: number;
-  auto_publish: PublishTarget[];
   clone_voice: boolean;
   hard_subtitles: boolean;
   source_has_hard_subtitles: boolean;

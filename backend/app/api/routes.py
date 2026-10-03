@@ -22,6 +22,7 @@ from app.models.review import (
     NarrationSegment,
     QualityIssue,
     ReviewQualityReport,
+    RequiredVisuals,
     SceneCandidate,
     StoryEvent,
     VerifiedReviewPackage,
@@ -619,7 +620,12 @@ def _auto_optimize_review_result(
             forward = list(decision.source_clips)
         if not forward:
             continue
-        chosen = max(forward, key=lambda item: (item.match_score, -item.start_seconds))
+        current = decision.source_clips[0] if decision.source_clips else None
+        chosen = (
+            current
+            if current is not None and current in forward and current.match_score >= 0.75
+            else max(forward, key=lambda item: (item.match_score, -item.start_seconds))
+        )
         if not decision.source_clips or chosen.candidate_id != decision.source_clips[0].candidate_id:
             changed_candidates += 1
         decision.selected_candidate_id = chosen.candidate_id
@@ -693,7 +699,6 @@ def _build_review_render_request(request: ReviewDraftRequest, source_video: Path
         bgm_mode=BgmMode.none,
         use_demucs=True,
         video_speed=1.0,
-        auto_publish=[],
         clone_voice=False,
         hard_subtitles=request.hard_subtitles,
         source_has_hard_subtitles=False,
@@ -1386,7 +1391,7 @@ async def render_review_draft_job(job_id: str) -> ReviewDraftJob:
 
 @router.post("/review/jobs/{job_id}/optimize", response_model=ReviewDraftJob, tags=["review"])
 async def optimize_review_draft_job(job_id: str) -> ReviewDraftJob:
-    """Apply safe timeline/candidate/duration repairs to a saved draft."""
+    """Repair a saved draft, then re-run the narrative QA for its current text."""
 
     job = review_draft_jobs.get(job_id)
     if not job or not job.result:
@@ -1395,6 +1400,22 @@ async def optimize_review_draft_job(job_id: str) -> ReviewDraftJob:
         raise HTTPException(status_code=409, detail="Review job is still processing.")
 
     optimized, notes = _auto_optimize_review_result(job.result, job.request.style)
+    from app.services.ai.review_analysis import _judge_narrative_style, _quality_report
+
+    narrative_assessment = await _judge_narrative_style(
+        optimized.narration_segments,
+        optimized.events,
+        job.request.style,
+    )
+    optimized.quality_report = _apply_review_hard_gate(_quality_report(
+        optimized.narration_segments,
+        optimized.events,
+        optimized.scenes,
+        optimized.edit_decision_list,
+        optimized.target_minutes,
+        job.request.style,
+        narrative_assessment,
+    ))
     optimized.output_file_path = None
     optimized.output_video_url = None
     optimized.final_evaluation = None
@@ -1515,10 +1536,15 @@ async def patch_review_segment(
         linked_event = next((item for item in result.events if item.event_id == decision.event_id), None)
         if linked_event is None:
             raise HTTPException(status_code=409, detail="Segment không còn event bằng chứng để kiểm chứng.")
+        previous_events = [
+            item for item in result.events
+            if item.order_index < linked_event.order_index
+        ][-2:]
         valid, reason, required_visuals = await verify_edited_narration(
             narration,
             linked_event,
             result.scenes,
+            context_events=previous_events,
         )
         if not valid:
             raise HTTPException(status_code=422, detail=f"Câu sửa không khớp bằng chứng: {reason}")
@@ -1543,6 +1569,29 @@ async def patch_review_segment(
             ),
             None,
         )
+        if chosen is None and request.scene_id and segment is not None:
+            linked_event = next((item for item in result.events if item.event_id == decision.event_id), None)
+            scene = next((item for item in result.scenes if item.scene_id == request.scene_id), None)
+            if linked_event is not None and scene is not None and scene.scene_id in linked_event.scene_ids:
+                from app.services.ai.review_analysis import _scene_match_score
+
+                match_score, match_reason = _scene_match_score(segment, linked_event, scene)
+                clip_end = min(
+                    scene.end_time,
+                    scene.start_time + min(7.0, max(0.55, segment.estimated_voice_duration)),
+                )
+                chosen = SceneCandidate(
+                    candidate_id=f"{segment_id}:{scene.scene_id}",
+                    scene_id=scene.scene_id,
+                    start_seconds=scene.start_time,
+                    end_seconds=clip_end,
+                    thumbnail_path=scene.thumbnail_path,
+                    thumbnail_url=f"/api/review/jobs/{job_id}/thumbnails/{Path(scene.thumbnail_path).name}"
+                    if scene.thumbnail_path else None,
+                    match_score=match_score,
+                    match_reason=match_reason,
+                )
+                decision.alternatives.append(chosen)
         if chosen is None:
             raise HTTPException(status_code=400, detail="Cảnh thay thế không thuộc segment này.")
     elif request.start_seconds is not None or request.end_seconds is not None:
@@ -1597,6 +1646,43 @@ async def patch_review_segment(
                 beat.match_reason = chosen.match_reason
                 beat.thumbnail_url = chosen.thumbnail_url
                 beat.candidates = decision.alternatives
+
+    if segment is not None and decision.source_clips:
+        # Keep the narration's evidence binding synchronized with the scene
+        # selected by the editor, then store exact source facts for QA/render.
+        from app.services.ai.review_analysis import _token_overlap
+
+        selected_scene_id = decision.source_clips[0].scene_id
+        selected_scene = next((item for item in result.scenes if item.scene_id == selected_scene_id), None)
+        if selected_scene is not None:
+            segment.candidate_scene_ids = [selected_scene.scene_id]
+            narration_folded = segment.narration.casefold()
+            characters = [
+                name for name in selected_scene.characters
+                if name.casefold() in narration_folded
+            ]
+            actions = selected_scene.visible_actions
+            best_action = max(
+                actions,
+                key=lambda value: _token_overlap(segment.narration, value),
+                default="",
+            )
+            action_values = [best_action] if best_action and _token_overlap(segment.narration, best_action) >= 0.35 else []
+            objects = [
+                value for value in selected_scene.important_objects
+                if value.casefold() in narration_folded or _token_overlap(value, segment.narration) >= 0.8
+            ]
+            locations = (
+                [selected_scene.location]
+                if selected_scene.location and _token_overlap(selected_scene.location, segment.narration) >= 0.4
+                else []
+            )
+            segment.required_visuals = RequiredVisuals(
+                characters=characters,
+                actions=action_values,
+                objects=objects,
+                locations=locations,
+            )
 
     result.narration_script = " ".join(item.narration.strip() for item in result.beats if item.narration.strip())
     # A small local edit has already been checked against its linked event.
@@ -2000,7 +2086,7 @@ async def generate_job_metadata(job_id: str) -> JobProgress:
         None,
     )
     if not subtitle_file:
-        raise HTTPException(status_code=404, detail="Job này chưa có phụ đề để AI viết nội dung YouTube.")
+        raise HTTPException(status_code=404, detail="Job này chưa có phụ đề để AI viết mô tả video.")
 
     from app.services.ai.content import generate_video_details
 
@@ -2033,57 +2119,6 @@ async def cancel_job(job_id: str) -> dict[str, str]:
     if task_manager.cancel_task(job_id):
         return {"message": "Đã gửi yêu cầu hủy tiến trình."}
     return {"message": "Không thể hủy (job không chạy hoặc đã kết thúc)."}
-
-
-from app.services.youtube.auth import get_youtube_auth_url, handle_oauth2_callback
-from app.services.youtube.upload import get_channel_videos_stats
-from pydantic import BaseModel
-
-class YoutubeCallbackRequest(BaseModel):
-    code: str
-    redirect_uri: str = "http://localhost:5173/youtube/callback"
-
-@router.post("/youtube/client-secret", tags=["youtube"])
-async def upload_client_secret(file: UploadFile = File(...)):
-    try:
-        data = await file.read()
-        import json
-        secret_data = json.loads(data)
-        if "web" not in secret_data and "installed" not in secret_data:
-            raise HTTPException(status_code=400, detail="Định dạng file client_secret.json không hợp lệ. Phải chứa khoá 'web' hoặc 'installed'.")
-        
-        dest = Path(settings.youtube_client_secrets_file)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
-        return {"status": "success", "message": "Đã lưu tệp client_secret.json thành công."}
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Tệp tải lên không phải là định dạng JSON hợp lệ.")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@router.get("/youtube/auth-url", tags=["youtube"])
-async def get_yt_auth_url(redirect_uri: str = "http://localhost:5173/youtube/callback"):
-    try:
-        url = get_youtube_auth_url(redirect_uri=redirect_uri)
-        return {"url": url}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@router.post("/youtube/callback", tags=["youtube"])
-async def yt_callback(req: YoutubeCallbackRequest):
-    try:
-        result = handle_oauth2_callback(req.code, redirect_uri=req.redirect_uri)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@router.get("/youtube/stats", tags=["youtube"])
-async def yt_stats():
-    try:
-        stats = get_channel_videos_stats()
-        return stats
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ─── Auto-detect blur regions ─────────────────────────────────────────────────
